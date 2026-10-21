@@ -1,0 +1,51 @@
+# Mushroom Facility Sensor Watchdog — docker-compose.yml
+#
+# Usage:
+#   ./ops.sh start        # build (if needed) + run detached
+#   ./ops.sh stop         # stop (keeps DB and config)
+#   ./ops.sh restart      # stop + start
+#   ./ops.sh logs         # tail -f container logs
+#
+# Secrets injection: copy .env.example to .env and fill in real values.
+# Anything set in .env wins over config.yaml for the listed keys.
+
+services:
+  watchdog:
+    build: .
+    image: sensor-watchdog:latest
+    container_name: sensor_watchdog
+    restart: unless-stopped
+    # Run as the host user (UID:GID passed in via HOST_UID/HOST_GID env vars,
+    # defaulting to 1001:1001) so the bind mounts work without chown tricks.
+    # Override at deploy time: HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose up
+    user: "${HOST_UID:-1001}:${HOST_GID:-1001}"
+    ports:
+      - "5050:5050"
+    volumes:
+      # Persistent SQLite database — survives container rebuilds.
+      - ./data:/app/data
+      # Editable configuration. Drop a fresh config.yaml here; the image
+      # does NOT bake one in. WATCHDOG_* env vars override file values.
+      - ./config:/app/config
+      # Optional backup directory; ops.sh backup writes here.
+      - ./backups:/app/backups
+    env_file:
+      - .env   # optional; missing file is fine
+    environment:
+      # These defaults are safe — if the user puts WATCHDOG_MQTT_PASSWORD in
+      # .env, it overrides the value pulled from config.yaml. Listed here
+      # only so the operator can SEE the override interface in one place.
+      WATCHDOG_CONFIG: /app/config/config.yaml
+      WATCHDOG_DB: /app/data/sensor_watchdog.db
+      TZ: ${TZ:-UTC}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5050/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

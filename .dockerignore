@@ -1,0 +1,41 @@
+# Files / directories that should NOT enter the image. Keep image small;
+# runtime state (DB) and config are bind-mounted from the host instead.
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Runtime state (lives on host via bind mount)
+data/
+backups/
+
+# Local config overrides (lives on host via bind mount)
+config/config.yaml
+config/config.local.yaml
+
+# Secrets (never bake these)
+.env
+.env.*
+!.env.example
+
+# Build artefacts
+*.egg-info/
+build/
+dist/
+
+# IDE / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Git
+.git/
+.gitignore

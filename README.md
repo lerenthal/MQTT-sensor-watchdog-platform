@@ -1,0 +1,132 @@
+# 🍄 MQTT Sensor Watchdog Platform
+
+> Independent MQTT subscriber + watchdog evaluator + Telegram nagging engine +
+> Flask admin dashboard for ESPHome-based environmental sensors in a facility
+> running GMP-relevant production. Detects device **OFFLINE** and **STALLED**
+> faults, maintains a full audit trail, and pages an operator via Telegram
+> until acknowledged or snoozed.
+
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
+---
+
+## What this does
+
+You have N ESPHome (or compatible) sensor nodes publishing on MQTT to a Mosquitto
+broker. This application sits between the broker and you:
+
+1. **Subscribes** to your facility's MQTT topic tree and records every sensor
+   reading into SQLite.
+2. **Detects** two failure modes:
+   - **OFFLINE** — the device stopped sending packets past a configured
+     timeout (or reported `offline` via LWT).
+   - **STALLED** — the device is still connected but its `heartbeat_counter`
+     value stopped incrementing past a configured timeout.
+3. **Re-nags** the operator via Telegram every *N* minutes until the alert is
+   acknowledged or snoozed (1h / 8h / 24h from inline buttons).
+4. **Logs** every action — login, snooze, restart, CSV upload, config change —
+   to an append-only audit table with the operator username.
+5. **Provides** a password-protected web dashboard with live sensor readings,
+   drilldown per device, sortable / searchable columns, CSV-driven facility
+   metadata (location, role), and printable status reports for compliance
+   batches.
+
+This is a **standalone** watchdog — it does not require, depend on, or
+integrate with Home Assistant. It only needs an MQTT broker.
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/lerenthal/MQTT-sensor-watchdog-platform
+cd MQTT-sensor-watchdog-platform
+
+# One command to bring it up (bin/build the image on first run)
+HOST_UID=$(id -u) HOST_GID=$(id -g) ./ops.sh start
+```
+
+Then open **`http://localhost:5050`** and sign in with the seeded admin
+(`/admin/config` → change passwords there or via the `auth:` block of
+`config.yaml`).
+
+To tear it back down without losing data:
+
+```bash
+./ops.sh stop    # keeps ./data and ./config/config.yaml
+```
+
+---
+
+## Documentation
+
+The doc set lives under [`docs/`](docs/). Read in this order:
+
+| | Doc | Audience |
+|---|---|---|
+| 1 | [`docs/install.md`](docs/install.md) | Production engineer setting up a fresh host |
+| 2 | [`docs/configuration.md`](docs/configuration.md) | Anyone editing `config.yaml` or `.env` |
+| 3 | [`docs/operations.md`](docs/operations.md) | Operator who runs `./ops.sh start/stop/logs/...` |
+| 4 | [`docs/user-guide.md`](docs/user-guide.md) | Operator/QC who logs in and uses the dashboard |
+| 5 | [`docs/security.md`](docs/security.md) | Security/IT — auth, secrets, audit |
+| 6 | [`docs/architecture.md`](docs/architecture.md) | Engineer who wants to understand the codebase |
+| 7 | [`docs/development.md`](docs/development.md) | Contributor / local dev |
+
+---
+
+## Repository layout
+
+```
+.
+├── app.py                  # Single-file Flask + MQTT + watchdog + Telegram
+├── dashboard.js            # Client-side JS for the dashboard (sort/search/expand)
+├── schema.sql              # SQLite schema (idempotent)
+├── config.yaml             # Bundled config template (committed; sanitised)
+├── requirements.txt        # Python deps for non-Docker development
+├── Dockerfile              # python:3.12-slim, non-root, healthcheck
+├── docker-compose.yml      # Single service, bind mounts, env-var secrets
+├── ops.sh                  # Operator entry-point: start/stop/restart/logs/...
+├── .dockerignore           # Keep image small
+├── .env.example            # Documented template; cp to .env for secrets
+├── .gitignore
+├── LICENSE                 # GPL v3
+├── README.md               # this file
+├── docs/                   # All documentation
+└── data/                   # Created at runtime by ops.sh; bind-mounted in container
+```
+
+In production, only the following are persistent and operator-managed:
+
+```
+config/config.yaml         # live config (bind-mounted; gitignored)
+.env                       # secrets (gitignored)
+data/sensor_watchdog.db    # SQLite database (bind-mounted; gitignored)
+backups/                   # ./ops.sh backup target (gitignored)
+```
+
+---
+
+## Requirements
+
+### Host
+- Linux (Debian / Ubuntu / RHEL tested)
+- Docker Engine 24+ and Compose v2 (or `docker-compose` v1)
+- Outbound network to your MQTT broker
+- Outbound network to `api.telegram.org` (for nag-alert delivery)
+
+### Runtime (inside container)
+- Python 3.12 (provided by the image)
+- `paho-mqtt`, `APScheduler`, `Flask`, `requests`, `PyYAML` — installed from
+  `requirements.txt` during image build
+- `curl` for the in-container healthcheck
+- A directory you control for `./data`, `./config`, `./backups`
+
+---
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation.
