@@ -1990,8 +1990,42 @@ def print_report():
 # -----------------------------------------------------------------------------
 @app.route("/health")
 def health():
+    """Liveness, not merely session state.
+
+    A broker that is reachable but no longer forwarding leaves the MQTT
+    session 'connected' while nothing arrives. Reporting that as healthy is
+    exactly the false-confidence failure this watchdog exists to prevent, so
+    we additionally check that packets have actually been received recently.
+    """
     with mqtt_health_lock:
-        return jsonify({"ok": mqtt_health["connected"]})
+        connected = mqtt_health["connected"]
+        last_disc = mqtt_health["last_disconnected_at"]
+
+    payload = {
+        "ok": False,
+        "mqtt_connected": connected,
+        "last_packet": None,
+        "last_packet_age_seconds": None,
+    }
+
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT MAX(ts) FROM sensor_readings").fetchone()
+        conn.close()
+        if row and row[0]:
+            last = _parse_ts(row[0])
+            if last:
+                age = (datetime.now() - last).total_seconds()
+                payload["last_packet"] = row[0]
+                payload["last_packet_age_seconds"] = int(age)
+                # 10 minutes with no packet from a live broker is an outage,
+                # regardless of what the MQTT session believes.
+                payload["ok"] = connected and age < 600
+    except Exception:
+        log.exception("health check failed")
+
+    status = 200 if payload["ok"] else 503
+    return jsonify(payload), status
 
 @app.errorhandler(403)
 def _403(_):
@@ -2005,11 +2039,42 @@ def _404(_):
 # Background jobs
 # -----------------------------------------------------------------------------
 def _watchdog_check_health():
+    """Two independent failure modes worth telling the operator about:
+      1. MQTT session lost (broker unreachable / refused).
+      2. Session alive but no packets arriving (broker up, forwarding
+         stopped). (2) is the one that hides longest, because the client
+         still believes it is connected.
+    """
     try:
         with mqtt_health_lock:
             connected = mqtt_health["connected"]
             last_disc = mqtt_health["last_disconnected_at"]
-        if connected or last_disc is None:
+
+        # (2) connected but silent
+        if connected:
+            try:
+                conn = get_db()
+                row = conn.execute("SELECT MAX(ts) FROM sensor_readings").fetchone()
+                conn.close()
+                if row and row[0]:
+                    age = (datetime.now() - _parse_ts(row[0])).total_seconds()
+                    if age > 600:
+                        mins = int(age // 60)
+                        # Fire at most once every 30 minutes.
+                        if mins % 30 == 0 or (600 < age < 660):
+                            telegram_engine.send_message(
+                                "⚠️ <b>No sensor data for %d minutes.</b>\n"
+                                "MQTT session is still connected, so the broker "
+                                "is reachable but not forwarding. This is a "
+                                "broker, ACL or network fault &mdash; not a "
+                                "sensor fault." % mins
+                            )
+            except Exception:
+                log.exception("no-data check failed")
+            return
+
+        # (1) session lost
+        if last_disc is None:
             return
         downtime = (datetime.now() - last_disc).total_seconds()
         if 60 <= downtime < 65 or int(downtime) % 600 == 0:
