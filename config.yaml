@@ -27,6 +27,15 @@ watchdog:
   check_interval_seconds: 30                  # Evaluation loop frequency
   default_heartbeat_timeout_seconds: 180      # 3 minutes without counter increment = STALLED
   default_offline_timeout_seconds: 120        # 2 minutes without any MQTT message = OFFLINE
+  # SUSPECTED_STALL: a per-sensor value that hasn't changed within this window
+  # raises a SUSPECTED_STALL alert, even if no heartbeat counter is published.
+  # Default 300s (5 min) matches the operator's natural intuition. Set higher
+  # for sensors that genuinely could be constant (e.g. a freezer's setpoint).
+  sensor_flatline_seconds: 300
+  # Fractional tolerance when comparing the new reading to the prior one. A
+  # value that differs by less than this fraction is treated as "unchanged".
+  # Default 0.1% ignores noise (e.g. 21.40 vs 21.41) but flags real flatlines.
+  sensor_flatline_min_change_pct: 0.1
 
 web:
   host: "0.0.0.0"

@@ -16,6 +16,9 @@ function escapeHtml(s) {
 function statusBadge(s) {
     if (s === 'ONLINE')  return '<span class="badge badge-online">ONLINE</span>';
     if (s === 'STALLED') return '<span class="badge badge-stalled">STALLED</span>';
+    if (s === 'SUSPECTED_STALL') return '<span class="badge badge-suspect">SUSPECTED</span>';
+    if (s === 'SENSOR_SILENT') return '<span class="badge badge-silent">SILENT</span>';
+    if (s === 'DEGRADED') return '<span class="badge badge-degraded">DEGRADED</span>';
     return '<span class="badge badge-offline">OFFLINE</span>';
 }
 

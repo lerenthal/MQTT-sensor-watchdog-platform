@@ -36,7 +36,7 @@ The default landing page after login.
 |---|---|
 | **Device** | The MQTT topic's second-level name (e.g. `sht41-1`). |
 | **Location / Role** | The human-readable location and the role from `device_metadata`. Empty until the admin uploads a CSV. |
-| **Status** | `ONLINE` (green), `STALLED` (orange), `OFFLINE` (red). |
+| **Status** | `ONLINE` (green), `DEGRADED` (purple), `STALLED` (orange), `SENSOR_SILENT` (cyan), `SUSPECTED` (yellow), `OFFLINE` (red). |
 | **Last Seen** | When the most recent MQTT packet arrived. |
 | **Heartbeat** | The last heartbeat-counter value the device published. |
 | **Temp (°C)** | The latest temperature reading. |
@@ -228,6 +228,50 @@ minutes until reconnect.
   relies on per-user attribution.
 
 ## Common questions
+
+**Q: Why does my dashboard show STALLED for a device whose heartbeat exists in Home Assistant / InfluxDB?**
+A: This was a real bug, fixed in the current build. Devices publish their
+heartbeat under a name like `sht41-4_heartbeat_counter`, and the watchdog's
+metric filter used to discard anything that wasn't temperature/humidity/
+CO₂/light/pressure — so the heartbeat was never recorded, and the device
+was permanently marked `STALLED`. Confirm the fix took effect by opening
+the device's **Sensors** drilldown: you should see a
+`…_heartbeat_counter` line with a rising value. If it's missing, check
+`./ops.sh logs` for `on_mqtt_message failed`.
+
+**Q: What's the difference between STALLED, SUSPECTED and SILENT?**
+A: Three different faults, each pointing somewhere different:
+
+- **STALLED** — the device publishes a heartbeat counter, but the counter's
+  *value* has stopped changing. The device is on the network but its
+  health loop isn't ticking.
+- **SILENT** (`SENSOR_SILENT`) — one specific sensor channel has stopped
+  publishing entirely, while the other channels on that device keep
+  working. Almost always a wiring, power, or per-sensor config problem.
+  The alert names the exact sensor.
+- **SUSPECTED** (`SUSPECTED_STALL`) — that channel is still publishing,
+  but the number hasn't moved. Either a dead sensor chip, or a room that
+  has genuinely stabilised (a sealed CO₂ chamber will sit at one ppm
+  value for hours — this is a *suspected* stall precisely because we
+  can't tell those apart from the outside).
+
+**Q: I get SUSPECTED_STALL alerts on a room that's just steady. What now?**
+A: Raise `watchdog.sensor_flatline_seconds` at `/admin/config` (300 s is
+the default; try 900 or 1800 for rooms that plateau), or clear the
+current one with `POST /device/<id>/reset_stale` until the value moves
+again.
+
+**Q: What does DEGRADED mean?**
+A: The device is still publishing, but at least one of its sensor channels
+failed a per-sensor check. Expand the **Sensors** column to see which one.
+The device isn't down — one part of it is unhappy.
+
+**Q: Can I restart a device from the dashboard?**
+A: Yes — the red **Restart** button in the Actions column publishes `PRESS`
+to `facility/<device>/env_sensor/button/restart/cmd`. This only works if
+the ESPHome node has an MQTT button component listening on that topic; if
+it isn't configured, the publish goes nowhere and you'd need physical
+access instead.
 
 **Q: Why does the dashboard say `MQTT: DOWN`?**
 A: The watchdog cannot reach the MQTT broker from this host. Talk to your

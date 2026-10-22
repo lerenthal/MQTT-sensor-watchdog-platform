@@ -155,17 +155,50 @@ WAL.
 
 ### Detection rules
 
-Implemented in `watchdog_eval_loop`. For every device:
+Implemented in `watchdog_eval_loop`. For every device, faults are evaluated
+in strict priority order — the first match wins:
 
-- If `device.status == "OFFLINE"` OR no packet for > `offline_timeout_seconds`:
-  raise OFFLINE.
-- Else if heartbeat counter value hasn't changed for >
-  `heartbeat_timeout_seconds`: raise STALLED.
-- Else: recovery, mark device ONLINE, resolve all open alerts.
+1. **OFFLINE** — `status_topic == "offline"` OR no packet of any kind for
+   more than `default_offline_timeout_seconds`.
+2. **STALLED** — the device has published a heartbeat counter at some
+   point, but its *value* hasn't changed for more than
+   `default_heartbeat_timeout_seconds`.
+3. **DEGRADED** — at least one sensor channel on the device has failed a
+   per-sensor check (see below), while the device overall is still
+   publishing.
+4. **ONLINE** — everything flowing.
 
-The rules are deliberately simple. Anything fancier (predictive
-maintenance, sensor-trust scoring, multi-node correlation) is left as
-exercise for future expansion.
+### Per-sensor checks (schema v5+)
+
+Heartbeat is optional. Many ESPHome nodes never publish one, so the
+watchdog also watches every individual sensor channel recorded in
+`sensor_readings`. Each row carries two timestamps:
+
+- `ts` — when this channel last sent *any* packet.
+- `last_change_ts` — when this channel last sent a packet whose **value
+  differed** from the previous one by more than
+  `sensor_flatline_min_change_pct`.
+
+Those two timestamps separate two genuinely different faults:
+
+| Alert | Test | Meaning |
+|---|---|---|
+| `SENSOR_SILENT` | `now − ts > sensor_flatline_seconds` | This channel stopped publishing entirely while siblings on the same device keep going. Usually wiring, power, or a config problem on that one sensor. |
+| `SUSPECTED_STALL` | `now − last_change_ts > sensor_flatline_seconds` (and packets are still arriving) | The channel is publishing, but the number is frozen. Either a dead sensor, or an environment that has genuinely stabilised. |
+
+Both roll the device status up to `DEGRADED` and raise a per-device alert
+naming the specific sensor.
+
+**Why the distinction matters:** a silent channel usually means something
+physical is disconnected. A frozen value usually means either a dead chip
+or a room that is simply steady. The operator investigates very
+differently in each case, so we don't conflate them.
+
+The `last_change_ts` column is maintained inside the same UPSERT that
+writes the reading — no separate history table is required, so this costs
+no extra storage. A cold-start rebase (`_rebase_stale_readings_on_boot`)
+runs once at boot so a restart doesn't immediately light up every channel
+as stalled.
 
 ### Telegram callback handling
 
@@ -234,10 +267,22 @@ def _apply_migrations(conn):
 Migrations are **idempotent**. Anything checked via `_column_exists` /
 `_table_exists` skips itself on a DB that's already at the target schema.
 
-Current schema version: **4**.
+Current schema version: **5**.
 - v2 → v3: added `device_metadata`, `csv_uploads`, `sensor_readings`,
   `devices.location`, `devices.role`.
-- v3 → v4: renamed `sensor_readings.sensor_id` to `sensor_name`.
+- v3 → v4: renamed `sensor_readings.sensor_id` to `sensor_name` (the real
+  hardware uses one device per physical node; `<name>` is an informational
+  sub-label, not a sub-device).
+- v4 → v5: added `sensor_readings.last_change_ts` plus the
+  `idx_readings_flatline` index. This is what makes `SENSOR_SILENT` and
+  `SUSPECTED_STALL` distinguishable without a history table.
+
+Note on migration ordering: `_apply_migrations()` runs **before**
+`schema.sql` in `init_db()`. This matters because `schema.sql` contains
+`CREATE INDEX` statements that reference columns introduced by migrations.
+On an existing database the `CREATE TABLE IF NOT EXISTS` statements are
+no-ops, so those indexes would otherwise be attempted against a table that
+has not yet been `ALTER`ed.
 
 ## Threading model
 

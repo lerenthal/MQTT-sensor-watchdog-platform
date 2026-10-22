@@ -27,9 +27,10 @@ CREATE TABLE IF NOT EXISTS sensor_readings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id TEXT NOT NULL,                  -- one per physical ESPHome node
     sensor_name TEXT NOT NULL,                -- e.g. 'maxim5_ground_temperature', informational
-    sensor_type TEXT NOT NULL,                -- 'temperature','humidity','co2','light',...
+    sensor_type TEXT NOT NULL,                -- 'temperature','humidity','co2','light','pressure','heartbeat'
     value REAL NOT NULL,
     ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_change_ts TIMESTAMP,                 -- timestamp of last value change; null until second observation
     UNIQUE(device_id, sensor_name, sensor_type)
 );
 
@@ -37,6 +38,8 @@ CREATE INDEX IF NOT EXISTS idx_readings_device_sensor
     ON sensor_readings(device_id, sensor_name, sensor_type);
 CREATE INDEX IF NOT EXISTS idx_readings_recent
     ON sensor_readings(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_readings_flatline
+    ON sensor_readings(last_change_ts);
 
 CREATE TABLE IF NOT EXISTS device_metadata (
     device_id TEXT PRIMARY KEY,

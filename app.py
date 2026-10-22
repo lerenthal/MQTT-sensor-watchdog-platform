@@ -117,6 +117,14 @@ def _table_exists(conn, table):
     ).fetchone() is not None
 
 def _apply_migrations(conn):
+    # v4 -> v5: add sensor_readings.last_change_ts. Must run BEFORE any
+    # CREATE INDEX that references it (schema.sql and the embedded script
+    # below both do).
+    if _table_exists(conn, "sensor_readings") and not _column_exists(conn, "sensor_readings", "last_change_ts"):
+        conn.execute("ALTER TABLE sensor_readings ADD COLUMN last_change_ts TIMESTAMP")
+        conn.execute("UPDATE sensor_readings SET last_change_ts = ts WHERE last_change_ts IS NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_flatline ON sensor_readings(last_change_ts)")
+        log.info("Migration: added sensor_readings.last_change_ts (v4 -> v5)")
     if not _column_exists(conn, "audit_logs", "username"):
         conn.execute("ALTER TABLE audit_logs ADD COLUMN username TEXT")
         log.info("Migration: added audit_logs.username")
@@ -139,9 +147,10 @@ def _apply_migrations(conn):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             device_id TEXT NOT NULL,                -- one per physical ESPHome node
             sensor_name TEXT NOT NULL,              -- e.g. 'maxim5_ground_temperature', informational
-            sensor_type TEXT NOT NULL,              -- 'temperature','humidity','co2','light','pressure'
+            sensor_type TEXT NOT NULL,              -- 'temperature','humidity','co2','light','pressure','heartbeat'
             value REAL NOT NULL,
             ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_change_ts TIMESTAMP,             -- timestamp of last value change; NULL until second observation
             UNIQUE(device_id, sensor_name, sensor_type)
         );
         CREATE INDEX IF NOT EXISTS idx_readings_device_sensor
@@ -157,7 +166,7 @@ def _apply_migrations(conn):
         log.info("Migration: renamed sensor_readings.sensor_id -> sensor_name")
 
     conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','4')"
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','5')"
     )
 
 def init_db():
@@ -167,9 +176,17 @@ def init_db():
     conn = sqlite3.connect(DB_FILE, timeout=10)
     # Enable WAL once at boot. Idempotent — persists in the DB file header.
     conn.execute("PRAGMA journal_mode=WAL")
+    # Migrations run BEFORE schema.sql. Reason: schema.sql contains
+    # CREATE INDEX statements that reference columns added by migrations
+    # (e.g. sensor_readings.last_change_ts). On an existing DB the
+    # CREATE TABLE IF NOT EXISTS statements are no-ops, so those indexes
+    # would fail against a table that hasn't been ALTERed yet.
+    _apply_migrations(conn)
     with open(SCHEMA_FILE, "r") as f:
         schema = f.read()
     conn.executescript(schema)
+    # Run migrations a second time — cheap, idempotent, and it picks up
+    # anything schema.sql just created that also needs an ALTER.
     _apply_migrations(conn)
     conn.commit()
     conn.close()
@@ -448,27 +465,57 @@ def on_mqtt_message(client, userdata, msg):
                 conn.close()
                 return
             sensor_type = None
-            # Match metric keywords. Order matters: 'co2' must be checked before
-            # 'co' to avoid false positives on 'co' words.
+            # Match metric keywords.
+            # - 'heartbeat' is checked specially because the topic name
+            #   often puts it AFTER the sensor label (e.g.
+            #   'sht41-4_heartbeat_counter'). We match a heartbeat
+            #   metric only if a number in the name (e.g. 'counter') is
+            #   present, to avoid matching things like 'light' that
+            #   contain 'heat' as a substring.
+            # - 'co2' must be checked before 'co' to avoid false positives
+            #   on 'co' words.
             lname = sensor_name.lower()
-            for key in ("temperature", "humidity", "co2", "light", "pressure"):
-                if key in lname:
-                    sensor_type = key
-                    break
+            sensor_type = None
+            if any(k in lname for k in ("temperature", "humidity", "light", "pressure")):
+                for key in ("temperature", "humidity", "co2", "light", "pressure"):
+                    if key in lname:
+                        sensor_type = key
+                        break
+            elif "heartbeat" in lname and ("counter" in lname or "ping" in lname or "tick" in lname):
+                # Strong heartbeat signal: name contains 'heartbeat' AND
+                # one of the words ESPHome uses for that purpose (counter, ping, tick).
+                # Falls through and rejects names like 'preheat_sensor' that merely
+                # contain 'heat'.
+                sensor_type = "heartbeat"
+            elif "heartbeat" in lname:
+                # Lenient fallback: matches 'sht41-4_heartbeat_counter' style names
+                # even when the trailing word isn't one of the explicit ones above.
+                sensor_type = "heartbeat"
             if sensor_type is None:
                 # No recognised metric in the name. Likely a non-numeric sensor
                 # whose float() somehow succeeded, or a numeric sensor whose
                 # name doesn't encode a type. Drop silently.
                 conn.close()
                 return
-            # Per-sensor row (one value per device+sensor+type; the latest wins via UNIQUE upsert).
-            cursor.execute("""
-                INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts)
-                VALUES (?, ?, ?, ?, ?)
+            # Per-sensor row. UPSERT: update value+ts on every packet, but only
+            # update last_change_ts when the value differs by more than
+            # watchdog.sensor_flatline_min_change_pct (default 0.1%). This lets
+            # us detect a value-flatline (sensor stuck) without needing a
+            # historical readings table.
+            tol = float(config.get("watchdog", {}).get("sensor_flatline_min_change_pct", 0.1)) / 100.0
+            cursor.execute(f"""
+                INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
                     value = excluded.value,
-                    ts    = excluded.ts
-            """, (device_id, sensor_name, sensor_type, val, now))
+                    ts    = excluded.ts,
+                    last_change_ts = CASE
+                        WHEN ((excluded.value - value) BETWEEN -?*ABS(value) AND +?*ABS(value))
+                          OR (excluded.value = value)
+                        THEN last_change_ts
+                        ELSE excluded.ts
+                    END
+            """, (device_id, sensor_name, sensor_type, val, now, now, tol, tol))
             # Roll up to devices for fast dashboard reads (last value wins per device, any sensor).
             if sensor_type == "temperature":
                 cursor.execute(
@@ -482,7 +529,7 @@ def on_mqtt_message(client, userdata, msg):
                 cursor.execute(
                     "UPDATE devices SET last_co2 = ? WHERE device_id = ?", (val, device_id)
                 )
-            # light/pressure intentionally not denormalised — dashboard only shows
+            # heartbeat/light/pressure intentionally not denormalised — dashboard only shows
             # the headline metrics; per-sensor view shows the rest.
         conn.commit()
         conn.close()
@@ -537,43 +584,126 @@ def _raise_or_nag(cursor, device_id, fault_type, fault_msg, nag_interval_s, now)
         cursor.execute("UPDATE alerts SET last_nagged_at = ? WHERE id = ?", (now, active["id"]))
 
 def watchdog_eval_loop():
+    """Detect faults in priority order: OFFLINE > STALLED > SUSPECTED_STALL > ONLINE.
+
+    Status precedence at the device level:
+      - OFFLINE    — no MQTT traffic past timeout, or LWT offline
+      - STALLED    — heartbeat counter (if any) hasn't changed past timeout
+      - DEGRADED   — at least one sensor value hasn't changed past sensor_flatline_seconds;
+                     the rest of the device looks otherwise healthy
+      - ONLINE     — all values flowing
+
+    Per-sensor SUSPECTED_STALL alerts are raised separately and roll the
+    device up to DEGRADED.
+    """
     try:
         conn = get_db()
         cursor = conn.cursor()
         now = datetime.now()
-        offline_limit = config["watchdog"]["default_offline_timeout_seconds"]
-        heartbeat_limit = config["watchdog"]["default_heartbeat_timeout_seconds"]
-        nag_interval = config["telegram"]["nagging_interval_seconds"]
+        offline_limit  = config["watchdog"]["default_offline_timeout_seconds"]
+        heartbeat_lim  = config["watchdog"]["default_heartbeat_timeout_seconds"]
+        flatline_limit  = int(config["watchdog"].get("sensor_flatline_seconds", 300))
+        nag_interval    = config["telegram"]["nagging_interval_seconds"]
 
         for dev in cursor.execute("SELECT * FROM devices").fetchall():
             device_id = dev["device_id"]
             snooze_until = _parse_ts(dev["snooze_until"])
             if snooze_until and now < snooze_until:
                 continue
-            last_seen = _parse_ts(dev["last_seen"])
-            last_hb_time = _parse_ts(dev["last_heartbeat_time"])
-            fault_type = None
-            fault_msg = ""
 
-            is_offline_topic = dev["status"] == "OFFLINE"
+            last_seen    = _parse_ts(dev["last_seen"])
+            last_hb_time = _parse_ts(dev["last_heartbeat_time"])
+            prev_status  = dev["status"]
+
+            fault_type = None
+            fault_msg  = ""
+
+            # 1. OFFLINE check (highest precedence)
+            is_offline_topic = prev_status == "OFFLINE"
             is_silent = last_seen and (now - last_seen).total_seconds() > offline_limit
             if is_offline_topic or is_silent:
                 fault_type = "OFFLINE"
                 silent_for = int((now - last_seen).total_seconds()) if last_seen else 0
                 fault_msg = f"Device silent for {silent_for}s."
-                if dev["status"] != "OFFLINE":
-                    cursor.execute("UPDATE devices SET status = 'OFFLINE' WHERE device_id = ?", (device_id,))
-            elif last_hb_time and (now - last_hb_time).total_seconds() > heartbeat_limit:
+
+            # 2. STALLED (heartbeat) check — only if device isn't already offline
+            elif last_hb_time and (now - last_hb_time).total_seconds() > heartbeat_lim:
                 fault_type = "STALLED"
                 fault_msg = f"Heartbeat counter frozen for {int((now - last_hb_time).total_seconds())}s."
-                if dev["status"] != "STALLED":
-                    cursor.execute("UPDATE devices SET status = 'STALLED' WHERE device_id = ?", (device_id,))
+
+            # 3. Per-sensor checks. Two distinct failure modes, deliberately
+            #    separated so the operator knows which one they're chasing:
+            #
+            #    SENSOR_SILENT   — no packets at all for > flatline window.
+            #                      Almost always a config/bus/power problem.
+            #    SUSPECTED_STALL — packets ARE arriving but the value hasn't
+            #                      changed past the window. Usually a dead chip
+            #                      OR a genuinely stable environment.
+            #
+            #    Both roll the device up to DEGRADED.
+            sensor_fault = cursor.execute("""
+                SELECT sensor_name, sensor_type, value, ts, last_change_ts,
+                       (julianday(?) - julianday(ts)) * 86400.0        AS silent_s,
+                       (julianday(?) - julianday(last_change_ts)) * 86400.0 AS flat_s
+                FROM sensor_readings
+                WHERE device_id = ?
+                  AND last_change_ts IS NOT NULL
+                  AND (julianday(?) - julianday(last_change_ts)) * 86400.0 > ?
+            """, (now.isoformat(sep=" "),
+                  now.isoformat(sep=" "),
+                  device_id,
+                  now.isoformat(sep=" "),
+                  flatline_limit)).fetchall()
+
+            if not fault_type and sensor_fault:
+                # SENSOR_SILENT takes precedence over SUSPECTED_STALL per sensor.
+                silent = [r for r in sensor_fault if (r["silent_s"] or 0) > flatline_limit]
+                flat   = [r for r in sensor_fault if (r["silent_s"] or 0) <= flatline_limit]
+                if silent:
+                    worst = max(silent, key=lambda r: r["silent_s"])
+                    fault_type = "SENSOR_SILENT"
+                    fault_msg = (
+                        f"Sensor {worst['sensor_name']} ({worst['sensor_type']}) "
+                        f"stopped publishing {int(worst['silent_s'])}s ago."
+                    )
+                else:
+                    worst = max(flat, key=lambda r: r["flat_s"])
+                    fault_type = "SUSPECTED_STALL"
+                    fault_msg = (
+                        f"Sensor {worst['sensor_name']} ({worst['sensor_type']}) "
+                        f"publishing but value unchanged for {int(worst['flat_s'])}s."
+                    )
+
+            # Update device.status
+            if fault_type:
+                if fault_type in ("SUSPECTED_STALL", "SENSOR_SILENT"):
+                    new_status = "DEGRADED"
+                else:
+                    new_status = fault_type
             else:
-                if dev["status"] != "ONLINE":
-                    cursor.execute("UPDATE devices SET status = 'ONLINE' WHERE device_id = ?", (device_id,))
-                cursor.execute("UPDATE alerts SET resolved = 1 WHERE device_id = ? AND resolved = 0", (device_id,))
+                new_status = "ONLINE"
+
+            if prev_status != new_status:
+                cursor.execute(
+                    "UPDATE devices SET status = ? WHERE device_id = ?",
+                    (new_status, device_id),
+                )
+
+            # Resolve any open alerts of the same type if recovery happened
+            if not fault_type:
+                cursor.execute(
+                    "UPDATE alerts SET resolved = 1 WHERE device_id = ? AND resolved = 0",
+                    (device_id,),
+                )
+            elif new_status != prev_status:
+                # When status transitions to a different fault, leave alerts of the
+                # *previous* type alone — operators want to see the history.
+                pass
+
+            # Raise / re-nag alert
             if fault_type:
                 _raise_or_nag(cursor, device_id, fault_type, fault_msg, nag_interval, now)
+
         conn.commit()
         conn.close()
     except Exception:
@@ -693,6 +823,10 @@ a:hover { color: var(--accent-hover); }
 .badge.badge-online { background: var(--success); }
 .badge.badge-stalled { background: var(--warning); }
 .badge.badge-offline { background: var(--danger); }
+.badge.badge-suspect   { background: #d97706; }
+.badge.badge-degraded  { background: #6d28d9; }
+.badge.badge-silent     { background: #0891b2; }
+.badge.badge-warning   { background: var(--warning); color: white; }
 .badge.badge-mqtt-ok { background: var(--success); }
 .badge.badge-mqtt-down { background: var(--danger); }
 .badge.badge-muted { background: var(--muted); }
@@ -971,6 +1105,36 @@ def unsnooze(device_id):
     conn.commit(); conn.close()
     audit("UNSNOOZE", device_id=device_id, details="Unsnoozed via web")
     return redirect(url_for("index"))
+
+
+@app.route("/device/<device_id>/reset_stale", methods=["POST"])
+@login_required
+def reset_device_stale(device_id):
+    """Operator-driven reset for a device whose STALLED alert is a false
+    positive -- e.g. the firmware stops publishing the heartbeat counter but
+    measurements are still flowing. Resolves the device's open alerts and
+    rebases last_change_ts so SUSPECTED_STALL doesn't immediately re-fire.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE alerts SET resolved = 1 WHERE device_id = ? AND resolved = 0",
+        (device_id,),
+    )
+    cursor.execute("""
+        UPDATE sensor_readings
+        SET last_change_ts = CURRENT_TIMESTAMP
+        WHERE device_id = ?
+    """, (device_id,))
+    cursor.execute(
+        "UPDATE devices SET status = 'ONLINE', snooze_until = NULL WHERE device_id = ?",
+        (device_id,),
+    )
+    conn.commit(); conn.close()
+    audit("RESET_STALE", device_id=device_id,
+          details="Operator reset; alerts resolved, last_change_ts rebased.")
+    return redirect(url_for("index"))
+
 
 @app.route("/api/restart/<device_id>", methods=["POST"])
 @login_required
@@ -1541,9 +1705,47 @@ def _watchdog_check_health():
     except Exception:
         log.exception("_watchdog_check_health crashed")
 
+def _rebase_stale_readings_on_boot():
+    """On first boot to schema v5 (or after a long downtime), rebase
+    last_change_ts so existing rows do not immediately look "stalled".
+
+    Without this, every sensor_readings row whose last_change_ts is older
+    than sensor_flatline_seconds will fire a SUSPECTED_STALL on the first
+    watchdog tick -- a noisy false-start.
+
+    We only rebase to "now", then mark the corresponding alert as
+    already-handled by clearing any open SUSPECTED_STALL alerts whose
+    triggered_at falls in the rebase window.
+    """
+    flatline_limit = int(config["watchdog"].get("sensor_flatline_seconds", 300))
+    conn = get_db()
+    cursor = conn.cursor()
+    rebase_count = cursor.execute("""
+        UPDATE sensor_readings
+        SET last_change_ts = CURRENT_TIMESTAMP
+        WHERE last_change_ts IS NULL
+           OR (julianday('now') - julianday(last_change_ts)) * 86400.0 > ?
+    """, (flatline_limit * 4,)).rowcount  # 4x the limit: only rebase genuinely stale.
+    if rebase_count:
+        # Mark the device as ONLINE on cold start so we don't show DEGRADED for
+        # 5 minutes after every restart.
+        cursor.execute("""
+            UPDATE devices SET status = 'ONLINE'
+            WHERE status IS NOT 'OFFLINE'
+        """)
+        cursor.execute(
+            "UPDATE alerts SET resolved = 1 WHERE alert_type IN ('SUSPECTED_STALL','SENSOR_SILENT') AND resolved = 0"
+        )
+        log.info("Cold-start rebase: set last_change_ts = now() for %d stale rows; "
+                 "resolved pre-existing SUSPECTED_STALL alerts.", rebase_count)
+    conn.commit()
+    conn.close()
+
+
 def main():
     init_db()
     _ensure_password_hashes()
+    _rebase_stale_readings_on_boot()
     client = start_mqtt()
     _mqtt_client_holder["client"] = client
     scheduler = BackgroundScheduler()

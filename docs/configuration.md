@@ -115,6 +115,33 @@ last **changed value**:
 updates only when the heartbeat counter value actually changes — sending the
 same number repeatedly does not refresh the stall timer.
 
+### Per-sensor detection (v5+)
+
+Heartbeat is not always published by every device. Since schema v5 the
+watchdog also evaluates **each individual sensor channel** and raises
+per-sensor alerts. Two failure modes are deliberately kept separate,
+because they point at different root causes:
+
+| Alert | Condition | Usual cause |
+|---|---|---|
+| `SENSOR_SILENT` | No packet from that channel for longer than `sensor_flatline_seconds`, while other channels on the same device keep publishing | Config, bus wiring, or power to that one sensor |
+| `SUSPECTED_STALL` | Packets **are** arriving but the numeric value has not changed (beyond `sensor_flatline_min_change_pct`) for longer than `sensor_flatline_seconds` | A dead/frozen sensor chip, **or** a genuinely stable environment |
+
+Either one rolls the device up to status **`DEGRADED`**.
+
+How the two are told apart in practice: `SENSOR_SILENT` compares `ts` (last
+packet of any kind for that channel) while `SUSPECTED_STALL` compares
+`last_change_ts` (last packet whose *value* differed). A channel with
+`ts` old but `last_change_ts` recent is silent; a channel with both fresh
+but a frozen value is stalled.
+
+**Tuning `sensor_flatline_seconds`.** 300 s (5 min) is a reasonable
+starting point, but rooms that are genuinely steady-state — a drying
+room, a sealed CO₂ chamber — can legitimately hold a value for hours. If
+you see recurring false positives on a specific channel, raise the
+timeout, or reset that device from the dashboard
+(`POST /device/<id>/reset_stale`) to clear the alert until the value moves.
+
 ### Coercion of env vars
 
 `WATCHDOG_MQTT_PORT` is parsed as `int`. `WATCHDOG_TG_ENABLED` accepts
