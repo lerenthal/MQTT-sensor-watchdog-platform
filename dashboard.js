@@ -6,6 +6,10 @@ let ALL_DEVICES = [];
 let SORT_KEY = localStorage.getItem('watchdog-sort-key') || null;
 let SORT_DIR = localStorage.getItem('watchdog-sort-dir') || 'asc';
 let SEARCH_DEBOUNCE = null;
+// FIX 1: the table body is rebuilt wholesale on every poll, which wipes any
+// open/closed state held in the DOM. Track expansion in a Set so panels
+// survive the re-render. Persisted so a page reload keeps the operator's view.
+let EXPANDED = new Set(JSON.parse(localStorage.getItem('watchdog-expanded') || '[]'));
 
 function escapeHtml(s) {
     return String(s ?? '').replace(/[&<>"']/g, c => ({
@@ -26,33 +30,70 @@ function sensorCell(d) {
     if (!d.sensor_count) {
         return '<span class="muted">no readings</span>';
     }
+    const h = d.sensor_health || {healthy: 0, suspected: 0, silent: 0};
     const sorted = (d.sensors || []).slice().sort((a, b) => {
         if (a.sensor_name !== b.sensor_name) return a.sensor_name.localeCompare(b.sensor_name);
         return a.sensor_type.localeCompare(b.sensor_type);
     });
     const lines = sorted.map(s => {
         const v = (typeof s.value === 'number') ? s.value.toFixed(2) : '--';
-        return '<div><span class="ts">' + escapeHtml(s.sensor_name) + '</span> &middot; '
-             + escapeHtml(s.sensor_type) + ': <strong>' + escapeHtml(v) + '</strong></div>';
+        let flag = '';
+        if (s.silent_seconds > 300) {
+            flag = '<span class="badge badge-silent">silent '
+                 + Math.round(s.silent_seconds / 60) + 'm</span>';
+        } else if (s.flat_seconds > 300) {
+            flag = '<span class="badge badge-suspect">frozen '
+                 + Math.round(s.flat_seconds / 60) + 'm</span>';
+        }
+        return '<div class="sensor-line"><span class="ts">'
+             + escapeHtml(s.sensor_name) + '</span> &middot; '
+             + escapeHtml(s.sensor_type) + ': <strong>' + escapeHtml(v) + '</strong> '
+             + flag + '</div>';
     }).join('');
     const id = encodeURIComponent(d.device_id);
-    return '<span class="muted">' + d.sensor_count + ' sensor'
-        + (d.sensor_count !== 1 ? 's' : '') + '</span>'
+    const isOpen = EXPANDED.has(d.device_id);
+    // Counters in the collapsed cell tell you something is wrong before you click.
+    let tally = '<span class="muted">' + d.sensor_count + ' sensor'
+        + (d.sensor_count !== 1 ? 's' : '') + '</span>';
+    if (h.silent)   tally += ' <span class="badge badge-silent">' + h.silent + ' silent</span>';
+    if (h.suspected) tally += ' <span class="badge badge-suspect">' + h.suspected + ' frozen</span>';
+    return tally
         + ' <button class="btn btn-sm" onclick="toggleSensors(\''
-        + escapeHtml(d.device_id) + '\', this)">&#9656;</button>'
+        + escapeHtml(d.device_id) + '\', this)">'
+        + (isOpen ? '&#9662;' : '&#9656;') + '</button>'
         + '<div id="sensors-' + id + '" '
-        + 'style="display:none;margin-top:.5rem;padding:.5rem;'
+        + 'style="display:' + (isOpen ? 'block' : 'none')
+        + ';margin-top:.5rem;padding:.5rem;'
         + 'background:var(--bg);border-radius:6px;font-size:.85rem;">'
         + lines + '</div>';
 }
 
 window.toggleSensors = function (deviceId, btn) {
-    const id = 'sensors-' + encodeURIComponent(deviceId);
-    const el = document.getElementById(id);
-    if (!el) return;
-    const open = el.style.display !== 'none';
-    el.style.display = open ? 'none' : 'block';
-    btn.innerHTML = open ? '&#9656;' : '&#9662;';
+    if (EXPANDED.has(deviceId)) {
+        EXPANDED.delete(deviceId);
+    } else {
+        EXPANDED.add(deviceId);
+    }
+    localStorage.setItem('watchdog-expanded', JSON.stringify([...EXPANDED]));
+    // Flip the panel directly rather than waiting for the next poll.
+    const el = document.getElementById('sensors-' + encodeURIComponent(deviceId));
+    if (el) {
+        const open = EXPANDED.has(deviceId);
+        el.style.display = open ? 'block' : 'none';
+        if (btn) btn.innerHTML = open ? '&#9662;' : '&#9656;';
+    }
+};
+
+window.collapseAll = function () {
+    EXPANDED.clear();
+    localStorage.setItem('watchdog-expanded', '[]');
+    refresh();
+};
+
+window.expandAll = function () {
+    ALL_DEVICES.forEach(d => EXPANDED.add(d.device_id));
+    localStorage.setItem('watchdog-expanded', JSON.stringify([...EXPANDED]));
+    refresh();
 };
 
 function renderRow(d) {
@@ -78,10 +119,31 @@ function renderRow(d) {
           + '<button class="btn btn-sm btn-danger" '
           + 'onclick="restart(\'' + escapeHtml(d.device_id) + '\')">Restart</button>';
 
+    // FIX 2: an explicit "why is this device not OK" column. Built from the
+    // same signals the watchdog used, so it agrees with the status badge.
+    let reason;
+    if (d.reason) {
+        const detail = (d.reason_detail || []).slice(0, 4).map(f =>
+            '<div class="reason-line"><span class="badge badge-'
+            + (f.alert_type === 'OFFLINE' ? 'offline'
+              : f.alert_type === 'STALLED' ? 'stalled'
+              : f.alert_type === 'SENSOR_SILENT' ? 'silent'
+              : 'suspect')
+            + '">' + escapeHtml(f.alert_type) + '</span> '
+            + escapeHtml(f.message)
+            + '<br><span class="ts">since '
+            + (f.triggered_at || '').slice(0, 19) + '</span></div>'
+        ).join('');
+        reason = '<div class="reason-box">' + detail + '</div>';
+    } else {
+        reason = '<span class="muted">—</span>';
+    }
+
     return '<tr data-device="' + escapeHtml(d.device_id)
         + '" data-status="' + escapeHtml(d.status)
         + '" data-location="' + escapeHtml(d.location || '')
         + '" data-role="' + escapeHtml(d.role || '')
+        + '" data-reason="' + escapeHtml(d.reason || '')
         + '" data-temp="' + (d.last_temp ?? '')
         + '" data-hum="' + (d.last_hum ?? '')
         + '" data-co2="' + (d.last_co2 ?? '')
@@ -93,6 +155,7 @@ function renderRow(d) {
           + '<br><span class="muted" style="font-size:.75rem">'
           + escapeHtml(d.role || '') + '</span></td>'
         + '<td>' + status + '</td>'
+        + '<td>' + reason + '</td>'
         + '<td class="ts">' + (d.last_seen || 'Never') + '</td>'
         + '<td>' + (d.last_heartbeat_value ?? 'N/A') + '</td>'
         + '<td>' + (d.last_temp ?? '--') + '</td>'
@@ -111,7 +174,8 @@ function applyFilter() {
     rows.forEach(r => {
         if (!q) { r.style.display = ''; visible++; return; }
         const haystack = (r.dataset.device + ' ' + r.dataset.location + ' '
-            + r.dataset.role + ' ' + r.dataset.status + ' ' + r.dataset.temp
+            + r.dataset.role + ' ' + r.dataset.status + ' ' + r.dataset.reason
+            + ' ' + r.dataset.temp
             + ' ' + r.dataset.hum + ' ' + r.dataset.co2
             + ' ' + (r.textContent || '')).toLowerCase();
         r.style.display = haystack.includes(q) ? '' : 'none';
@@ -168,7 +232,7 @@ async function refresh() {
         ALL_DEVICES = data.devices || [];
         const tbody = document.getElementById('devices-tbody');
         if (!ALL_DEVICES.length) {
-            tbody.innerHTML = '<tr><td colspan="11" class="muted">'
+            tbody.innerHTML = '<tr><td colspan="12" class="muted">'
                 + 'No devices yet &mdash; waiting for MQTT traffic&hellip;</td></tr>';
             document.getElementById('row-count').textContent = '';
             return;

@@ -865,6 +865,23 @@ a:hover { color: var(--accent-hover); }
 .badge.badge-suspect   { background: #d97706; }
 .badge.badge-degraded  { background: #6d28d9; }
 .badge.badge-silent     { background: #0891b2; }
+/* FIX 3: freeze the column header row so it stays visible while scrolling. */
+.sticky-head th {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: var(--surface);
+    box-shadow: inset 0 -1px 0 var(--border);
+}
+.sticky-head th .sort-arrow { position: relative; top: 0; }
+/* FIX 2: per-device fault explanation. */
+.reason-box { font-size: .8rem; line-height: 1.35; }
+.reason-line { margin-bottom: .3rem; }
+.reason-line:last-child { margin-bottom: 0; }
+/* FIX 1: keep the expanded sensor panel readable inside a table cell. */
+.sensor-line { padding: .1rem 0; }
+/* Horizontal scroll + capped height so the sticky header has something to stick against. */
+.table-scroll { overflow-x: auto; max-height: 72vh; overflow-y: auto; }
 .badge.badge-warning   { background: var(--warning); color: white; }
 .badge.badge-mqtt-ok { background: var(--success); }
 .badge.badge-mqtt-down { background: var(--danger); }
@@ -1039,16 +1056,19 @@ def index():
          style="max-width:340px;margin-left:1rem"
          oninput="dashboardSearch()">
   <span id="row-count" class="muted"></span>
+  <button class="btn btn-sm" onclick="expandAll()" title="Expand every sensor panel">&#9662; Expand all</button>
+  <button class="btn btn-sm" onclick="collapseAll()" title="Collapse every sensor panel">&#9656; Collapse all</button>
   <span style="margin-left:auto"><a class="btn btn-primary" href="{{{{ url_for('print_report') }}}}">🖨 Print Report</a></span>
 </div>
 <div class="card">
   <h3>Monitored Devices <span class="muted" style="font-weight:400;font-size:.85rem">— click a column header to sort</span></h3>
-  <div style="overflow-x:auto">
+  <div class="table-scroll">
     <table class="table">
-      <thead><tr>
+      <thead class="sticky-head"><tr>
         <th data-sort="device">Device <span class="sort-arrow"></span></th>
         <th data-sort="location">Location / Role <span class="sort-arrow"></span></th>
         <th data-sort="status">Status <span class="sort-arrow"></span></th>
+        <th data-sort="reason">Reason <span class="sort-arrow"></span></th>
         <th data-sort="lastseen">Last Seen <span class="sort-arrow"></span></th>
         <th data-sort="heartbeat">Heartbeat <span class="sort-arrow"></span></th>
         <th data-sort="temp">Temp °C <span class="sort-arrow"></span></th>
@@ -1080,32 +1100,104 @@ def api_devices():
         "SELECT * FROM devices ORDER BY device_id ASC"
     ).fetchall()]
     sensor_rows = conn.execute("""
-        SELECT device_id, sensor_name, sensor_type, value, ts
+        SELECT device_id, sensor_name, sensor_type, value, ts, last_change_ts
         FROM sensor_readings
     """).fetchall()
+    now_s = datetime.now().isoformat(sep=" ")
+
+    # Active fault alerts, so the dashboard can explain *why* a device is in
+    # its current status rather than making the operator go dig for it.
+    fault_rows = conn.execute("""
+        SELECT device_id, alert_type, message, triggered_at
+        FROM alerts
+        WHERE resolved = 0
+        ORDER BY triggered_at ASC
+    """).fetchall()
+    faults_by_device = {}
+    for r in fault_rows:
+        faults_by_device.setdefault(r["device_id"], []).append({
+            "alert_type": r["alert_type"],
+            "message": r["message"],
+            "triggered_at": r["triggered_at"],
+        })
     conn.close()
 
     sensors_by_device = {}
     for r in sensor_rows:
+        silent_s = flat_s = None
+        if r["ts"]:
+            silent_s = int((datetime.now()
+                            - _parse_ts(r["ts"])).total_seconds())
+        if r["last_change_ts"]:
+            flat_s = int((datetime.now()
+                          - _parse_ts(r["last_change_ts"])).total_seconds())
         sensors_by_device.setdefault(r["device_id"], []).append({
             "sensor_name": r["sensor_name"],
             "sensor_type": r["sensor_type"],
             "value": r["value"],
             "ts": r["ts"],
+            "last_change_ts": r["last_change_ts"],
+            "silent_seconds": silent_s,
+            "flat_seconds": flat_s,
         })
 
-    # Summary fields the dashboard can't compute cheaply from raw sensors.
+    flatline_limit = int(config.get("watchdog", {}).get("sensor_flatline_seconds", 300))
+
     for d in devices:
         s = sensors_by_device.get(d["device_id"], [])
         d["sensors"] = s
         d["sensor_count"] = len({x["sensor_name"] for x in s})
-        # Latest reading per sensor-type (used in the expand row).
-        d["latest_by_type"] = {
-            x["sensor_type"]: {"value": x["value"], "ts": x["ts"]}
-            for x in s
-        }
         d["location"] = d.get("location") or ""
         d["role"] = d.get("role") or ""
+        d["faults"] = faults_by_device.get(d["device_id"], [])
+
+        # Per-sensor health, mirroring the watchdog's own classification so the
+        # operator sees exactly what the watchdog saw.
+        healthy, suspect, silent = [], [], []
+        for x in s:
+            if x["sensor_type"] == "heartbeat":
+                continue  # a health counter, not an environmental reading
+            if x["silent_seconds"] is not None and x["silent_seconds"] > flatline_limit:
+                silent.append(x)
+            elif x["flat_seconds"] is not None and x["flat_seconds"] > flatline_limit:
+                suspect.append(x)
+            else:
+                healthy.append(x)
+        d["sensor_health"] = {
+            "healthy": len(healthy),
+            "suspected": len(suspect),
+            "silent": len(silent),
+        }
+
+        # Human-readable reason for the device's status, built from the same
+        # signals the watchdog used. Empty string when healthy.
+        reasons = []
+        st = d["status"]
+        if st == "OFFLINE":
+            seen = _parse_ts(d.get("last_seen"))
+            if seen:
+                reasons.append("no MQTT traffic for %ds"
+                               % int((datetime.now() - seen).total_seconds()))
+            else:
+                reasons.append("never seen on the broker")
+        elif st == "STALLED":
+            hb = _parse_ts(d.get("last_heartbeat_time"))
+            if hb:
+                reasons.append("heartbeat frozen for %ds"
+                               % int((datetime.now() - hb).total_seconds()))
+            else:
+                reasons.append("heartbeat counter not received")
+        elif st == "DEGRADED":
+            for x in silent:
+                reasons.append("%s stopped publishing %ds ago"
+                               % (x["sensor_name"], x["silent_seconds"]))
+            for x in suspect:
+                reasons.append("%s value frozen for %ds"
+                               % (x["sensor_name"], x["flat_seconds"]))
+            if not reasons and d["faults"]:
+                reasons.append(d["faults"][0]["message"])
+        d["reason"] = "; ".join(reasons)
+        d["reason_detail"] = d["faults"]
 
     with mqtt_health_lock:
         health = dict(mqtt_health)
