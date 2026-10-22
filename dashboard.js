@@ -193,20 +193,20 @@ function renderRow(d) {
         + '" data-lastseen="' + (d.last_seen || '')
         + '" data-heartbeat="' + (d.last_heartbeat_value ?? '')
         + '">'
-        + '<td><strong>' + escapeHtml(d.device_id) + '</strong></td>'
-        + '<td>' + escapeHtml(d.location || '')
-          + '<br><span class="muted" style="font-size:.75rem">'
-          + escapeHtml(d.role || '') + '</span></td>'
-        + '<td>' + status + '</td>'
-        + '<td>' + reason + '</td>'
-        + '<td class="ts">' + (d.last_seen || 'Never') + '</td>'
-        + '<td>' + (d.last_heartbeat_value ?? 'N/A') + '</td>'
-        + '<td>' + (d.last_temp ?? '--') + '</td>'
-        + '<td>' + (d.last_hum ?? '--') + '</td>'
-        + '<td>' + (d.last_co2 ?? '--') + '</td>'
-        + '<td>' + sensorCell(d) + '</td>'
-        + '<td>' + snooze + '</td>'
-        + '<td>' + actions + '</td>'
+        + '<td class="col-device"><strong>' + escapeHtml(d.device_id) + '</strong></td>'
+        + '<td class="col-location">' + escapeHtml(d.location || '')
+          + (d.role ? '<br><span class="muted" style="font-size:.75rem">'
+                     + escapeHtml(d.role) + '</span>' : '') + '</td>'
+        + '<td class="col-status">' + status + '</td>'
+        + '<td class="col-reason">' + reason + '</td>'
+        + '<td class="col-lastseen ts">' + (d.last_seen || 'Never').slice(5, 19) + '</td>'
+        + '<td class="col-heartbeat num">' + (d.last_heartbeat_value ?? '--') + '</td>'
+        + '<td class="col-temp num">' + (d.last_temp ?? '--') + '</td>'
+        + '<td class="col-hum num">' + (d.last_hum ?? '--') + '</td>'
+        + '<td class="col-co2 num">' + (d.last_co2 ?? '--') + '</td>'
+        + '<td class="col-sensors">' + sensorCell(d) + '</td>'
+        + '<td class="col-snooze">' + snooze + '</td>'
+        + '<td class="col-actions">' + actions + '</td>'
         + '</tr>';
 }
 
@@ -267,6 +267,27 @@ function handleSortClick(th) {
     applySort();
 }
 
+// Systemic fault banner: N devices losing the same metric in the same
+// window is a broker / network / ACL event, not N sensor failures. Say so
+// explicitly so an operator doesn't go chasing twenty CO2 sensors.
+function renderSystemic(list) {
+    const el = document.getElementById('systemic-banner');
+    if (!el) return;
+    if (!list.length) { el.innerHTML = ''; return; }
+    el.innerHTML = list.map(c =>
+        '<div class="systemic-banner"><span>&#9888;</span><div>'
+        + '<strong>Systemic fault: ' + escapeHtml(c.sensor_type) + ' silent on '
+        + c.count + ' devices</strong><br>'
+        + '<span class="muted">All stopped between '
+        + Math.round(c.window_start / 60) + ' and ' + Math.round(c.window_end / 60)
+        + ' minutes ago. Simultaneous loss of one metric across many devices '
+        + 'points at the broker, network or an ACL change &mdash; not at the '
+        + 'sensors themselves.</span><br>'
+        + '<span class="muted">Affected: ' + escapeHtml(c.devices.join(', '))
+        + '</span></div></div>'
+    ).join('');
+}
+
 async function refresh() {
     try {
         const res = await fetch('/api/devices');
@@ -290,6 +311,7 @@ async function refresh() {
         } else {
             mb.className = 'badge badge-mqtt-down'; mb.textContent = 'MQTT: DOWN';
         }
+        renderSystemic(data.systemic || []);
     } catch (e) { console.error(e); }
 }
 

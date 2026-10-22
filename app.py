@@ -618,6 +618,72 @@ def _raise_or_nag(cursor, device_id, fault_type, fault_msg, nag_interval_s, now)
         telegram_engine.send_nag_alert(device_id, fault_type, fault_msg)
         cursor.execute("UPDATE alerts SET last_nagged_at = ? WHERE id = ?", (now, active["id"]))
 
+def _detect_systemic_faults(conn, now, flatline_limit):
+    """Find faults that share a metric AND a time window across many devices.
+
+    A single broker, ACL or network fault will stop one metric on every
+    device at once. Reported individually that is N alarming alerts; reported
+    as one cluster it is one actionable finding. We require BOTH:
+
+      - the same sensor_type across many devices, and
+      - their last-packet timestamps clustered inside a short window
+
+    A genuine per-sensor hardware failure fails the second test: ten chips
+    dying simultaneously across ten rooms is not a hardware pattern.
+    """
+    rows = conn.execute("""
+        SELECT device_id, sensor_type, ts
+        FROM sensor_readings
+        WHERE sensor_type != 'heartbeat'
+          AND ts IS NOT NULL
+    """).fetchall()
+
+    # Group silent sensors by metric.
+    by_metric = {}
+    for r in rows:
+        last = _parse_ts(r["ts"])
+        if last is None:
+            continue
+        silent = (now - last).total_seconds()
+        if silent > flatline_limit:
+            by_metric.setdefault(r["sensor_type"], []).append((r["device_id"], silent))
+
+    clusters = []
+    for stype, items in by_metric.items():
+        # A device can publish several channels that all classify as the same
+        # metric (e.g. scd30_1 carries both 'scd30-1_co2' and 'scd30_co2').
+        # Count devices, not channels, or one device inflates the cluster.
+        per_device = {}
+        for dev, silent in items:
+            per_device[dev] = max(per_device.get(dev, 0), silent)
+        items = [(d, s) for d, s in per_device.items()]
+        if len(items) < 3:
+            continue
+        # Cluster by rounding the silence to the nearest 5 minutes; a shared
+        # cause produces a tight cluster, independent failures spread out.
+        buckets = {}
+        for dev, silent in items:
+            key = int(silent // 300)
+            buckets.setdefault(key, []).append(dev)
+        for key, devs in buckets.items():
+            if len(devs) >= 3:
+                clusters.append({
+                    "sensor_type": stype,
+                    "devices": sorted(set(devs)),
+                    "count": len(set(devs)),
+                    "window_start": key * 300,
+                    "window_end": (key + 1) * 300,
+                })
+
+    # Keep only the largest cluster per metric — the dominant systemic fault.
+    best = {}
+    for cl in clusters:
+        cur = best.get(cl["sensor_type"])
+        if cur is None or cl["count"] > cur["count"]:
+            best[cl["sensor_type"]] = cl
+    return sorted(best.values(), key=lambda c: -c["count"])
+
+
 def watchdog_eval_loop():
     """Detect faults in priority order: OFFLINE > STALLED > SUSPECTED_STALL > ONLINE.
 
@@ -743,6 +809,29 @@ def watchdog_eval_loop():
             if fault_type:
                 _raise_or_nag(cursor, device_id, fault_type, fault_msg, nag_interval, now)
 
+        # Systemic faults: many devices losing the same metric in the same
+        # window points at the broker, network or an ACL change rather than at
+        # N independent sensors. Suppress the per-device SENSOR_SILENT noise
+        # for devices caught in a cluster; the cluster is reported instead.
+        systemic = _detect_systemic_faults(conn, now, flatline_limit)
+        if systemic:
+            summary = "; ".join(
+                "%s on %d devices" % (c["sensor_type"], c["count"]) for c in systemic
+            )
+            log.warning("Systemic fault detected: %s", summary)
+            audit("SYSTEMIC_FAULT", details=summary, username="watchdog")
+            clustered = {d for c in systemic for d in c["devices"]}
+            # Resolve the individual per-device alerts for this round; the
+            # cluster alert below carries the actionable information.
+            for c in systemic:
+                for dev in c["devices"]:
+                    cursor.execute(
+                        "UPDATE alerts SET resolved = 1 "
+                        "WHERE device_id = ? AND alert_type = 'SENSOR_SILENT' "
+                        "AND resolved = 0 AND message LIKE ?",
+                        (dev, f"%{c['sensor_type']}%"),
+                    )
+
         conn.commit()
         conn.close()
     except Exception:
@@ -854,10 +943,72 @@ a:hover { color: var(--accent-hover); }
   border-radius: 12px; padding: 1.25rem; box-shadow: var(--shadow); margin-bottom: 1.5rem;
 }
 .card h3 { margin: 0 0 1rem; font-size: 1rem; font-weight: 600; }
-.table { width: 100%; border-collapse: collapse; font-size: .9rem; }
-.table th, .table td { text-align: left; padding: .65rem .75rem; border-bottom: 1px solid var(--border); }
-.table th { color: var(--muted); font-weight: 600; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
-.table tbody tr:hover { background: var(--bg); }
+/* Responsive devices table.
+   The operator frequently runs the browser zoomed below 100% so more of the
+   room fits. Layout rules, in priority order:
+     1. table-layout: fixed + width:100%  -> columns compress to fit, never
+        overflow horizontally.
+     2. Per-column max-widths so a long value (a reason string) wraps instead
+        of stretching its column.
+     3. Below 1200px, drop the least-critical columns (Heartbeat, Last Seen,
+        CO2) into the expanded sensor panel, where they are still available.
+   table-layout:fixed is the load-bearing part: without it a browser picks
+   column widths from content and the table overflows no matter what CSS
+   says. */
+.table.devices {
+    width: 100%;
+    table-layout: fixed;
+    border-collapse: collapse;
+    font-size: .85rem;
+}
+.table.devices th, .table.devices td {
+    text-align: left;
+    padding: .5rem .5rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    overflow-wrap: anywhere;   /* long device_ids / topics wrap, not overflow */
+    word-break: break-word;
+}
+.table.devices th {
+    color: var(--muted); font-weight: 600; font-size: .7rem;
+    text-transform: uppercase; letter-spacing: .03em;
+}
+.table.devices tbody tr:hover { background: var(--bg); }
+/* Column sizing. Sums to ~100%. */
+.col-device    { width: 13%; }
+.col-location  { width: 11%; }
+.col-status    { width: 7%;  }
+.col-reason    { width: 22%; }
+.col-lastseen  { width: 11%; }
+.col-heartbeat { width: 6%;  }
+.col-temp      { width: 6%;  }
+.col-hum       { width: 6%;  }
+.col-co2       { width: 6%;  }
+.col-sensors   { width: 7%;  }
+.col-snooze    { width: 5%;  }
+.col-actions   { width: 6%;  }
+/* Values are tabular so digits line up column to column. */
+.table.devices td.num { font-variant-numeric: tabular-nums; }
+/* Narrow viewports: shed the columns an operator can recover from the
+   sensor panel, so the remaining ones stay legible instead of all shrinking. */
+@media (max-width: 1200px) {
+    .table.devices { font-size: .78rem; }
+    .table.devices th, .table.devices td { padding: .4rem .35rem; }
+    .col-lastseen, .col-heartbeat { display: none; }
+    .col-device   { width: 17%; }
+    .col-location { width: 14%; }
+    .col-status   { width: 9%;  }
+    .col-reason   { width: 30%; }
+    .col-temp     { width: 8%;  }
+    .col-hum      { width: 8%;  }
+    .col-co2      { width: 8%;  }
+    .col-sensors  { width: 9%;  }
+    .col-snooze   { width: 0;   }
+    .col-actions  { width: 0;   }
+}
+@media (max-width: 860px) {
+    .col-location, .col-co2 { display: none; }
+}
 .badge { display: inline-block; padding: .2rem .55rem; border-radius: 999px; font-size: .75rem; font-weight: 600; color: white; }
 .badge.badge-online { background: var(--success); }
 .badge.badge-stalled { background: var(--warning); }
@@ -869,6 +1020,14 @@ a:hover { color: var(--accent-hover); }
    a one-line summary and expands to the full per-sensor breakdown. */
 .reason-box { font-size: .8rem; line-height: 1.35; }
 .reason-line { margin-bottom: .3rem; }
+.systemic-banner {
+    display: flex; align-items: flex-start; gap: .6rem;
+    padding: .7rem .9rem; margin-bottom: .9rem;
+    border-radius: 10px; border: 1px solid var(--danger);
+    background: rgba(220,38,38,.08); color: var(--danger); font-size: .85rem;
+}
+.systemic-banner strong { color: var(--danger); }
+.systemic-banner .muted { color: var(--muted); }
 .reason-line:last-child { margin-bottom: 0; }
 .reason-summary {
     max-width: 320px; overflow: hidden; text-overflow: ellipsis;
@@ -1061,21 +1220,22 @@ def index():
 </div>
 <div class="card">
   <h3>Monitored Devices <span class="muted" style="font-weight:400;font-size:.85rem">— click a column header to sort</span></h3>
+  <div id="systemic-banner"></div>
   <div style="overflow-x:auto">
-    <table class="table">
+    <table class="table devices">
       <thead><tr>
-        <th data-sort="device">Device <span class="sort-arrow"></span></th>
-        <th data-sort="location">Location / Role <span class="sort-arrow"></span></th>
-        <th data-sort="status">Status <span class="sort-arrow"></span></th>
-        <th data-sort="reason">Reason <span class="sort-arrow"></span></th>
-        <th data-sort="lastseen">Last Seen <span class="sort-arrow"></span></th>
-        <th data-sort="heartbeat">Heartbeat <span class="sort-arrow"></span></th>
-        <th data-sort="temp">Temp °C <span class="sort-arrow"></span></th>
-        <th data-sort="hum">Humidity % <span class="sort-arrow"></span></th>
-        <th data-sort="co2">CO2 ppm <span class="sort-arrow"></span></th>
-        <th>Sensors</th>
-        <th>Snooze</th>
-        <th>Actions</th>
+        <th class="col-device"    data-sort="device">Device <span class="sort-arrow"></span></th>
+        <th class="col-location"  data-sort="location">Loc / Role <span class="sort-arrow"></span></th>
+        <th class="col-status"    data-sort="status">Status <span class="sort-arrow"></span></th>
+        <th class="col-reason"    data-sort="reason">Reason <span class="sort-arrow"></span></th>
+        <th class="col-lastseen"  data-sort="lastseen">Last Seen <span class="sort-arrow"></span></th>
+        <th class="col-heartbeat" data-sort="heartbeat">HB <span class="sort-arrow"></span></th>
+        <th class="col-temp"      data-sort="temp">°C <span class="sort-arrow"></span></th>
+        <th class="col-hum"       data-sort="hum">RH% <span class="sort-arrow"></span></th>
+        <th class="col-co2"       data-sort="co2">CO2 <span class="sort-arrow"></span></th>
+        <th class="col-sensors">Sensors</th>
+        <th class="col-snooze">Snooze</th>
+        <th class="col-actions">Actions</th>
       </tr></thead>
       <tbody id="devices-tbody"><tr><td colspan="11" class="muted">Loading…</td></tr></tbody>
     </table>
@@ -1198,9 +1358,20 @@ def api_devices():
         d["reason"] = "; ".join(reasons)
         d["reason_detail"] = d["faults"]
 
+    # Systemic fault rollup for the dashboard banner. Needs its own
+    # connection because the main one is closed by this point.
+    try:
+        flatline_limit = int(config.get("watchdog", {}).get("sensor_flatline_seconds", 300))
+        sysconn = get_db()
+        systemic = _detect_systemic_faults(sysconn, datetime.now(), flatline_limit)
+        sysconn.close()
+    except Exception as e:
+        log.exception("systemic fault detection failed")
+        systemic = []
+
     with mqtt_health_lock:
         health = dict(mqtt_health)
-    return jsonify({"devices": devices, "mqtt": health})
+    return jsonify({"devices": devices, "mqtt": health, "systemic": systemic})
 
 @app.route("/api/devices/<device_id>/sensors")
 @login_required
