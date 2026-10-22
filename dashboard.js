@@ -10,6 +10,9 @@ let SEARCH_DEBOUNCE = null;
 // open/closed state held in the DOM. Track expansion in a Set so panels
 // survive the re-render. Persisted so a page reload keeps the operator's view.
 let EXPANDED = new Set(JSON.parse(localStorage.getItem('watchdog-expanded') || '[]'));
+// Reason panels are tracked separately from sensor panels so the operator can
+// keep one open and the other closed. Default collapsed.
+let REASON_OPEN = new Set(JSON.parse(localStorage.getItem('watchdog-reason-open') || '[]'));
 
 function escapeHtml(s) {
     return String(s ?? '').replace(/[&<>"']/g, c => ({
@@ -84,9 +87,35 @@ window.toggleSensors = function (deviceId, btn) {
     }
 };
 
+window.toggleReason = function (deviceId, btn) {
+    if (REASON_OPEN.has(deviceId)) {
+        REASON_OPEN.delete(deviceId);
+    } else {
+        REASON_OPEN.add(deviceId);
+    }
+    localStorage.setItem('watchdog-reason-open', JSON.stringify([...REASON_OPEN]));
+    const el = document.getElementById('reason-' + encodeURIComponent(deviceId));
+    if (!el) return;
+    const open = REASON_OPEN.has(deviceId);
+    el.style.display = open ? 'block' : 'none';
+    if (btn) {
+        const nf = btn.querySelector('.muted');
+        btn.innerHTML = (open ? '&#9662;' : '&#9656;')
+                      + (nf ? ' <span class="muted">' + nf.textContent + '</span>' : '');
+    }
+};
+
+window.collapseReasons = function () {
+    REASON_OPEN.clear();
+    localStorage.setItem('watchdog-reason-open', '[]');
+    refresh();
+};
+
 window.collapseAll = function () {
     EXPANDED.clear();
+    REASON_OPEN.clear();
     localStorage.setItem('watchdog-expanded', '[]');
+    localStorage.setItem('watchdog-reason-open', '[]');
     refresh();
 };
 
@@ -121,9 +150,12 @@ function renderRow(d) {
 
     // FIX 2: an explicit "why is this device not OK" column. Built from the
     // same signals the watchdog used, so it agrees with the status badge.
+    // Collapsed by default: one truncated line plus a toggle that reveals the
+    // full per-fault breakdown (type badge, message, trigger time).
     let reason;
     if (d.reason) {
-        const detail = (d.reason_detail || []).slice(0, 4).map(f =>
+        const isOpen = REASON_OPEN.has(d.device_id);
+        const detail = (d.reason_detail || []).map(f =>
             '<div class="reason-line"><span class="badge badge-'
             + (f.alert_type === 'OFFLINE' ? 'offline'
               : f.alert_type === 'STALLED' ? 'stalled'
@@ -134,7 +166,18 @@ function renderRow(d) {
             + '<br><span class="ts">since '
             + (f.triggered_at || '').slice(0, 19) + '</span></div>'
         ).join('');
-        reason = '<div class="reason-box">' + detail + '</div>';
+        const nf = (d.reason_detail || []).length;
+        reason = '<span class="reason-summary" title="'
+              + escapeHtml(d.reason) + '">' + escapeHtml(d.reason) + '</span>'
+            + ' <button class="btn btn-sm" onclick="toggleReason(\''
+            + escapeHtml(d.device_id) + '\', this)" title="'
+            + (isOpen ? 'Hide' : 'Show') + ' fault detail">'
+            + (isOpen ? '&#9662;' : '&#9656;')
+            + (nf ? ' <span class="muted">' + nf + '</span>' : '') + '</button>'
+            + '<div class="reason-panel" id="reason-' + encodeURIComponent(d.device_id) + '" '
+            + 'style="display:' + (isOpen ? 'block' : 'none') + ';">'
+            + (detail || '<span class="muted">' + escapeHtml(d.reason) + '</span>')
+            + '</div>';
     } else {
         reason = '<span class="muted">—</span>';
     }

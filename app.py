@@ -865,23 +865,22 @@ a:hover { color: var(--accent-hover); }
 .badge.badge-suspect   { background: #d97706; }
 .badge.badge-degraded  { background: #6d28d9; }
 .badge.badge-silent     { background: #0891b2; }
-/* FIX 3: freeze the column header row so it stays visible while scrolling. */
-.sticky-head th {
-    position: sticky;
-    top: 0;
-    z-index: 20;
-    background: var(--surface);
-    box-shadow: inset 0 -1px 0 var(--border);
-}
-.sticky-head th .sort-arrow { position: relative; top: 0; }
-/* FIX 2: per-device fault explanation. */
+/* FIX 2: per-device fault explanation. Collapsed by default; the cell shows
+   a one-line summary and expands to the full per-sensor breakdown. */
 .reason-box { font-size: .8rem; line-height: 1.35; }
 .reason-line { margin-bottom: .3rem; }
 .reason-line:last-child { margin-bottom: 0; }
+.reason-summary {
+    max-width: 320px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; display: inline-block; vertical-align: middle;
+}
+.reason-panel {
+    margin-top: .35rem; padding: .4rem; background: var(--bg);
+    border-radius: 6px; min-width: 260px;
+}
 /* FIX 1: keep the expanded sensor panel readable inside a table cell. */
 .sensor-line { padding: .1rem 0; }
-/* Horizontal scroll + capped height so the sticky header has something to stick against. */
-.table-scroll { overflow-x: auto; max-height: 72vh; overflow-y: auto; }
+
 .badge.badge-warning   { background: var(--warning); color: white; }
 .badge.badge-mqtt-ok { background: var(--success); }
 .badge.badge-mqtt-down { background: var(--danger); }
@@ -1056,15 +1055,15 @@ def index():
          style="max-width:340px;margin-left:1rem"
          oninput="dashboardSearch()">
   <span id="row-count" class="muted"></span>
-  <button class="btn btn-sm" onclick="expandAll()" title="Expand every sensor panel">&#9662; Expand all</button>
-  <button class="btn btn-sm" onclick="collapseAll()" title="Collapse every sensor panel">&#9656; Collapse all</button>
+  <button class="btn btn-sm" onclick="expandAll()" title="Expand every sensor panel">&#9662; Expand sensors</button>
+  <button class="btn btn-sm" onclick="collapseAll()" title="Collapse all sensor panels and fault details">&#9656; Collapse all</button>
   <span style="margin-left:auto"><a class="btn btn-primary" href="{{{{ url_for('print_report') }}}}">🖨 Print Report</a></span>
 </div>
 <div class="card">
   <h3>Monitored Devices <span class="muted" style="font-weight:400;font-size:.85rem">— click a column header to sort</span></h3>
-  <div class="table-scroll">
+  <div style="overflow-x:auto">
     <table class="table">
-      <thead class="sticky-head"><tr>
+      <thead><tr>
         <th data-sort="device">Device <span class="sort-arrow"></span></th>
         <th data-sort="location">Location / Role <span class="sort-arrow"></span></th>
         <th data-sort="status">Status <span class="sort-arrow"></span></th>
