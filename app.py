@@ -502,20 +502,36 @@ def on_mqtt_message(client, userdata, msg):
             # watchdog.sensor_flatline_min_change_pct (default 0.1%). This lets
             # us detect a value-flatline (sensor stuck) without needing a
             # historical readings table.
-            tol = float(config.get("watchdog", {}).get("sensor_flatline_min_change_pct", 0.1)) / 100.0
-            cursor.execute(f"""
-                INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
-                    value = excluded.value,
-                    ts    = excluded.ts,
-                    last_change_ts = CASE
-                        WHEN ((excluded.value - value) BETWEEN -?*ABS(value) AND +?*ABS(value))
-                          OR (excluded.value = value)
-                        THEN last_change_ts
-                        ELSE excluded.ts
-                    END
-            """, (device_id, sensor_name, sensor_type, val, now, now, tol, tol))
+            # Heartbeat counters are exempt from the percentage tolerance: a
+            # counter sitting at 16000 that ticks to 16001 is a 0.006% delta,
+            # which the tolerance would wrongly classify as "unchanged".
+            if sensor_type == "heartbeat":
+                cursor.execute("""
+                    INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
+                        value = excluded.value,
+                        ts    = excluded.ts,
+                        last_change_ts = CASE
+                            WHEN excluded.value = value THEN last_change_ts
+                            ELSE excluded.ts
+                        END
+                """, (device_id, sensor_name, sensor_type, val, now, now))
+            else:
+                tol = float(config.get("watchdog", {}).get("sensor_flatline_min_change_pct", 0.1)) / 100.0
+                cursor.execute(f"""
+                    INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
+                        value = excluded.value,
+                        ts    = excluded.ts,
+                        last_change_ts = CASE
+                            WHEN ((excluded.value - value) BETWEEN -?*ABS(value) AND +?*ABS(value))
+                              OR (excluded.value = value)
+                            THEN last_change_ts
+                            ELSE excluded.ts
+                        END
+                """, (device_id, sensor_name, sensor_type, val, now, now, tol, tol))
             # Roll up to devices for fast dashboard reads (last value wins per device, any sensor).
             if sensor_type == "temperature":
                 cursor.execute(
@@ -529,6 +545,25 @@ def on_mqtt_message(client, userdata, msg):
                 cursor.execute(
                     "UPDATE devices SET last_co2 = ? WHERE device_id = ?", (val, device_id)
                 )
+            elif sensor_type == "heartbeat":
+                # Roll the heartbeat up onto the device row. The STALLED rule
+                # reads devices.last_heartbeat_time, so this MUST be updated
+                # whenever a heartbeat packet arrives -- otherwise the device
+                # is flagged STALLED forever regardless of what the sensor
+                # is actually doing.
+                hb_val = int(val)
+                prev = cursor.execute(
+                    "SELECT last_heartbeat_value FROM devices WHERE device_id = ?",
+                    (device_id,),
+                ).fetchone()
+                # Only stamp the timestamp when the counter actually moved.
+                # A device that keeps re-sending the same number is stalled.
+                if prev is None or prev["last_heartbeat_value"] != hb_val:
+                    cursor.execute(
+                        "UPDATE devices SET last_heartbeat_time = ?, "
+                        "last_heartbeat_value = ? WHERE device_id = ?",
+                        (now, hb_val, device_id),
+                    )
             # heartbeat/light/pressure intentionally not denormalised — dashboard only shows
             # the headline metrics; per-sensor view shows the rest.
         conn.commit()
@@ -641,12 +676,16 @@ def watchdog_eval_loop():
             #                      OR a genuinely stable environment.
             #
             #    Both roll the device up to DEGRADED.
+            # Heartbeat is excluded from the per-sensor checks: it is a health
+            # counter, not an environmental measurement, and the STALLED rule
+            # above already covers it. Counting it here would double-report.
             sensor_fault = cursor.execute("""
                 SELECT sensor_name, sensor_type, value, ts, last_change_ts,
                        (julianday(?) - julianday(ts)) * 86400.0        AS silent_s,
                        (julianday(?) - julianday(last_change_ts)) * 86400.0 AS flat_s
                 FROM sensor_readings
                 WHERE device_id = ?
+                  AND sensor_type != 'heartbeat'
                   AND last_change_ts IS NOT NULL
                   AND (julianday(?) - julianday(last_change_ts)) * 86400.0 > ?
             """, (now.isoformat(sep=" "),
