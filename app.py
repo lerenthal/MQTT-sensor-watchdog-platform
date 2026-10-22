@@ -938,6 +938,11 @@ a:hover { color: var(--accent-hover); }
 .nav-tab.active { background: var(--accent); color: white; }
 .user-chip { color: var(--muted); font-size: .85rem; }
 .container { max-width: 1200px; margin: 1.5rem auto; padding: 0 1.5rem; }
+/* The devices table needs the full viewport. On a 16:9 monitor the default
+   1200px cap wasted roughly a third of the width, which is what forced
+   horizontal scrolling. This variant claims the screen up to a sane ceiling
+   so all twelve columns fit at 100% zoom on 1920x1080. */
+.container-wide { max-width: 1920px; margin: 1rem auto; padding: 0 1rem; }
 .card {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 12px; padding: 1.25rem; box-shadow: var(--shadow); margin-bottom: 1.5rem;
@@ -975,23 +980,27 @@ a:hover { color: var(--accent-hover); }
 }
 .table.devices tbody tr:hover { background: var(--bg); }
 /* Column sizing. Sums to ~100%. */
-.col-device    { width: 13%; }
-.col-location  { width: 11%; }
-.col-status    { width: 7%;  }
-.col-reason    { width: 22%; }
-.col-lastseen  { width: 11%; }
-.col-heartbeat { width: 6%;  }
-.col-temp      { width: 6%;  }
-.col-hum       { width: 6%;  }
-.col-co2       { width: 6%;  }
-.col-sensors   { width: 7%;  }
-.col-snooze    { width: 5%;  }
-.col-actions   { width: 6%;  }
+/* Sized against a 1920px viewport minus padding (~1870px usable):
+     device 150  location 131  status 94   reason 411  lastseen 131
+     hb 94       temp 84       hum 84        co2 94     sensors 224
+     snooze 168  actions 206                                            */
+.col-device    { width: 8%;   }
+.col-location  { width: 7%;   }
+.col-status    { width: 5%;   }
+.col-reason    { width: 22%;  }
+.col-lastseen  { width: 7%;   }
+.col-heartbeat { width: 5%;   }
+.col-temp      { width: 4.5%; }
+.col-hum       { width: 4.5%; }
+.col-co2       { width: 5%;   }
+.col-sensors   { width: 12%;  }
+.col-snooze    { width: 9%;   }
+.col-actions   { width: 11%;  }
 /* Values are tabular so digits line up column to column. */
 .table.devices td.num { font-variant-numeric: tabular-nums; }
 /* Narrow viewports: shed the columns an operator can recover from the
    sensor panel, so the remaining ones stay legible instead of all shrinking. */
-@media (max-width: 1200px) {
+@media (max-width: 1100px) {
     .table.devices { font-size: .78rem; }
     .table.devices th, .table.devices td { padding: .4rem .35rem; }
     .col-lastseen, .col-heartbeat { display: none; }
@@ -1030,15 +1039,20 @@ a:hover { color: var(--accent-hover); }
 .systemic-banner .muted { color: var(--muted); }
 .reason-line:last-child { margin-bottom: 0; }
 .reason-summary {
-    max-width: 320px; overflow: hidden; text-overflow: ellipsis;
-    white-space: nowrap; display: inline-block; vertical-align: middle;
+    display: inline-block; vertical-align: middle;
+    max-width: calc(100% - 4.5rem);   /* leave room for the toggle button */
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .reason-panel {
     margin-top: .35rem; padding: .4rem; background: var(--bg);
     border-radius: 6px; min-width: 260px;
+    max-height: 190px; overflow-y: auto;   /* long fault lists scroll in place */
 }
 /* FIX 1: keep the expanded sensor panel readable inside a table cell. */
 .sensor-line { padding: .1rem 0; }
+.table.devices td.col-sensors > div {
+    max-height: 190px; overflow-y: auto;
+}
 
 .badge.badge-warning   { background: var(--warning); color: white; }
 .badge.badge-mqtt-ok { background: var(--success); }
@@ -1098,7 +1112,7 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); ou
 }
 """
 
-def _render_layout(title, body, current_tab=None):
+def _render_layout(title, body, current_tab=None, wide=False):
     tabs = [
         ("devices", "Devices", "index"),
         ("history", "Audit Log", "audit_page"),
@@ -1134,7 +1148,7 @@ def _render_layout(title, body, current_tab=None):
   <nav class="nav-tabs">{nav_html}</nav>
   <div style="display:flex;gap:.5rem;align-items:center;">{user_chip}</div>
 </div>
-<div class="container">{body}</div>
+<div class="container{" container-wide" if wide else ""}">{body}</div>
 <script>
 (function(){{
   var t = localStorage.getItem('watchdog-theme') || 'light';
@@ -1244,7 +1258,7 @@ def index():
 <script>window.REFRESH_SECONDS = {refresh};</script>
 <script>{DASHBOARD_JS}</script>
 """
-    return _render_layout("Dashboard", body, current_tab="devices")
+    return _render_layout("Dashboard", body, current_tab="devices", wide=True)
 
 @app.route("/api/devices")
 @login_required
