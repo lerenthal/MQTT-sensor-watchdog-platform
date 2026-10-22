@@ -1,0 +1,23 @@
+# Normalise line endings in the repo; check out LF on every platform.
+# Windows editors that forget to handle this produce a diff-every-PR repo.
+* text=auto eol=lf
+
+# Shell scripts MUST stay LF even on Windows, or bash chokes.
+*.sh text eol=lf
+
+# Python, YAML, Markdown, JS - all fine as LF.
+*.py  text eol=lf
+*.js  text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+*.sql  text eol=lf
+
+# Keep the exec bit on the operator entry point.
+ops.sh diff=merge
+
+# Binary-ish files that should never be line-ending-mangled.
+*.db  binary
+*.png binary
+*.jpg binary
+*.pdf binary

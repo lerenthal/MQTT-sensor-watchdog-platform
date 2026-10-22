@@ -21,7 +21,9 @@ backups/
 # Local config / secrets
 # =============================================================================
 .env
+# .env.example IS committed - it's the documented template.
 .env.*
+!.env.example
 # Live config (bind-mounted by ops.sh). The bundled template is at ./config.yaml.
 config/config.yaml
 config/config.local.yaml
