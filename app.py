@@ -117,6 +117,23 @@ def _table_exists(conn, table):
     ).fetchone() is not None
 
 def _apply_migrations(conn):
+    # v6 -> v7: operator-acknowledged known-degraded sensors. These are
+    # excluded from alerting so a documented, accepted fault does not drown
+    # the dashboard in permanent noise.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS known_degraded (
+            device_id   TEXT NOT NULL,
+            sensor_name TEXT NOT NULL,
+            reason      TEXT,
+            suppressed_by TEXT,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (device_id, sensor_name)
+        );
+    """)
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','7')"
+    )
+
     # v5 -> v6: per-entity target ranges.
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS sensor_thresholds (
@@ -191,7 +208,7 @@ def _apply_migrations(conn):
         log.info("Migration: renamed sensor_readings.sensor_id -> sensor_name")
 
     conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','6')"
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','7')"
     )
 
 def init_db():
@@ -383,6 +400,61 @@ def _parse_ts(value):
             continue
     return None
 
+# Metric keywords recognised in an ESPHome sensor_name. Order matters:
+# longer / more specific patterns first, because "co2" must win over "co",
+# and "ground_temperature" still resolves to temperature.
+_SENSOR_METRIC_PATTERNS = (
+    ("heartbeat",   ("heartbeat",)),
+    ("co2",         ("co2", "co_2", "carbon_dioxide", "eco2", "equivalent_co2")),
+    ("pm25",        ("pm2_5", "pm25")),
+    ("pm10",        ("pm10", "pm_10")),
+    ("pm1",         ("pm1", "pm_1")),
+    ("pm4",         ("pm4", "pm_4")),
+    ("particle",    ("particle", "particulate", "pm_")),
+    ("tvoc",        ("tvoc", "voc")),
+    ("no2",         ("no2", "nitrogen_dioxide")),
+    ("o2",          ("oxygen",)),
+    ("co",          ("carbon_monoxide",)),
+    ("nh3",         ("nh3", "ammonia")),
+    ("h2",          ("hydrogen",)),
+    ("formaldehyde",("formaldehyde", "hcho")),
+    ("illuminance", ("lux", "illuminance", "light_lux")),
+    ("light",       ("light", "brightness")),
+    ("pressure",    ("pressure", "barometric")),
+    ("humidity",    ("humidity", "rh", "relative_humidity")),
+    ("temperature", ("temperature", "temp")),
+    ("wind",        ("wind",)),
+    ("moisture",    ("moisture", "soil_moisture")),
+    ("soil",        ("soil",)),
+    ("power",       ("power", "watt")),
+    ("energy",      ("energy", "kwh")),
+    ("voltage",     ("voltage", "volt")),
+    ("current",     ("current", "amp")),
+    ("battery",     ("battery",)),
+    ("signal",      ("rssi", "wifi_signal", "signal_strength")),
+)
+
+
+def _classify_sensor(sensor_name):
+    """Map an ESPHome sensor_name onto a metric type, or None if it is a
+    diagnostic rather than a reading.
+
+    The facility's sensors carry the metric in the name
+    ('maxim5_co2', 'aimon-1_pm25', 'bme680-1_pressure'), so the name is the
+    only signal available. Order is significant: 'co2' is checked before
+    'co', and 'temperature' last so 'ground_temperature' still resolves to
+    temperature.
+    """
+    lname = (sensor_name or "").lower()
+    if not lname:
+        return None
+    for metric, needles in _SENSOR_METRIC_PATTERNS:
+        for needle in needles:
+            if needle in lname:
+                return metric
+    return None
+
+
 def on_mqtt_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         with mqtt_health_lock:
@@ -545,33 +617,14 @@ def on_mqtt_message(client, userdata, msg):
             except (ValueError, TypeError):
                 conn.close()
                 return
-            sensor_type = None
-            # Match metric keywords.
-            # - 'heartbeat' is checked specially because the topic name
-            #   often puts it AFTER the sensor label (e.g.
-            #   'sht41-4_heartbeat_counter'). We match a heartbeat
-            #   metric only if a number in the name (e.g. 'counter') is
-            #   present, to avoid matching things like 'light' that
-            #   contain 'heat' as a substring.
-            # - 'co2' must be checked before 'co' to avoid false positives
-            #   on 'co' words.
-            lname = sensor_name.lower()
-            sensor_type = None
-            if any(k in lname for k in ("temperature", "humidity", "light", "pressure")):
-                for key in ("temperature", "humidity", "co2", "light", "pressure"):
-                    if key in lname:
-                        sensor_type = key
-                        break
-            elif "heartbeat" in lname and ("counter" in lname or "ping" in lname or "tick" in lname):
-                # Strong heartbeat signal: name contains 'heartbeat' AND
-                # one of the words ESPHome uses for that purpose (counter, ping, tick).
-                # Falls through and rejects names like 'preheat_sensor' that merely
-                # contain 'heat'.
-                sensor_type = "heartbeat"
-            elif "heartbeat" in lname:
-                # Lenient fallback: matches 'sht41-4_heartbeat_counter' style names
-                # even when the trailing word isn't one of the explicit ones above.
-                sensor_type = "heartbeat"
+            sensor_type = _classify_sensor(sensor_name)
+            if sensor_type is None:
+                # No recognised metric in the name. Almost always a
+                # diagnostic (mac address, uptime, ip, ssid) rather than a
+                # reading. Drop silently rather than filling the DB with
+                # noise.
+                conn.close()
+                return
             if sensor_type is None:
                 # No recognised metric in the name. Likely a non-numeric sensor
                 # whose float() somehow succeeded, or a numeric sensor whose
@@ -732,10 +785,14 @@ def _detect_systemic_faults(conn, now, flatline_limit):
     dying simultaneously across ten rooms is not a hardware pattern.
     """
     rows = conn.execute("""
-        SELECT device_id, sensor_type, ts
-        FROM sensor_readings
-        WHERE sensor_type != 'heartbeat'
-          AND ts IS NOT NULL
+        SELECT r.device_id, r.sensor_type, r.ts
+        FROM sensor_readings r
+        WHERE r.sensor_type != 'heartbeat'
+          AND r.ts IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM known_degraded k
+              WHERE k.device_id = r.device_id AND k.sensor_name = r.sensor_name
+          )
     """).fetchall()
 
     # Group silent sensors by metric.
@@ -854,6 +911,11 @@ def watchdog_eval_loop():
                   AND sensor_type != 'heartbeat'
                   AND last_change_ts IS NOT NULL
                   AND (julianday(?) - julianday(last_change_ts)) * 86400.0 > ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM known_degraded k
+                      WHERE k.device_id = sensor_readings.device_id
+                        AND k.sensor_name = sensor_readings.sensor_name
+                  )
             """, (now.isoformat(sep=" "),
                   now.isoformat(sep=" "),
                   device_id,
@@ -1151,8 +1213,26 @@ a:hover { color: var(--accent-hover); }
     padding: .5rem .5rem;
     border-bottom: 1px solid var(--border);
     vertical-align: top;
-    overflow-wrap: anywhere;   /* long device_ids / topics wrap, not overflow */
-    word-break: break-word;
+    /* Break at word boundaries, never mid-word. A device id like
+       'sht40-scd30-1_scd30_temperature' must wrap between words, not
+       split 'temperature' across two lines. */
+    overflow-wrap: normal;
+    word-break: keep-all;
+    hyphens: none;
+}
+/* Font size is user-adjustable via the toolbar slider. */
+.table.devices { font-size: var(--table-font-size, .85rem); }
+.table.devices th { font-size: calc(var(--table-font-size, .85rem) * .82); }
+/* A word longer than its column still has to go somewhere - allow it to
+   overflow its cell rather than break mid-word, and give the table room. */
+.table.devices td { min-width: 0; }
+.table.devices .nowrap { white-space: nowrap; }
+#font-size-slider {
+    width: 110px; accent-color: var(--accent); cursor: pointer;
+}
+.font-size-label {
+    font-size: .75rem; color: var(--muted); white-space: nowrap;
+    font-variant-numeric: tabular-nums;
 }
 .table.devices th {
     color: var(--muted); font-weight: 600; font-size: .7rem;
@@ -1230,6 +1310,22 @@ a:hover { color: var(--accent-hover); }
 }
 /* FIX 1: keep the expanded sensor panel readable inside a table cell. */
 .sensor-line { padding: .1rem 0; }
+/* Compact per-sensor chips in the collapsed cell. */
+.svwrap { font-size: .82em; line-height: 1.45; }
+.svrow { margin-bottom: .15rem; }
+.svtype {
+    display: inline-block; min-width: 62px; color: var(--muted);
+    font-size: .85em; text-transform: uppercase; letter-spacing: .03em;
+}
+.sv {
+    display: inline-block; padding: 0 .35rem; margin: 0 .2rem .15rem 0;
+    border-radius: 4px; background: var(--bg); border: 1px solid var(--border);
+    white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.sv.silent     { border-color: #0891b2; color: #0891b2; }
+.sv.flat       { border-color: #d97706; color: #d97706; }
+.sv.bad        { border-color: var(--danger); color: var(--danger); font-weight: 600; }
+.sv.suppressed { opacity: .5; text-decoration: line-through; }
 .table.devices td.col-sensors > div {
     max-height: 190px; overflow-y: auto;
 }
@@ -1414,6 +1510,9 @@ def index():
          style="max-width:340px;margin-left:1rem"
          oninput="dashboardSearch()">
   <span id="row-count" class="muted"></span>
+  <span class="font-size-label" id="font-size-label">A</span>
+  <input id="font-size-slider" type="range" min="10" max="20" step="1"
+         title="Table font size" oninput="setFontSize(this.value)">
   <button class="btn btn-sm" onclick="expandAll()" title="Expand every sensor panel">&#9662; Expand sensors</button>
   <button class="btn btn-sm" onclick="collapseAll()" title="Collapse all sensor panels and fault details">&#9656; Collapse all</button>
   <span style="margin-left:auto"><a class="btn btn-primary" href="{{{{ url_for('print_report') }}}}">🖨 Print Report</a></span>
@@ -1517,8 +1616,30 @@ def api_devices():
     except Exception:
         log.exception("threshold lookup failed")
 
+    # Operator-acknowledged known-degraded sensors. Excluded from alerting,
+    # but still shown so the operator can see the sensor exists and is
+    # knowingly suppressed.
+    try:
+        kc = get_db()
+        degraded = {}
+        for r in kc.execute(
+            "SELECT device_id, sensor_name, reason, suppressed_by, created_at "
+            "FROM known_degraded"
+        ):
+            degraded.setdefault(r["device_id"], []).append({
+                "sensor_name": r["sensor_name"],
+                "reason": r["reason"],
+                "suppressed_by": r["suppressed_by"],
+                "created_at": r["created_at"],
+            })
+        kc.close()
+    except Exception:
+        log.exception("known_degraded lookup failed")
+        degraded = {}
+
     for d in devices:
         thr = thresholds.get(d["device_id"], {})
+        d["known_degraded"] = degraded.get(d["device_id"], [])
         s = sensors_by_device.get(d["device_id"], [])
         # Decorate each reading with its range verdict so the UI can colour it.
         for x in s:
@@ -1531,6 +1652,9 @@ def api_devices():
             else:
                 x["threshold"] = None
                 x["in_range"] = None
+        kd_names = {k["sensor_name"] for k in d.get("known_degraded", [])}
+        for x in s:
+            x["known_degraded"] = x["sensor_name"] in kd_names
         d["thresholds"] = thr
         d["sensors"] = s
         d["sensor_count"] = len({x["sensor_name"] for x in s})
@@ -1870,6 +1994,135 @@ def admin_sensors_csv():
     audit("CSV_UPLOAD",
           details=f"upload_id={upload_id}; rows={len(rows)}; file={filename!r}; note={note!r}")
     return redirect(url_for("admin_config", saved=1))
+
+
+@app.route("/admin/degraded", methods=["GET", "POST"])
+@login_required
+def admin_degraded():
+    """Manage operator-acknowledged known-degraded sensors.
+
+    A sensor listed here is excluded from SENSOR_SILENT / SUSPECTED_STALL
+    alerting and from systemic-fault clustering, so a documented, accepted
+    fault does not permanently occupy the dashboard. The sensor still shows
+    in the sensor panel, marked as suppressed.
+    """
+    if session.get("role") != "admin":
+        abort(403)
+
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        device_id = (request.form.get("device_id") or "").strip()
+        sensor_name = (request.form.get("sensor_name") or "").strip()
+        reason = (request.form.get("reason") or "").strip()
+        who = session.get("username", "?")
+
+        if action == "remove":
+            conn = get_db()
+            conn.execute(
+                "DELETE FROM known_degraded WHERE device_id=? AND sensor_name=?",
+                (device_id, sensor_name),
+            )
+            conn.commit(); conn.close()
+            audit("KNOWN_DEGRADED_REMOVED", device_id=device_id,
+                  details=f"{sensor_name}: {reason}", username=who)
+            return redirect(url_for("admin_degraded"))
+
+        # The picker submits "device|sensor" in one field.
+        if "|" in sensor_name and not device_id:
+            device_id, sensor_name = [p.strip() for p in sensor_name.split("|", 1)]
+        if not device_id or not sensor_name:
+            return redirect(url_for("admin_degraded"))
+
+        conn = get_db()
+        conn.execute("""
+            INSERT INTO known_degraded(device_id, sensor_name, reason, suppressed_by, created_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(device_id, sensor_name) DO UPDATE SET
+                reason = excluded.reason,
+                suppressed_by = excluded.suppressed_by,
+                created_at = CURRENT_TIMESTAMP
+        """, (device_id, sensor_name, reason, who))
+        conn.commit(); conn.close()
+        audit("KNOWN_DEGRADED_ADDED", device_id=device_id,
+              details=f"{sensor_name}: {reason}", username=who)
+        return redirect(url_for("admin_degraded"))
+
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT device_id, sensor_name, reason, suppressed_by, created_at
+        FROM known_degraded ORDER BY device_id, sensor_name
+    """).fetchall()
+    conn.close()
+    rows_html = "".join(
+        f'<tr><td>{html_lib.escape(r["device_id"])}</td>'
+        f'<td>{html_lib.escape(r["sensor_name"])}</td>'
+        f'<td class="muted">{html_lib.escape(r["reason"] or "")}</td>'
+        f'<td>{html_lib.escape(r["suppressed_by"] or "")}</td>'
+        f'<td class="ts">{(r["created_at"] or "")[:19]}</td>'
+        f'<td><form method="post" action="/admin/degraded" style="display:inline">'
+        f'<input type="hidden" name="action" value="remove">'
+        f'<input type="hidden" name="device_id" value="{html_lib.escape(r["device_id"])}">'
+        f'<input type="hidden" name="sensor_name" value="{html_lib.escape(r["sensor_name"])}">'
+        f'<button class="btn btn-sm btn-danger" type="submit">Remove</button>'
+        f'</form></td></tr>'
+        for r in rows
+    ) or '<tr><td colspan="6" class="muted">None — every sensor is actively monitored.</td></tr>'
+
+    # Candidate sensors: currently flagged as silent or stalled.
+    cand = conn = get_db()
+    candidates = cand.execute("""
+        SELECT r.device_id, r.sensor_name, r.sensor_type,
+               (julianday('now') - julianday(r.last_change_ts)) * 86400.0 AS flat_s
+        FROM sensor_readings r
+        WHERE r.sensor_type != 'heartbeat'
+          AND r.last_change_ts IS NOT NULL
+          AND (julianday('now') - julianday(r.last_change_ts)) * 86400.0 > ?
+          AND NOT EXISTS (
+              SELECT 1 FROM known_degraded k
+              WHERE k.device_id=r.device_id AND k.sensor_name=r.sensor_name)
+        ORDER BY flat_s DESC LIMIT 40
+    """, (int(config.get("watchdog", {}).get("sensor_flatline_seconds", 300)),)).fetchall()
+    cand.close()
+    cand_html = "".join(
+        f'<option value="{html_lib.escape(c["device_id"])}|{html_lib.escape(c["sensor_name"])}">'
+        f'{html_lib.escape(c["device_id"])} / {html_lib.escape(c["sensor_name"])} '
+        f'({html_lib.escape(c["sensor_type"])}, {int(c["flat_s"]//60)}m)</option>'
+        for c in candidates
+    ) or '<option value="">— no currently-degraded sensors —</option>'
+
+    body = f"""<div class="card">
+  <h3>Known-degraded sensors</h3>
+  <p class="muted" style="margin-top:0">
+    Suppress alerting for a sensor you have investigated and accepted.
+    The sensor keeps reporting and stays visible in the dashboard, marked as
+    suppressed, but it no longer raises SENSOR_SILENT / SUSPECTED_STALL and
+    is excluded from systemic-fault clustering.
+    <strong>Use this for a diagnosed fault, not for a fault you have not
+    looked at.</strong>
+  </p>
+  <form method="post" action="/admin/degraded">
+    <input type="hidden" name="action" value="add">
+    <div class="field">
+      <label>Sensor (currently flagged)</label>
+      <select name="sensor_name">{cand_html}</select>
+    </div>
+    <div class="field">
+      <label>Reason (recorded in the audit trail)</label>
+      <input type="text" name="reason" placeholder="e.g. SCD30 on I2C bus down; replacement scheduled">
+    </div>
+    <button class="btn btn-primary" type="submit">Suppress alerting</button>
+  </form>
+</div>
+<div class="card">
+  <h3>Suppressed sensors</h3>
+  <div style="overflow-x:auto">
+    <table class="table table-sm">
+      <thead><tr><th>Device</th><th>Sensor</th><th>Reason</th><th>By</th><th>Since</th><th></th></tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+  </div>
+</div>"""
+    return _render_layout("Known-degraded sensors", body, current_tab="admin")
 
 
 @app.route("/admin/sensors/history")

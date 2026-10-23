@@ -62,11 +62,15 @@ function sensorCell(d) {
     }).join('');
     const id = encodeURIComponent(d.device_id);
     const isOpen = EXPANDED.has(d.device_id);
-    // Counters in the collapsed cell tell you something is wrong before you click.
+    // Every sensor is named in the collapsed cell, grouped by metric. A count
+    // alone hid the fact that one device can publish several channels of the
+    // same type (maxim4 carries four temperature sensors).
     let tally = '<span class="muted">' + d.sensor_count + ' sensor'
         + (d.sensor_count !== 1 ? 's' : '') + '</span>';
-    if (h.silent)   tally += ' <span class="badge badge-silent">' + h.silent + ' silent</span>';
+    if (h.silent)    tally += ' <span class="badge badge-silent">' + h.silent + ' silent</span>';
     if (h.suspected) tally += ' <span class="badge badge-suspect">' + h.suspected + ' frozen</span>';
+    const kd = (d.known_degraded || []).length;
+    if (kd) tally += ' <span class="badge badge-muted">' + kd + ' suppressed</span>';
     return tally
         + ' <button class="btn btn-sm" onclick="toggleSensors(\''
         + escapeHtml(d.device_id) + '\', this)">'
@@ -211,7 +215,8 @@ function renderRow(d) {
         + '<td class="col-temp num">' + (d.last_temp ?? '--') + '</td>'
         + '<td class="col-hum num">' + (d.last_hum ?? '--') + '</td>'
         + '<td class="col-co2 num">' + (d.last_co2 ?? '--') + '</td>'
-        + '<td class="col-sensors">' + sensorCell(d) + '</td>'
+        + '<td class="col-sensors">' + sensorSummary(d)
+          + '<div style="margin-top:.3rem">' + sensorCell(d) + '</div></td>'
         + '<td class="col-snooze">' + snooze + '</td>'
         + '<td class="col-actions">' + actions + '</td>'
         + '</tr>';
@@ -331,6 +336,61 @@ window.restart = async function (deviceId) {
     refresh();
 };
 
+// Table font size. Stored per-browser so each operator can set their own
+// reading comfort on a shared wall screen or laptop.
+window.setFontSize = function (px) {
+    const v = px + 'px';
+    document.documentElement.style.setProperty('--table-font-size', v);
+    localStorage.setItem('watchdog-font-size', px);
+    const lbl = document.getElementById('font-size-label');
+    if (lbl) lbl.textContent = px;
+};
+
+// ---- #3: collapsed sensor cell lists every sensor by name --------------------
+// The count alone hid the fact that a device can publish several sensors of
+// the same type (maxim4 has four temperature channels). The collapsed cell
+// now names them, so nothing is invisible until you expand.
+function sensorSummary(d) {
+    const list = (d.sensors || [])
+        .filter(s => s.sensor_type !== 'heartbeat')
+        .slice()
+        .sort((a, b) => {
+            if (a.sensor_type !== b.sensor_type) return a.sensor_type.localeCompare(b.sensor_type);
+            return a.sensor_name.localeCompare(b.sensor_name);
+        });
+    if (!list.length) return '<span class="muted">no readings</span>';
+
+    const groups = {};
+    list.forEach(s => {
+        (groups[s.sensor_type] = groups[s.sensor_type] || []).push(s);
+    });
+
+    const parts = Object.keys(groups).sort().map(t => {
+        const g = groups[t];
+        const names = g.map(s => {
+            const short = s.sensor_name
+                .replace(new RegExp('^' + escapeRegExp(d.device_id) + '_?'), '')
+                .replace(new RegExp('^' + escapeRegExp(d.device_id.replace(/_/g, '-')) + '_?'), '')
+                || s.sensor_name;
+            const v = (typeof s.value === 'number') ? s.value.toFixed(1) : '--';
+            let cls = 'sv';
+            if (s.known_degraded) cls += ' suppressed';
+            else if (s.in_range === false) cls += ' bad';
+            else if (s.silent_seconds > 300) cls += ' silent';
+            else if (s.flat_seconds > 300) cls += ' flat';
+            return '<span class="' + cls + '" title="' + escapeHtml(s.sensor_name) + '">'
+                 + escapeHtml(short) + ' ' + escapeHtml(v) + '</span>';
+        });
+        return '<div class="svrow"><span class="svtype">' + escapeHtml(t) + '</span>'
+             + names.join(' ') + '</div>';
+    });
+    return '<div class="svwrap">' + parts.join('') + '</div>';
+}
+
+function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 window.dashboardSearch = function () {
     if (SEARCH_DEBOUNCE) clearTimeout(SEARCH_DEBOUNCE);
     SEARCH_DEBOUNCE = setTimeout(applyFilter, 200);
@@ -342,6 +402,15 @@ window.addEventListener('DOMContentLoaded', () => {
         th.addEventListener('click', () => handleSortClick(th));
     });
     if (SORT_KEY) applySort();
+
+    // Restore the operator's chosen table font size.
+    const saved = localStorage.getItem('watchdog-font-size');
+    const slider = document.getElementById('font-size-slider');
+    if (slider) {
+        const px = saved || 13;
+        slider.value = px;
+        setFontSize(px);
+    }
 });
 
 refresh();
