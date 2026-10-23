@@ -104,7 +104,7 @@ def get_db():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     # busy_timeout is a fallback in case WAL is somehow disabled.
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=15000")   # tolerate the watchdog loop's write burst
     return conn
 
 def _column_exists(conn, table, column):
@@ -117,6 +117,31 @@ def _table_exists(conn, table):
     ).fetchone() is not None
 
 def _apply_migrations(conn):
+    # v5 -> v6: per-entity target ranges.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sensor_thresholds (
+            device_id   TEXT NOT NULL,
+            sensor_name TEXT NOT NULL,
+            min_value   REAL,
+            max_value   REAL NOT NULL,
+            severity    TEXT NOT NULL DEFAULT 'WARNING',
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (device_id, sensor_name)
+        );
+        CREATE TABLE IF NOT EXISTS out_of_range (
+            device_id   TEXT NOT NULL,
+            sensor_name TEXT NOT NULL,
+            value       REAL,
+            severity    TEXT,
+            message     TEXT,
+            entered_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            resolved    INTEGER DEFAULT 0,
+            resolved_at TIMESTAMP,
+            PRIMARY KEY (device_id, sensor_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_thresholds_device
+            ON sensor_thresholds(device_id);
+    """)
     # v4 -> v5: add sensor_readings.last_change_ts. Must run BEFORE any
     # CREATE INDEX that references it (schema.sql and the embedded script
     # below both do).
@@ -166,7 +191,7 @@ def _apply_migrations(conn):
         log.info("Migration: renamed sensor_readings.sensor_id -> sensor_name")
 
     conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','5')"
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','6')"
     )
 
 def init_db():
@@ -195,14 +220,25 @@ def init_db():
 def audit(action, device_id=None, details="", username=None):
     if username is None:
         username = session.get("username", "anonymous")
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO audit_logs (device_id, username, action, details) "
-        "VALUES (?, ?, ?, ?)",
-        (device_id, username, action, details),
-    )
-    conn.commit()
-    conn.close()
+    conn = None
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO audit_logs (device_id, username, action, details) "
+            "VALUES (?, ?, ?, ?)",
+            (device_id, username, action, details),
+        )
+        conn.commit()
+    except Exception:
+        # An audit write failing must not take down the operator action that
+        # triggered it. Log loudly, move on.
+        log.exception("audit write failed for action=%s", action)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 # -----------------------------------------------------------------------------
 # Authentication
@@ -368,6 +404,49 @@ def on_mqtt_disconnect(client, userdata, rc, properties=None):
         mqtt_health["last_disconnected_at"] = datetime.now()
     log.warning(f"MQTT disconnected (rc={rc}); paho will auto-reconnect.")
 
+def _retry_mqtt_write(device_id, sensor_name, sensor_type, val, now, tol):
+    """Re-attempt a single sensor write on a fresh connection."""
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        if sensor_type == "heartbeat":
+            cursor.execute("""
+                INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
+                    value = excluded.value, ts = excluded.ts,
+                    last_change_ts = CASE WHEN excluded.value = value
+                                         THEN last_change_ts ELSE excluded.ts END
+            """, (device_id, sensor_name, sensor_type, val, now, now))
+        else:
+            cursor.execute(f"""
+                INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
+                    value = excluded.value, ts = excluded.ts,
+                    last_change_ts = CASE
+                        WHEN ((excluded.value - value) BETWEEN -?*ABS(value) AND +?*ABS(value))
+                          OR (excluded.value = value)
+                        THEN last_change_ts ELSE excluded.ts END
+            """, (device_id, sensor_name, sensor_type, val, now, now, tol, tol))
+        if sensor_type == "temperature":
+            cursor.execute("UPDATE devices SET last_temp=? WHERE device_id=?", (val, device_id))
+        elif sensor_type == "humidity":
+            cursor.execute("UPDATE devices SET last_hum=? WHERE device_id=?", (val, device_id))
+        elif sensor_type == "co2":
+            cursor.execute("UPDATE devices SET last_co2=? WHERE device_id=?", (val, device_id))
+        elif sensor_type == "heartbeat":
+            hb_val = int(val)
+            prev = cursor.execute("SELECT last_heartbeat_value FROM devices WHERE device_id=?",
+                                 (device_id,)).fetchone()
+            if prev is None or prev["last_heartbeat_value"] != hb_val:
+                cursor.execute("UPDATE devices SET last_heartbeat_time=?, last_heartbeat_value=? WHERE device_id=?",
+                               (now, hb_val, device_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def on_mqtt_message(client, userdata, msg):
     topic = msg.topic
     try:
@@ -419,6 +498,8 @@ def on_mqtt_message(client, userdata, msg):
         # Unknown substructure under env_sensor; skip silently to avoid log spam.
         return
     now = datetime.now()
+    # Hoisted so the lock-retry handler always has it in scope.
+    tol = float(config.get("watchdog", {}).get("sensor_flatline_min_change_pct", 0.1)) / 100.0
     try:
         conn = get_db()
         cursor = conn.cursor()
@@ -518,7 +599,6 @@ def on_mqtt_message(client, userdata, msg):
                         END
                 """, (device_id, sensor_name, sensor_type, val, now, now))
             else:
-                tol = float(config.get("watchdog", {}).get("sensor_flatline_min_change_pct", 0.1)) / 100.0
                 cursor.execute(f"""
                     INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
                     VALUES (?, ?, ?, ?, ?, ?)
@@ -568,6 +648,26 @@ def on_mqtt_message(client, userdata, msg):
             # the headline metrics; per-sensor view shows the rest.
         conn.commit()
         conn.close()
+    except sqlite3.OperationalError as e:
+        # Contention with the watchdog's write transaction. The MQTT thread
+        # must not drop the packet: the next publish of the same value
+        # arrives within seconds anyway, but losing it would leave a stale
+        # reading on the dashboard. Retry briefly, then give up quietly.
+        if "locked" in str(e).lower() or "busy" in str(e).lower():
+            for attempt in range(3):
+                time.sleep(0.4 * (attempt + 1))
+                try:
+                    _retry_mqtt_write(device_id, sensor_name, sensor_type,
+                                      val, now, tol)
+                    return
+                except sqlite3.OperationalError:
+                    continue
+                except Exception:
+                    break
+            log.warning("on_mqtt_message: dropped %s after retries (%s)",
+                        topic, e)
+            return
+        log.exception(f"on_mqtt_message failed for topic={topic}: {e}")
     except Exception as e:
         log.exception(f"on_mqtt_message failed for topic={topic}: {e}")
 
@@ -809,11 +909,91 @@ def watchdog_eval_loop():
             if fault_type:
                 _raise_or_nag(cursor, device_id, fault_type, fault_msg, nag_interval, now)
 
+        # Release the write lock acquired by the device loop before doing the
+        # heavier read-heavy passes below. WAL permits one writer; holding
+        # this transaction across those scans blocks every MQTT ingest and
+        # every web request, which is what produced the intermittent
+        # "database is locked" on login.
+        conn.commit()
+
+        # Per-entity target ranges. Only evaluated on FRESH readings: a dead
+        # channel must report SENSOR_SILENT, not also claim to be out of range
+        # based on a stale value.
+        # NOTE: use a SEPARATE connection. The device loop below iterates a
+        # cursor on `conn` while writing; opening a second read cursor on the
+        # same connection mid-iteration makes SQLite raise "database is
+        # locked" and, because it happens inside the loop's transaction, it
+        # blocks every other writer (MQTT thread, web handlers) until the
+        # transaction unwinds.
+        _rc = get_db()
+        range_faults = _rc.execute("""
+            SELECT t.device_id, t.sensor_name, t.min_value, t.max_value, t.severity,
+                   r.value, r.ts
+            FROM sensor_thresholds t
+            JOIN sensor_readings r
+              ON r.device_id = t.device_id AND r.sensor_name = t.sensor_name
+            WHERE r.sensor_type != 'heartbeat'
+              AND (julianday(?) - julianday(r.ts)) * 86400.0 <= ?
+        """, (now.isoformat(sep=" "), max(flatline_limit, 120))).fetchall()
+        # Resolve current breach state in the same read-only pass so the loop
+        # below does no reads at all - only writes.
+        range_state = {
+            (x["device_id"], x["sensor_name"]): x["resolved"]
+            for x in _rc.execute("SELECT device_id, sensor_name, resolved FROM out_of_range")
+        }
+        _rc.close()
+
+        for rf in range_faults:
+            dev, name, lo, hi, sev, val, ts = rf
+            breach = (lo is not None and val < lo) or (val > hi)
+            was_open = range_state.get((dev, name), 1) == 0
+
+            if breach and not was_open:
+                side = ("below %.1f" % lo) if (lo is not None and val < lo) else ("above %.1f" % hi)
+                msg = "%s is %.2f (%s, limit %.1f-%.1f)" % (
+                    name, val, side, lo if lo is not None else -9999, hi)
+                conn.execute("""
+                    INSERT INTO out_of_range(device_id, sensor_name, value, severity, message)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(device_id, sensor_name) DO UPDATE SET
+                        value=excluded.value, severity=excluded.severity,
+                        message=excluded.message, resolved=0, resolved_at=NULL,
+                        entered_at=CURRENT_TIMESTAMP
+                """, (dev, name, val, sev, msg))
+                _raise_or_nag(cursor, dev, "OUT_OF_RANGE", msg, nag_interval, now)
+                log.warning("OUT_OF_RANGE %s: %s", dev, msg)
+            elif breach and was_open:
+                # Still out of range - refresh value/message, do not re-alert.
+                conn.execute(
+                    "UPDATE out_of_range SET value=?, message=? WHERE device_id=? AND sensor_name=?",
+                    (val, "%s is %.2f (limit %.1f-%.1f)" % (
+                        name, val, lo if lo is not None else -9999, hi), dev, name),
+                )
+            elif not breach and was_open:
+                conn.execute(
+                    "UPDATE out_of_range SET resolved=1, resolved_at=CURRENT_TIMESTAMP "
+                    "WHERE device_id=? AND sensor_name=?",
+                    (dev, name),
+                )
+                conn.execute(
+                    "UPDATE alerts SET resolved=1 WHERE device_id=? AND alert_type='OUT_OF_RANGE' "
+                    "AND resolved=0 AND message LIKE ?",
+                    (dev, "%" + name + "%"),
+                )
+                audit("OUT_OF_RANGE_CLEARED", device_id=dev,
+                      details="%s back in range" % name, username="watchdog")
+                log.info("OUT_OF_RANGE cleared: %s %s", dev, name)
+
         # Systemic faults: many devices losing the same metric in the same
         # window points at the broker, network or an ACL change rather than at
         # N independent sensors. Suppress the per-device SENSOR_SILENT noise
         # for devices caught in a cluster; the cluster is reported instead.
-        systemic = _detect_systemic_faults(conn, now, flatline_limit)
+        # Own connection again: _detect_systemic_faults scans every reading
+        # row, and running that on `conn` while its device-loop transaction
+        # is open blocks every other writer for the duration.
+        _sc = get_db()
+        systemic = _detect_systemic_faults(_sc, now, flatline_limit)
+        _sc.close()
         if systemic:
             summary = "; ".join(
                 "%s on %d devices" % (c["sensor_type"], c["count"]) for c in systemic
@@ -1209,12 +1389,18 @@ def logout():
 # -----------------------------------------------------------------------------
 # Dashboard
 # -----------------------------------------------------------------------------
-DASHBOARD_JS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.js")
-try:
-    DASHBOARD_JS = open(DASHBOARD_JS_PATH).read()
-except OSError:
-    log.warning("dashboard.js not found at %s; dashboard will be non-interactive", DASHBOARD_JS_PATH)
-    DASHBOARD_JS = "console.error('dashboard.js missing');"
+_ASSET_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _load_js(name):
+    try:
+        with open(os.path.join(_ASSET_DIR, name)) as fh:
+            return fh.read()
+    except OSError:
+        log.warning("%s not found; that view will be non-interactive", name)
+        return "console.error('%s missing');" % name
+
+DASHBOARD_JS = _load_js("dashboard.js")
+WALLBOARD_JS = _load_js("wallboard.js")
 
 
 @app.route("/")
@@ -1316,8 +1502,36 @@ def api_devices():
 
     flatline_limit = int(config.get("watchdog", {}).get("sensor_flatline_seconds", 300))
 
+    # Per-entity target ranges and current in/out state, for dashboard colouring.
+    thresholds = {}
+    try:
+        tc = get_db()
+        for r in tc.execute(
+            "SELECT device_id, sensor_name, min_value, max_value, severity "
+            "FROM sensor_thresholds"
+        ):
+            thresholds.setdefault(r["device_id"], {})[r["sensor_name"]] = {
+                "min": r["min_value"], "max": r["max_value"], "severity": r["severity"],
+            }
+        tc.close()
+    except Exception:
+        log.exception("threshold lookup failed")
+
     for d in devices:
+        thr = thresholds.get(d["device_id"], {})
         s = sensors_by_device.get(d["device_id"], [])
+        # Decorate each reading with its range verdict so the UI can colour it.
+        for x in s:
+            t = thr.get(x["sensor_name"])
+            if t and x["sensor_type"] != "heartbeat":
+                lo, hi = t["min"], t["max"]
+                v = x["value"]
+                x["threshold"] = t
+                x["in_range"] = not ((lo is not None and v < lo) or v > hi)
+            else:
+                x["threshold"] = None
+                x["in_range"] = None
+        d["thresholds"] = thr
         d["sensors"] = s
         d["sensor_count"] = len({x["sensor_name"] for x in s})
         d["location"] = d.get("location") or ""
@@ -1518,9 +1732,15 @@ def _parse_sensor_csv(text):
     header_norm = [h.strip().lower() for h in header]
     if "device_id" not in header_norm:
         return rows, ["CSV must include a 'device_id' column"]
-    di = header_norm.index("device_id")
-    li = header_norm.index("location") if "location" in header_norm else None
-    ri = header_norm.index("role")       if "role"       in header_norm else None
+    di  = header_norm.index("device_id")
+    li  = header_norm.index("location")      if "location"      in header_norm else None
+    ri  = header_norm.index("role")          if "role"          in header_norm else None
+    si  = header_norm.index("sensor_name")   if "sensor_name"   in header_norm else None
+    mini= header_norm.index("min_value")     if "min_value"     in header_norm else None
+    maxi= header_norm.index("max_value")     if "max_value"     in header_norm else None
+    sevi= header_norm.index("severity")      if "severity"      in header_norm else None
+    if si is not None and maxi is None:
+        return [], ["CSV has a 'sensor_name' column but no 'max_value' - a range needs an upper limit"]
 
     for line_no, raw in enumerate(reader, start=2):
         if not raw or all(not (c or "").strip() for c in raw):
@@ -1534,10 +1754,57 @@ def _parse_sensor_csv(text):
             continue
         location = (raw[li].strip() if li is not None and li < len(raw) else "")
         role     = (raw[ri].strip() if ri is not None and ri < len(raw) else "")
+
+        # Optional per-entity threshold columns. Rows without sensor_name are
+        # metadata-only, which keeps the original two-column format working.
+        def col(idx):
+            return (raw[idx].strip() if idx is not None and idx < len(raw) else "")
+        sname = col(si)
+        minv  = col(mini)
+        maxv  = col(maxi)
+        sev   = col(sevi).upper() or "WARNING"
+
+        # Severity is only meaningful on a row that actually defines a range.
+        # A metadata-only row (no sensor_name) leaves it blank and must not be
+        # rejected for it.
+        defines_range = bool(sname) and bool(maxv)
+        if defines_range and sev not in ("WARNING", "CRITICAL"):
+            errors.append("line %d: severity must be WARNING or CRITICAL" % line_no)
+            continue
+
+        # Parse numerics defensively - a malformed number is a rejected row,
+        # not a 500 from deep inside float().
+        min_val = max_val = None
+        bad = False
+        for label, txt in (("min_value", minv), ("max_value", maxv)):
+            if not txt:
+                continue
+            try:
+                v = float(txt)
+            except ValueError:
+                errors.append("line %d: %s must be a number (got %r)"
+                              % (line_no, label, txt))
+                bad = True
+                break
+            if label == "min_value":
+                min_val = v
+            else:
+                max_val = v
+        if bad:
+            continue
+        if defines_range and max_val is not None and min_val is not None \
+                and min_val >= max_val:
+            errors.append("line %d: min_value must be below max_value" % line_no)
+            continue
+
         rows.append({
             "device_id": device_id,
             "location":  location,
             "role":      role,
+            "sensor_name": sname,
+            "min_value": min_val,
+            "max_value": max_val,
+            "severity":  sev,
         })
     return rows, errors
 
@@ -1587,6 +1854,17 @@ def admin_sensors_csv():
                 location = excluded.location,
                 role     = excluded.role
         """, (r["device_id"], r["location"], r["role"]))
+
+        # A row carrying sensor_name + max_value also defines a target range.
+        if r.get("sensor_name") and r.get("max_value") is not None:
+            cursor.execute("""
+                INSERT INTO sensor_thresholds(device_id, sensor_name, min_value, max_value, severity)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(device_id, sensor_name) DO UPDATE SET
+                    min_value = excluded.min_value,
+                    max_value = excluded.max_value,
+                    severity  = excluded.severity
+            """, (r["device_id"], r["sensor_name"], r["min_value"], r["max_value"], r["severity"]))
     cursor.execute("UPDATE csv_uploads SET applied = 1 WHERE upload_id = ?", (upload_id,))
     conn.commit(); conn.close()
     audit("CSV_UPLOAD",
@@ -1711,16 +1989,30 @@ def admin_config():
 <div class="card">
   <h3>Sensor metadata (CSV upload)</h3>
   <p class="muted" style="margin-top:0">
-    Upload a CSV to assign a <strong>location</strong> and optional <strong>role</strong> to each device.
-    Header row required. Only the columns named below are read; extra columns are ignored.
+    Upload a CSV to assign a <strong>location</strong> and optional
+    <strong>role</strong> to each device, and to define
+    <strong>target ranges</strong> per entity.
+    Header row required. Only the named columns are read; extras are ignored.
   </p>
   <details style="margin-bottom:1rem">
     <summary class="muted">CSV format &amp; example</summary>
-    <pre class="diff" style="margin-top:.5rem">device_id,location,role
-sht41-1,Spawn Incubator A,producer
-sht41-2,"Fruiting Room, North",dup
-sht41-3,Fruiting Room B,
-bme280-1,Drying Room,reference</pre>
+    <pre class="diff" style="margin-top:.5rem">device_id,location,role,sensor_name,min_value,max_value,severity
+sht41-1,Spawn Inc A,producer,,,,
+sht41-1,,,sht41-1_temperature,18,24,CRITICAL
+sht41-1,,,sht41-1_humidity,70,90,WARNING
+sht41-1,,,sht41-1_co2,,1200,WARNING
+sht41-2,"Fruiting, North",dup,,,
+sht41-3,,,sht41-3_temperature,24,30,WARNING</pre>
+    <p class="muted" style="margin:.6rem 0 0">
+      Leave <span class="ts">sensor_name / min_value / max_value / severity</span>
+      empty for a metadata-only row. Fill them in to set a target range for one
+      entity: a fresh reading outside the range raises
+      <strong>OUT_OF_RANGE</strong> and the row is flagged in the dashboard.
+      <span class="ts">severity</span> is <strong>WARNING</strong> or
+      <strong>CRITICAL</strong>; CRITICAL sorts first on the wall board.
+      A blank <span class="ts">min_value</span> means no lower bound.
+      Ranges are only evaluated against fresh readings, so a dead sensor reports
+      SENSOR_SILENT rather than a misleading out-of-range.</p>
   </details>
   <form method="post" action="/admin/sensors/csv">
     <div class="field">
@@ -1984,6 +2276,132 @@ def print_report():
   <a class="btn" href="/">← Back to dashboard</a>
 </div>
 </body></html>"""
+
+# -----------------------------------------------------------------------------
+# Wall-display alarm board
+# -----------------------------------------------------------------------------
+WALL_CSS = """
+* { box-sizing: border-box; margin: 0; }
+body {
+    background: #0b0f14; color: #e6edf3; height: 100vh; overflow: hidden;
+    font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+    display: flex; flex-direction: column;
+}
+.bar {
+    display: flex; align-items: center; gap: 1.5rem;
+    padding: .9rem 2rem; background: #111820; border-bottom: 2px solid #1f2a37;
+    flex-shrink: 0;
+}
+.bar h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: .02em; }
+.mqtt { margin-left: auto; font-size: 1rem; font-weight: 700; padding: .3rem .9rem;
+        border-radius: 999px; }
+.mqtt.ok   { background: #10371f; color: #4ade80; }
+.mqtt.down { background: #4a1414; color: #f87171; animation: pulse 1s infinite; }
+#clock { font-size: 1.5rem; font-weight: 300; color: #7d8590;
+         font-variant-numeric: tabular-nums; }
+.stage { flex: 1; padding: 2rem; overflow-y: auto; }
+.clear-mark { font-size: 12rem; color: #16a34a; text-align: center; line-height: 1;
+              margin-top: 4vh; }
+.clear-text { font-size: 3.5rem; font-weight: 800; text-align: center;
+              color: #4ade80; letter-spacing: .04em; margin-top: 1rem; }
+.clear-sub { font-size: 1.3rem; text-align: center; color: #7d8590; margin-top: 1rem; }
+.alarm-head { display: flex; align-items: baseline; gap: 1.5rem;
+              margin-bottom: 1.5rem; flex-wrap: wrap; }
+.alarm-title { font-size: 3.2rem; font-weight: 800; }
+.crit-n { color: #f87171; }
+.tot-n  { color: #fbbf24; }
+.alarm-sub { font-size: 1.3rem; color: #7d8590; }
+table.faults { width: 100%; border-collapse: collapse; font-size: 1.15rem; }
+table.faults th {
+    text-align: left; padding: .6rem .8rem; color: #7d8590;
+    font-size: .8rem; text-transform: uppercase; letter-spacing: .06em;
+    border-bottom: 2px solid #1f2a37;
+}
+table.faults td { padding: .8rem; border-bottom: 1px solid #1a222c; }
+.sev { display: inline-block; padding: .2rem .6rem; border-radius: 6px;
+       font-size: .75rem; font-weight: 700; }
+.sev-crit { background: #4a1414; color: #f87171; }
+.sev-warn { background: #4a3a14; color: #fbbf24; }
+.dev  { font-weight: 700; font-family: ui-monospace, monospace; }
+.typ  { color: #93a1b0; }
+.msg  { color: #e6edf3; }
+.since { color: #7d8590; font-family: ui-monospace, monospace; white-space: nowrap; }
+.more { margin-top: 1rem; color: #7d8590; font-size: 1.1rem; }
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .45 } }
+/* Auto-dismiss stops the flashing but keeps the list readable. */
+.stage.alarming.auto-dismissed { background: #0b0f14; }
+.stage.alarming:not(.auto-dismissed) { animation: flashbg 1.2s infinite; }
+@keyframes flashbg {
+    0%,100% { background: #2a0f0f; }
+    50%     { background: #0b0f14; }
+}
+"""
+
+@app.route("/wallboard")
+@login_required
+def wallboard():
+    body = f"""<div class="bar">
+  <h1>&#127812; Sensor Watchdog &mdash; Facility Board</h1>
+  <span id="mqtt-state" class="mqtt down">BROKER ...</span>
+  <span id="clock"></span>
+</div>
+<div id="stage" class="stage"></div>
+<script>window.REFRESH_SECONDS = 5;</script>
+<script>{WALLBOARD_JS}</script>"""
+    html_doc = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sensor Watchdog - Facility Board</title>
+<style>{WALL_CSS}</style></head>
+<body>{body}</body></html>"""
+    return html_doc
+
+
+@app.route("/api/wallboard")
+@login_required
+def api_wallboard():
+    """Compact fault feed for the wall display."""
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT device_id, alert_type, message, triggered_at
+        FROM alerts
+        WHERE resolved = 0
+        ORDER BY
+            CASE alert_type
+                WHEN 'OUT_OF_RANGE' THEN 0
+                WHEN 'OFFLINE'     THEN 1
+                WHEN 'STALLED'     THEN 2
+                WHEN 'SENSOR_SILENT' THEN 3
+                ELSE 4
+            END,
+            triggered_at ASC
+    """).fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+    last = conn.execute("SELECT MAX(ts) FROM sensor_readings").fetchone()[0]
+    sysrows = conn.execute("SELECT COUNT(*) FROM out_of_range WHERE resolved=0").fetchone()[0]
+    conn.close()
+
+    faults = [{
+        "device_id": r["device_id"],
+        "alert_type": r["alert_type"],
+        "message": r["message"],
+        "triggered_at": r["triggered_at"],
+        "severity": "CRITICAL" if r["alert_type"] in ("OUT_OF_RANGE", "OFFLINE", "STALLED")
+                    else "WARNING",
+    } for r in rows]
+
+    with mqtt_health_lock:
+        mqtt_ok = mqtt_health["connected"]
+
+    return jsonify({
+        "faults": faults,
+        "mqtt_ok": mqtt_ok,
+        "total": total,
+        "lastPacket": (last[:19] if last else None),
+        "systemic": sysrows > 0,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
 
 # -----------------------------------------------------------------------------
 # Misc

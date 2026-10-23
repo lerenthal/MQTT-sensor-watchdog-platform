@@ -47,6 +47,13 @@ function sensorCell(d) {
         } else if (s.flat_seconds > 300) {
             flag = '<span class="badge badge-suspect">frozen '
                  + Math.round(s.flat_seconds / 60) + 'm</span>';
+        } else if (s.in_range === false) {
+            const t = s.threshold || {};
+            const lim = (t.min != null ? t.min : '') + ' - ' + t.max;
+            flag = '<span class="badge badge-' + (t.severity === 'CRITICAL' ? 'offline' : 'stalled')
+                 + '">out of range (' + lim + ')</span>';
+        } else if (s.in_range === true) {
+            flag = '<span class="muted" style="font-size:.75rem">in range</span>';
         }
         return '<div class="sensor-line"><span class="ts">'
              + escapeHtml(s.sensor_name) + '</span> &middot; '
