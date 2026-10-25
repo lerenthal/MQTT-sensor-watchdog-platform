@@ -105,6 +105,39 @@ is no SemVer for this project.
   so `CREATE INDEX` statements that reference newly-added columns do not
   fail on existing databases.
 
+### Fixed (follow-up review of the review)
+
+- **Restart artefact in the systemic-fault detector.** The new SYSTEMIC
+  cluster logic manufactured a fleet-wide false alarm on every container
+  restart: with no packets recorded while the watchdog is down, every
+  channel ages past the flatline window at the same moment, so the
+  detector reported "temperature silent on 30 devices". That is our own
+  downtime, not a fault, and it pages people. The watchdog now records
+  which channels it has *observed alive* since it started, and a cluster
+  is only reported if at least one channel in the group was observed
+  going quiet. Regression test added.
+- **Orphaned `/device/<id>/reset_stale` route** had no UI. Added a
+  "Reset" button on DEGRADED device rows.
+- **The wall board** rendered its own standalone document and so never
+  received a CSRF token; it now emits one.
+- **Firmware fault messages** now name the specific faulting sensor
+  ("firmware reports sensor fault: airquality1_particulate_fault")
+  instead of a generic string.
+
+### Verified after the review fixes
+
+- The ESPHome firmware diagnostics are now ingested and reaching the
+  watchdog from 22 devices: `value_stall`, `sensor_fault` and per-probe
+  fault entities, published as ON/OFF under `binary_sensor/<name>/state`.
+  All `value_stall` entities read clear, confirming that disabling the
+  server-side flatline heuristic removed only false positives. Three real
+  hardware faults were identified that the watchdog could not have found
+  on its own: `airmon-1_scd30_fault`, `airquality1_particulate_fault`
+  and `airquality2_particulate_fault`.
+- `web.secret_key` was regenerated on first boot of the new code (the
+  live config carried the committed placeholder). Existing browser
+  sessions were invalidated once, as expected.
+
 ## 2026-10-21 — Initial public release
 
 Initial commit. Flask + MQTT + watchdog + Telegram + dashboard in a

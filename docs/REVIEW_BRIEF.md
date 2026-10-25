@@ -8,7 +8,8 @@ deployment described in §2.
 **Repository:** https://github.com/lerenthal/MQTT-sensor-watchdog-platform
 **Branch:** `main` (all work pushed; nothing is uncommitted)
 **License:** GPL-3.0
-**Reviewed state:** commit `68efef7`
+**Reviewed state:** commit `2e6b972` (post-review fixes applied; see
+`docs/CHANGES_FOR_REVIEW.md`)
 
 ---
 
@@ -406,12 +407,17 @@ binary_sensor:
       return (now - id(last_change_ms) > ${stall_timeout_ms});
 ```
 
-**It is not reaching the watchdog.** The watchdog captures diagnostics
-whose name contains `stall`/`fault`, but the entity name is
-`"SCD30-2 Value Stall"` — with a **space**, and ESPHome's `binary_sensor`
-platform publishes to a different topic shape than `sensor/`. Zero
-diagnostic rows have ever been captured. Until this is resolved, **a
-genuinely frozen sensor produces no alarm.**
+**RESOLVED in review commit `2e6b972`.** ESPHome's `binary_sensor`
+platform publishes to `binary_sensor/<slug>/state` (not `sensor/<name>/state`)
+with an `ON`/`OFF` text payload. The ingest now handles that shape
+separately, decodes the text to 1.0/0.0, and stores it as `diagnostic`.
+Diagnostics from **22 devices** now reach the watchdog.
+
+Every `value_stall` entity reads clear, which confirms that disabling the
+server-side flatline heuristic removed only false positives. Three real
+hardware faults were found that the watchdog could not have detected on its
+own: `airmon-1_scd30_fault`, `airquality1_particulate_fault` and
+`airquality2_particulate_fault`.
 
 **Open question for the reviewer:** is this a watchdog parsing gap (fixable
 in Python) or does the ESPHome YAML need one line so the entity publishes

@@ -1224,6 +1224,7 @@ def watchdog_eval_loop():
             """, (device_id,)).fetchall()
             _fw_stalled = False
             _fw_fault = False
+            _fw_detail = []      # names of the specific faulting sensors
             for _r in _fw:
                 _n = (_r["sensor_name"] or "").lower()
                 # Diagnostics are stored numerically (1.0 = active, 0.0 = clear)
@@ -1233,10 +1234,14 @@ def watchdog_eval_loop():
                 except (TypeError, ValueError):
                     _on = str(_r["value"]).strip().lower() in (
                         "on", "true", "1", "yes", "pressed")
-                if "stall" in _n and _on:
+                if not _on:
+                    continue
+                if "stall" in _n:
                     _fw_stalled = True
-                elif "fault" in _n and _on:
+                    _fw_detail.append(_r["sensor_name"])
+                elif "fault" in _n:
                     _fw_fault = True
+                    _fw_detail.append(_r["sensor_name"])
             # Split the candidates into two fundamentally different things:
             #   SILENT = no packets at all for > window. This is a FACT, not a
             #            guess, and must always be reported (review finding B1 —
@@ -1257,8 +1262,15 @@ def watchdog_eval_loop():
             # has explicitly enabled server-side flatline detection. Otherwise
             # drop it — but SILENT facts above are kept regardless.
             if _fw_stalled or _fw_fault:
-                _why = ("firmware reports value stall" if _fw_stalled
-                        else "firmware reports sensor fault")
+                _names = ", ".join(_fw_detail) if _fw_detail else ""
+                if _fw_stalled and _fw_fault:
+                    _why = "firmware reports value stall and/or sensor fault"
+                elif _fw_stalled:
+                    _why = "firmware reports value stall"
+                else:
+                    _why = "firmware reports sensor fault"
+                if _names:
+                    _why += ": " + _names
                 flat = [{
                     "sensor_name": "device",
                     "sensor_type": "diagnostic",
