@@ -25,6 +25,18 @@ function escapeHtml(s) {
 // uses, rather than a hardcoded value (review finding B16).
 let FLATLINE_LIMIT = 300;
 
+// Feature 3: rows are compact by default and expand on click. Expansion is
+// per-device and survives the 10s poll, like the sensor panels.
+let EXPANDED_ROWS = new Set(JSON.parse(localStorage.getItem('watchdog-expanded-rows') || '[]'));
+
+// Feature 2: remember the status each device had on the previous poll, so a
+// row that CHANGED state can be highlighted. A device that has been broken for
+// an hour should look calm; a device that just broke should not.
+let PREV_STATUS = new Map(JSON.parse(localStorage.getItem('watchdog-prev-status') || '[]'));
+
+// A row flashes for this long after its status changes.
+const FLASH_MS = 8000;
+
 // State-changing requests must be POST and carry the CSRF token (finding B9).
 // Render an inline POST form so these work without inline JS handlers.
 function postForm(action, label, cls, confirmMsg) {
@@ -165,12 +177,15 @@ function renderRow(d) {
           + (d.snooze_until || '').slice(0, 16) + '</span>'
         : '<span class="muted">Active</span>';
     const id = encodeURIComponent(d.device_id);
+    const isOpen = EXPANDED_ROWS.has(d.device_id);
+
+    // --- Feature 2: did this device's status change since the last poll?
+    const prev = PREV_STATUS.get(d.device_id);
+    const changed = prev !== undefined && prev !== d.status;
+    const changedFrom = changed ? prev : null;
+
     const restartBtn = '<button class="btn btn-sm btn-danger" '
         + 'onclick="restart(\'' + escapeHtml(d.device_id) + '\')">Restart</button>';
-    // "Reset stale" clears a SUSPECTED_STALL / SENSOR_SILENT alert on a device
-    // whose fault is a known false positive (e.g. a sensor that holds one
-    // value in a steady room). It resolves the alert, rebases the change
-    // clock and clears any snooze.
     const resetStaleBtn = (d.status === 'DEGRADED')
         ? postForm('/device/' + id + '/reset_stale', 'Reset', 'btn btn-sm btn-warning',
                    'Clear the stall alert for ' + d.device_id + '?')
@@ -189,41 +204,56 @@ function renderRow(d) {
           + '</div></div>'
           + restartBtn + resetStaleBtn;
 
-    // FIX 2: an explicit "why is this device not OK" column. Built from the
-    // same signals the watchdog used, so it agrees with the status badge.
-    // Collapsed by default: one truncated line plus a toggle that reveals the
-    // full per-fault breakdown (type badge, message, trigger time).
-    let reason;
-    if (d.reason) {
-        const isOpen = REASON_OPEN.has(d.device_id);
-        const detail = (d.reason_detail || []).map(f =>
-            '<div class="reason-line"><span class="badge badge-'
-            + (f.alert_type === 'OFFLINE' ? 'offline'
-              : f.alert_type === 'STALLED' ? 'stalled'
-              : f.alert_type === 'SENSOR_SILENT' ? 'silent'
-              : 'suspect')
-            + '">' + escapeHtml(f.alert_type) + '</span> '
-            + escapeHtml(f.message)
-            + '<br><span class="ts">since '
-            + (f.triggered_at || '').slice(0, 19) + '</span></div>'
-        ).join('');
-        const nf = (d.reason_detail || []).length;
-        reason = '<span class="reason-summary" title="'
-              + escapeHtml(d.reason) + '">' + escapeHtml(d.reason) + '</span>'
-            + ' <button class="btn btn-sm" onclick="toggleReason(\''
-            + escapeHtml(d.device_id) + '\', this)" title="'
-            + (isOpen ? 'Hide' : 'Show') + ' fault detail">'
-            + (isOpen ? '&#9662;' : '&#9656;')
-            + (nf ? ' <span class="muted">' + nf + '</span>' : '') + '</button>'
-            + '<div class="reason-panel" id="reason-' + encodeURIComponent(d.device_id) + '" '
-            + 'style="display:' + (isOpen ? 'block' : 'none') + ';">'
-            + (detail || '<span class="muted">' + escapeHtml(d.reason) + '</span>')
-            + '</div>';
-    } else {
-        reason = '<span class="muted">—</span>';
-    }
+    // --- Compact one-line summary (always visible).
+    const loc = d.location || '';
+    const role = d.role ? ' (' + d.role + ')' : '';
+    const sensors = sensorSummary(d);
+    const reasonShort = d.reason
+        ? '<span class="reason-summary" title="' + escapeHtml(d.reason) + '">'
+          + escapeHtml(d.reason) + '</span>'
+        : '<span class="muted">&mdash;</span>';
 
-    return '<tr data-device="' + escapeHtml(d.device_id)
+    const changedTag = changed
+        ? '<span class="changed-tag" title="Status changed from '
+          + escapeHtml(changedFrom || '?') + '">'
+          + escapeHtml(changedFrom || '?') + ' &rarr; ' + escapeHtml(d.status)
+          + '</span>'
+        : '';
+
+    // --- Detail (shown only when the row is expanded).
+    const detail = isOpen ? (
+        '<tr class="detail-row" data-detail-for="' + escapeHtml(d.device_id) + '">'
+      + '<td colspan="12">'
+      + '<div class="detail-grid">'
+      + '<div><span class="dl">Location / Role</span><span class="dv">'
+        + escapeHtml(loc || '\u2014') + escapeHtml(role) + '</span></div>'
+      + '<div><span class="dl">Status</span><span class="dv">' + status + '</span></div>'
+      + '<div><span class="dl">Last seen</span><span class="dv ts">'
+        + (d.last_seen || 'Never') + '</span></div>'
+      + '<div><span class="dl">Heartbeat</span><span class="dv num">'
+        + (d.last_heartbeat_value ?? '\u2014') + '</span></div>'
+      + '<div><span class="dl">Reason</span><span class="dv">'
+        + (d.reason_detail || []).map(f =>
+            '<div><span class="badge badge-' + faultBadgeClass(f.alert_type) + '">'
+            + escapeHtml(f.alert_type) + '</span> ' + escapeHtml(f.message)
+            + ' <span class="ts">since ' + escapeHtml((f.triggered_at || '').slice(0, 19))
+            + '</span></div>').join('')
+        + '</span></div>'
+      + '<div><span class="dl">Snooze</span><span class="dv">' + snooze + '</span></div>'
+      + '<div><span class="dl">Actions</span><span class="dv">' + actions + '</span></div>'
+      + '</div>'
+      + '<div class="detail-sensors"><span class="dl">All sensors</span>'
+      + sensors + '</div>'
+      + '</td></tr>'
+    ) : '';
+
+    const rowClass = 'row-compact'
+        + (changed ? ' row-changed' : '')
+        + (d.status === 'OFFLINE' ? ' row-offline' : '')
+        + (d.status === 'DEGRADED' ? ' row-degraded' : '')
+        + (d.status === 'STALLED' ? ' row-stalled' : '');
+
+    const main = '<tr class="' + rowClass + '" data-device="' + escapeHtml(d.device_id)
         + '" data-status="' + escapeHtml(d.status)
         + '" data-location="' + escapeHtml(d.location || '')
         + '" data-role="' + escapeHtml(d.role || '')
@@ -233,24 +263,52 @@ function renderRow(d) {
         + '" data-co2="' + (d.last_co2 ?? '')
         + '" data-lastseen="' + (d.last_seen || '')
         + '" data-heartbeat="' + (d.last_heartbeat_value ?? '')
-        + '">'
-        + '<td class="col-device"><strong>' + escapeHtml(d.device_id) + '</strong></td>'
-        + '<td class="col-location">' + escapeHtml(d.location || '')
+        + '" onclick="toggleRow(\'' + escapeHtml(d.device_id) + '\')">'
+        + '<td class="col-device"><span class="expand-caret">'
+          + (isOpen ? '&#9662;' : '&#9656;') + '</span> <strong>'
+          + escapeHtml(d.device_id) + '</strong></td>'
+        + '<td class="col-location">' + escapeHtml(loc)
           + (d.role ? '<br><span class="muted" style="font-size:.75rem">'
                      + escapeHtml(d.role) + '</span>' : '') + '</td>'
-        + '<td class="col-status">' + status + '</td>'
-        + '<td class="col-reason">' + reason + '</td>'
-        + '<td class="col-lastseen ts">' + (d.last_seen || 'Never').slice(5, 19) + '</td>'
-        + '<td class="col-heartbeat num">' + (d.last_heartbeat_value ?? '--') + '</td>'
+        + '<td class="col-status">' + status + changedTag + '</td>'
         + '<td class="col-temp num">' + (d.last_temp ?? '--') + '</td>'
         + '<td class="col-hum num">' + (d.last_hum ?? '--') + '</td>'
         + '<td class="col-co2 num">' + (d.last_co2 ?? '--') + '</td>'
-        + '<td class="col-sensors">' + sensorSummary(d)
-          + '<div style="margin-top:.3rem">' + sensorCell(d) + '</div></td>'
+        + '<td class="col-reason">' + reasonShort + '</td>'
+        + '<td class="col-sensors">' + sensors + '</td>'
+        + '<td class="col-lastseen ts">'
+          + (d.last_seen || 'Never').slice(5, 19) + '</td>'
         + '<td class="col-snooze">' + snooze + '</td>'
-        + '<td class="col-actions">' + actions + '</td>'
+        + '<td class="col-actions">'
+          + '<button class="btn btn-sm btn-danger" onclick="event.stopPropagation();restart(\''
+          + escapeHtml(d.device_id) + '\')">Restart</button>'
+          + '</td>'
         + '</tr>';
+
+    return main + detail;
 }
+
+function faultBadgeClass(t) {
+    if (t === 'SYSTEMIC') return 'offline';
+    if (t === 'OUT_OF_RANGE') return 'stalled';
+    if (t === 'OFFLINE') return 'offline';
+    if (t === 'STALLED') return 'stalled';
+    if (t === 'SENSOR_SILENT') return 'silent';
+    return 'suspect';
+}
+
+// Feature 3: expand/collapse a device row. The detail is a separate <tr>, so
+// a re-render is the simplest way to add or remove it.
+window.toggleRow = function (deviceId) {
+    if (EXPANDED_ROWS.has(deviceId)) {
+        EXPANDED_ROWS.delete(deviceId);
+    } else {
+        EXPANDED_ROWS.add(deviceId);
+    }
+    localStorage.setItem('watchdog-expanded-rows', JSON.stringify([...EXPANDED_ROWS]));
+    refresh();
+};
+
 
 function applyFilter() {
     const q = (document.getElementById('search').value || '').toLowerCase().trim();
@@ -344,6 +402,14 @@ async function refresh() {
             document.getElementById('row-count').textContent = '';
             return;
         }
+        // Feature 2: remember each device's status so the NEXT render can
+        // tell that it changed. Do this BEFORE rendering, otherwise every
+        // device would look "changed" on every poll.
+        const nowStatus = new Map();
+        ALL_DEVICES.forEach(d => nowStatus.set(d.device_id, d.status));
+        PREV_STATUS = nowStatus;
+        localStorage.setItem('watchdog-prev-status', JSON.stringify([...PREV_STATUS]));
+
         tbody.innerHTML = ALL_DEVICES.map(renderRow).join('');
         applyFilter();
         applySort();
@@ -357,6 +423,15 @@ async function refresh() {
         renderSystemic(data.systemic || []);
     } catch (e) { console.error(e); }
 }
+
+// Feature 2: a changed row flashes briefly, then settles. Without this the
+// highlight would persist for as long as the fault lasts, which defeats the
+// point - a device that has been broken for an hour should look calm.
+setTimeout(() => {
+    document.querySelectorAll('tr.row-changed').forEach(tr => {
+        tr.classList.remove('row-changed');
+    });
+}, FLASH_MS);
 
 window.restart = async function (deviceId) {
     if (!confirm('Restart ' + deviceId + '?')) return;

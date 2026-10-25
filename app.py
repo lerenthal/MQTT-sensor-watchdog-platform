@@ -70,6 +70,31 @@ def _override(cfg, *keys, value):
     cur[keys[-1]] = value
     return cfg
 
+# Devices on the ignore list are installed but not currently in use. They are
+# hidden from the dashboard and excluded from alerting entirely, so a
+# decommissioned sensor cannot raise alarms.
+def _persist_config():
+    """Write the in-memory config back to the config file.
+
+    Used by admin actions that change a key directly (ignore list) rather
+    than through the YAML editor.
+    """
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            yaml.safe_dump(config, f, sort_keys=False, default_flow_style=False)
+        return True
+    except OSError:
+        log.exception("could not persist config to %s", CONFIG_FILE)
+        return False
+
+
+def _ignored_devices():
+    raw = config.get("watchdog", {}).get("ignored_devices", []) or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(d).strip() for d in raw if str(d).strip()}
+
+
 for env, path in [
     ("WATCHDOG_MQTT_BROKER",  ("mqtt", "broker")),
     ("WATCHDOG_MQTT_PORT",    ("mqtt", "port")),
@@ -144,6 +169,19 @@ def _apply_migrations(conn):
             value TEXT NOT NULL
         );
     """)
+    # v7 -> v8: per-device status history, so the dashboard can tell the
+    # operator that a device JUST changed state (and flash the row) rather
+    # than showing a static list of colours.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS device_status_history (
+            device_id TEXT NOT NULL,
+            status     TEXT NOT NULL,
+            changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            seen_at    INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_status_history_device
+            ON device_status_history(device_id, changed_at DESC);
+    """)
     # v6 -> v7: operator-acknowledged known-degraded sensors. These are
     # excluded from alerting so a documented, accepted fault does not drown
     # the dashboard in permanent noise.
@@ -157,10 +195,6 @@ def _apply_migrations(conn):
             PRIMARY KEY (device_id, sensor_name)
         );
     """)
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','7')"
-    )
-
     # v5 -> v6: per-entity target ranges.
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS sensor_thresholds (
@@ -241,7 +275,7 @@ def _apply_migrations(conn):
         log.info("Migration: renamed sensor_readings.sensor_id -> sensor_name")
 
     conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','7')"
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','8')"
     )
 
 def init_db():
@@ -1152,8 +1186,17 @@ def watchdog_eval_loop():
             (dev, c["sensor_type"]) for c in systemic for dev in c["devices"]
         }
 
+        _ignored = _ignored_devices()
         for dev in cursor.execute("SELECT * FROM devices").fetchall():
             device_id = dev["device_id"]
+            if device_id in _ignored:
+                # Installed but not in use: no evaluation, no alerts. Clear any
+                # stale alert so it does not linger on the wall board.
+                cursor.execute(
+                    "UPDATE alerts SET resolved = 1 WHERE device_id = ? AND resolved = 0",
+                    (device_id,),
+                )
+                continue
             snooze_until = _parse_ts(dev["snooze_until"])
             if snooze_until and now < snooze_until:
                 continue
@@ -1319,6 +1362,15 @@ def watchdog_eval_loop():
                 cursor.execute(
                     "UPDATE devices SET status = ? WHERE device_id = ?",
                     (new_status, device_id),
+                )
+                # Feature 2: record the transition so the dashboard can flash
+                # the row and show what it changed FROM. Without this the
+                # operator sees a static colour and cannot tell a fresh
+                # failure from a long-standing one.
+                cursor.execute(
+                    "INSERT INTO device_status_history(device_id, status, changed_at) "
+                    "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    (device_id, new_status),
                 )
 
             # Resolve alerts that no longer apply. This must be PER ALERT
@@ -1699,18 +1751,61 @@ a:hover { color: var(--accent-hover); }
      device 150  location 131  status 94   reason 411  lastseen 131
      hb 94       temp 84       hum 84        co2 94     sensors 224
      snooze 168  actions 206                                            */
-.col-device    { width: 8%;   }
-.col-location  { width: 7%;   }
-.col-status    { width: 5%;   }
-.col-reason    { width: 22%;  }
-.col-lastseen  { width: 7%;   }
-.col-heartbeat { width: 5%;   }
-.col-temp      { width: 4.5%; }
-.col-hum       { width: 4.5%; }
-.col-co2       { width: 5%;   }
-.col-sensors   { width: 12%;  }
-.col-snooze    { width: 9%;   }
-.col-actions   { width: 11%;  }
+/* Feature 3: compact one-line rows. The device row is a single line; the
+   detail lives in a second <tr> that only exists while expanded. */
+.row-compact td {
+    padding: .35rem .5rem;
+    vertical-align: middle;
+    white-space: nowrap;
+}
+.row-compact { cursor: pointer; }
+.row-compact:hover { background: var(--bg); }
+.expand-caret { color: var(--muted); font-size: .8em; }
+
+/* Feature 2: a device that JUST changed state flashes. The highlight is
+   removed after FLASH_MS so a long-standing fault looks calm. */
+@keyframes rowflash {
+    0%, 100% { background: transparent; }
+    50%      { background: rgba(250, 204, 21, .35); }
+}
+tr.row-changed { animation: rowflash 1s 4; }
+tr.row-changed td { border-bottom-color: var(--warning); }
+/* Persistent tint by severity, so the colour still means something after
+   the flash has ended. */
+tr.row-offline  td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
+tr.row-degraded td:first-child { box-shadow: inset 3px 0 0 #6d28d9; }
+tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
+.changed-tag {
+    display: inline-block; margin-left: .35rem; padding: 0 .35rem;
+    border-radius: 4px; background: var(--warning); color: #1f2937;
+    font-size: .7rem; font-weight: 700;
+}
+
+/* The expanded detail row. */
+.detail-row td {
+    background: var(--bg); padding: .7rem .8rem; white-space: normal;
+    border-left: 3px solid var(--accent);
+}
+.detail-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: .5rem 1rem;
+}
+.detail-grid > div { display: flex; flex-direction: column; gap: .15rem; }
+.dl { font-size: .68rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.dv { font-size: .85rem; }
+.detail-sensors { margin-top: .6rem; padding-top: .5rem; border-top: 1px solid var(--border); }
+
+.col-device    { width: 13%;  }
+.col-location  { width: 9%;   }
+.col-status    { width: 9%;   }
+.col-temp      { width: 5%;   }
+.col-hum       { width: 5%;   }
+.col-co2       { width: 6%;   }
+.col-reason    { width: 20%;  }
+.col-sensors   { width: 13%;  }
+.col-lastseen  { width: 8%;   }
+.col-snooze    { width: 7%;   }
+.col-actions   { width: 5%;   }
 /* Values are tabular so digits line up column to column. */
 .table.devices td.num { font-variant-numeric: tabular-nums; }
 /* Narrow viewports: shed the columns an operator can recover from the
@@ -1718,17 +1813,14 @@ a:hover { color: var(--accent-hover); }
 @media (max-width: 1100px) {
     .table.devices { font-size: .78rem; }
     .table.devices th, .table.devices td { padding: .4rem .35rem; }
-    .col-lastseen, .col-heartbeat { display: none; }
+    .col-lastseen { display: none; }
     .col-device   { width: 17%; }
-    .col-location { width: 14%; }
-    .col-status   { width: 9%;  }
-    .col-reason   { width: 30%; }
-    .col-temp     { width: 8%;  }
-    .col-hum      { width: 8%;  }
-    .col-co2      { width: 8%;  }
-    .col-sensors  { width: 9%;  }
-    .col-snooze   { width: 0;   }
-    .col-actions  { width: 0;   }
+    .col-location { width: 12%; }
+    .col-status   { width: 11%; }
+    .col-reason   { width: 28%; }
+    .col-sensors  { width: 14%; }
+    .col-snooze   { width: 8%;  }
+    .col-actions  { width: 5%;  }
 }
 @media (max-width: 860px) {
     .col-location, .col-co2 { display: none; }
@@ -1982,13 +2074,12 @@ def index():
         <th class="col-device"    data-sort="device">Device <span class="sort-arrow"></span></th>
         <th class="col-location"  data-sort="location">Loc / Role <span class="sort-arrow"></span></th>
         <th class="col-status"    data-sort="status">Status <span class="sort-arrow"></span></th>
-        <th class="col-reason"    data-sort="reason">Reason <span class="sort-arrow"></span></th>
-        <th class="col-lastseen"  data-sort="lastseen">Last Seen <span class="sort-arrow"></span></th>
-        <th class="col-heartbeat" data-sort="heartbeat">HB <span class="sort-arrow"></span></th>
         <th class="col-temp"      data-sort="temp">°C <span class="sort-arrow"></span></th>
         <th class="col-hum"       data-sort="hum">RH% <span class="sort-arrow"></span></th>
         <th class="col-co2"       data-sort="co2">CO2 <span class="sort-arrow"></span></th>
+        <th class="col-reason"    data-sort="reason">Reason <span class="sort-arrow"></span></th>
         <th class="col-sensors">Sensors</th>
+        <th class="col-lastseen"  data-sort="lastseen">Last Seen <span class="sort-arrow"></span></th>
         <th class="col-snooze">Snooze</th>
         <th class="col-actions">Actions</th>
       </tr></thead>
@@ -2010,9 +2101,11 @@ def api_devices():
     we aggregate here so the JS poll is a single request, not N+1.
     """
     conn = get_db()
+    # Feature 1: devices on the ignore list are not shown at all.
+    _ignored = _ignored_devices()
     devices = [dict(r) for r in conn.execute(
         "SELECT * FROM devices ORDER BY device_id ASC"
-    ).fetchall()]
+    ).fetchall() if r["device_id"] not in _ignored]
     sensor_rows = conn.execute("""
         SELECT device_id, sensor_name, sensor_type, value, ts, last_change_ts
         FROM sensor_readings
@@ -2075,6 +2168,7 @@ def api_devices():
     # Operator-acknowledged known-degraded sensors. Excluded from alerting,
     # but still shown so the operator can see the sensor exists and is
     # knowingly suppressed.
+    hconn = get_db()
     try:
         kc = get_db()
         degraded = {}
@@ -2165,6 +2259,20 @@ def api_devices():
                 reasons.append(d["faults"][0]["message"])
         d["reason"] = "; ".join(reasons)
         d["reason_detail"] = d["faults"]
+        # Feature 2: was this status reached recently, and what was it before?
+        # The dashboard uses this to flash a changed row and to say
+        # "was ONLINE, now OFFLINE".
+        try:
+            hist = hconn.execute(
+                "SELECT status, changed_at FROM device_status_history "
+                "WHERE device_id = ? ORDER BY changed_at DESC LIMIT 2",
+                (d["device_id"],),
+            ).fetchall()
+            d["status_changed_at"] = hist[0]["changed_at"] if hist else None
+            d["previous_status"] = hist[1]["status"] if len(hist) > 1 else None
+        except Exception:
+            d["status_changed_at"] = None
+            d["previous_status"] = None
 
     # Systemic fault rollup for the dashboard banner. Needs its own
     # connection because the main one is closed by this point.
@@ -2466,6 +2574,99 @@ def admin_sensors_csv():
     return redirect(url_for("admin_config", saved=1))
 
 
+@app.route("/admin/ignored", methods=["GET", "POST"])
+@login_required
+def admin_ignored():
+    """Manage the ignore list: devices that are installed but not in use.
+
+    An ignored device is hidden from the dashboard AND excluded from
+    alerting, so a decommissioned or spare sensor cannot raise alarms.
+    """
+    if session.get("role") != "admin":
+        abort(403)
+
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        device_id = (request.form.get("device_id") or "").strip()
+        who = session.get("username", "?")
+
+        if action == "remove" and device_id:
+            _ignored = _ignored_devices()
+            _ignored.discard(device_id)
+            config.setdefault("watchdog", {})["ignored_devices"] = sorted(_ignored)
+            _persist_config()
+            audit("IGNORE_REMOVED", device_id=device_id,
+                  details="Device returned to monitoring", username=who)
+            return redirect(url_for("admin_ignored"))
+
+        if action == "add" and device_id:
+            _ignored = _ignored_devices()
+            _ignored.add(device_id)
+            config.setdefault("watchdog", {})["ignored_devices"] = sorted(_ignored)
+            _persist_config()
+            audit("IGNORE_ADDED", device_id=device_id,
+                  details="Device hidden from dashboard and alerting", username=who)
+            return redirect(url_for("admin_ignored"))
+
+        return redirect(url_for("admin_ignored"))
+
+    ignored = _ignored_devices()
+    conn = get_db()
+    all_devices = [r[0] for r in conn.execute(
+        "SELECT DISTINCT device_id FROM devices ORDER BY device_id")]
+    known = [d for d in all_devices if d not in ignored]
+    conn.close()
+
+    ignored_rows = "".join(
+        f'<tr><td><strong>{html_lib.escape(d)}</strong></td>'
+        f'<td class="muted">hidden from dashboard, excluded from alerting</td>'
+        f'<td><form method="post" action="/admin/ignored" style="display:inline">'
+        f'{_csrf_input()}'
+        f'<input type="hidden" name="action" value="remove">'
+        f'<input type="hidden" name="device_id" value="{html_lib.escape(d)}">'
+        f'<button class="btn btn-sm btn-success" type="submit">Resume monitoring</button>'
+        f'</form></td></tr>'
+        for d in sorted(ignored)
+    ) or '<tr><td colspan="3" class="muted">No devices ignored.</td></tr>'
+
+    options = "".join(
+        f'<option value="{html_lib.escape(d)}">{html_lib.escape(d)}</option>'
+        for d in known
+    ) or '<option value="">— no monitored devices —</option>'
+
+    body = f"""<div class="card">
+  <h3>Ignore list</h3>
+  <p class="muted" style="margin-top:0">
+    Devices that are physically installed but currently not in use. An ignored
+    device is <strong>hidden from the dashboard</strong> and
+    <strong>excluded from alerting entirely</strong>, so it cannot raise
+    alarms. Its readings are still recorded in the database.
+    <br><span class="muted">Also editable at <code>/admin/config</code> under
+    <code>watchdog.ignored_devices</code>.</span>
+  </p>
+  <form method="post" action="/admin/ignored">
+    {_csrf_input()}
+    <input type="hidden" name="action" value="add">
+    <div class="field">
+      <label>Device</label>
+      <select name="device_id">{options}</select>
+    </div>
+    <button class="btn btn-primary" type="submit">Ignore this device</button>
+  </form>
+</div>
+<div class="card">
+  <h3>Currently ignored</h3>
+  <div style="overflow-x:auto">
+    <table class="table table-sm">
+      <thead><tr><th>Device</th><th>Effect</th><th></th></tr></thead>
+      <tbody>{ignored_rows}</tbody>
+    </table>
+  </div>
+  <a class="btn" href="/admin/config">← Back to admin config</a>
+</div>"""
+    return _render_layout("Ignore list", body, current_tab="admin")
+
+
 @app.route("/admin/degraded", methods=["GET", "POST"])
 @login_required
 def admin_degraded():
@@ -2743,6 +2944,10 @@ sht41-3,,,sht41-3_temperature,24,30,WARNING</pre>
       Ranges are only evaluated against fresh readings, so a dead sensor reports
       SENSOR_SILENT rather than a misleading out-of-range.</p>
   </details>
+  <p class="muted" style="margin-top:0">
+    Need to hide a device that is installed but not in use?
+    <a href="/admin/ignored">Manage the ignore list</a>.
+  </p>
   <form method="post" action="/admin/sensors/csv">
     {_csrf_input()}
     <div class="field">
@@ -2821,6 +3026,14 @@ def admin_config_post():
     for key in ("telegram", "watchdog", "facility", "snooze_presets", "auth"):
         if key in new_cfg:
             config[key] = new_cfg[key]
+    # ignored_devices lives under watchdog:, which is hot-reloaded above, so
+    # the ignore list takes effect on the next watchdog tick without a
+    # restart. Normalise it to a sorted list of strings either way.
+    _ign = config.get("watchdog", {}).get("ignored_devices", []) or []
+    if isinstance(_ign, str):
+        _ign = [_ign]
+    config.setdefault("watchdog", {})["ignored_devices"] = sorted(
+        {str(d).strip() for d in _ign if str(d).strip()})
     if "web" in new_cfg and "dashboard_refresh_seconds" in new_cfg["web"]:
         config["web"]["dashboard_refresh_seconds"] = new_cfg["web"]["dashboard_refresh_seconds"]
 

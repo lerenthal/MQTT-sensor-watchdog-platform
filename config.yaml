@@ -1,96 +1,57 @@
-# =============================================================================
-# MUSHROOM FACILITY SENSOR WATCHDOG CONFIGURATION
-# =============================================================================
-# Local-only deployment. Do NOT commit real credentials to a public repo.
-# For shared deployment, move `mqtt.password`, `telegram.bot_token`, and
-# `telegram.chat_id` into environment variables (see app.py load order).
-
 mqtt:
-  broker: "10.10.17.11"
+  broker: 10.10.17.11
   port: 1883
-  username: "CHANGE_ME"
-  password: "CHANGE_ME"
-  topic_subscription: "facility/+/env_sensor/#"
-  # Robustness: keep the MQTT thread alive across broker restarts.
+  username: CHANGE_ME
+  password: CHANGE_ME
+  topic_subscription: facility/+/env_sensor/#
   keepalive_seconds: 60
   reconnect_min_delay_seconds: 1
   reconnect_max_delay_seconds: 30
-
 telegram:
-  # Disabled by default so a fresh install with placeholder credentials does
-  # not spin the long-poll loop against a bogus token. Set to true (or
-  # WATCHDOG_TG_ENABLED=true) once a real bot_token/chat_id is configured.
   enabled: false
-  bot_token: "YOUR_TELEGRAM_BOT_TOKEN_HERE"   # Get from @BotFather
-  chat_id: "YOUR_TELEGRAM_CHAT_ID_HERE"       # Your personal or group chat ID
-  nagging_interval_seconds: 180               # Re-send alert every 3 minutes until acked/snoozed
-  poll_timeout_seconds: 25                    # Long-poll window per getUpdates call
-
+  bot_token: YOUR_TELEGRAM_BOT_TOKEN_HERE
+  chat_id: YOUR_TELEGRAM_CHAT_ID_HERE
+  nagging_interval_seconds: 180
+  poll_timeout_seconds: 25
 watchdog:
-  check_interval_seconds: 30                  # Evaluation loop frequency
-  default_heartbeat_timeout_seconds: 180      # 3 minutes without counter increment = STALLED
-  default_offline_timeout_seconds: 120        # 2 minutes without any MQTT message = OFFLINE
-  # SUSPECTED_STALL: a per-sensor value that hasn't changed within this window
-  # raises a SUSPECTED_STALL alert, even if no heartbeat counter is published.
-  # Default 900s (15 min). Integer-rounded sensors sit on the same value for
-  # many minutes in a stable room, which is not a fault. Raise further for
-  # genuinely constant setpoints; lower only where a frozen value is a
-  # genuine failure mode you need caught quickly.
+  check_interval_seconds: 30
+  default_heartbeat_timeout_seconds: 180
+  default_offline_timeout_seconds: 120
   sensor_flatline_seconds: 900
-  # Absolute tolerance in the metric's own units. A new reading that differs
-  # from the previous by no more than this is treated as unchanged. 0 means
-  # any movement at all counts, which is correct for devices publishing
-  # integer ppm or 0.1 C resolution.
   sensor_flatline_min_change: 0.0
-  # Server-side value-flatline detection. OFF by default: it cannot
-  # distinguish a frozen sensor from a room that is genuinely steady,
-  # and on this fleet it produced only false positives. Turn it on for
-  # a device that publishes its own stall verdict but is not yet
-  # visible to the watchdog.
   sensor_flatline_detection_enabled: false
-  # OUT_OF_RANGE dwell. A reading must stay outside its target range this long
-  # before it raises/pages, so a value oscillating across a limit does not flap
-  # the alert. Set to 0 for the old immediate behaviour.
+  ignored_devices:
+  - spare-1
+  - spare-2
   out_of_range_hysteresis_seconds: 60
-
 web:
-  host: "0.0.0.0"
+  host: 0.0.0.0
   port: 5050
-  # Long random string for Flask session signing. Rotate to invalidate
-  # existing logins. SECURITY: a committed/weak key lets anyone forge an admin
-  # session. If this is left as the CHANGE_ME placeholder (or shorter than 32
-  # chars), the app generates a strong random key on first boot and writes it
-  # back here. Prefer setting WATCHDOG_SECRET_KEY in .env, which overrides this.
-  secret_key: "CHANGE_ME_generated_on_first_boot"
-  dashboard_refresh_seconds: 10               # Poll /api/devices (was meta-refresh, caused flash)
-
-# Web UI authentication. v1 uses a small fixed user table with per-user
-# passwords. Audit rows are stamped with the username of whoever is
-# logged in.
+  secret_key: CHANGE_ME_generated_on_first_boot
+  dashboard_refresh_seconds: 10
 auth:
   users:
     yaniv:
-      password: "mushroom"      # CHANGE on first boot
-      role: "admin"
+      role: admin
+      password_hash:
+        salt: 443eba6511184694
+        hash: ba540f939d0fd28f98586a4bfa9fc3d944db5addc79507f2f1eccdeb53fbabbb
     operator:
-      password: "operator"      # CHANGE on first boot
-      role: "operator"
-  # Maximum config-history rows to retain; older rows are pruned by
-  # /admin/config (most recent save wins).
+      role: operator
+      password_hash:
+        salt: 1164c9df8fbe1c8a
+        hash: 7c7f906086b2ee480e2ba9a54ac036d1bc55f75ffa924b0b9e098ba1272217cd
   config_history_max_versions: 50
-
-# Facility metadata for the print report header.
 facility:
-  name: "Mushroom Cultivation Facility"
-  location: "Israel"
-  report_title: "Sensor Watchdog Status Report"
-
+  name: Mushroom Cultivation Facility
+  location: Israel
+  report_title: Sensor Watchdog Status Report
 snooze_presets:
-  - label: "1 Hour"
-    hours: 1
-  - label: "8 Hours"
-    hours: 8
-  - label: "24 Hours"
-    hours: 24
-  - label: "7 Days"
-    hours: 168
+- label: 1 Hour
+  hours: 1
+- label: 8 Hours
+  hours: 8
+- label: 24 Hours
+  hours: 24
+- label: 7 Days
+  hours: 168
