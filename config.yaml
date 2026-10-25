@@ -29,13 +29,22 @@ watchdog:
   default_offline_timeout_seconds: 120        # 2 minutes without any MQTT message = OFFLINE
   # SUSPECTED_STALL: a per-sensor value that hasn't changed within this window
   # raises a SUSPECTED_STALL alert, even if no heartbeat counter is published.
-  # Default 300s (5 min) matches the operator's natural intuition. Set higher
-  # for sensors that genuinely could be constant (e.g. a freezer's setpoint).
-  sensor_flatline_seconds: 300
-  # Fractional tolerance when comparing the new reading to the prior one. A
-  # value that differs by less than this fraction is treated as "unchanged".
-  # Default 0.1% ignores noise (e.g. 21.40 vs 21.41) but flags real flatlines.
-  sensor_flatline_min_change_pct: 0.1
+  # Default 900s (15 min). Integer-rounded sensors sit on the same value for
+  # many minutes in a stable room, which is not a fault. Raise further for
+  # genuinely constant setpoints; lower only where a frozen value is a
+  # genuine failure mode you need caught quickly.
+  sensor_flatline_seconds: 900
+  # Absolute tolerance in the metric's own units. A new reading that differs
+  # from the previous by no more than this is treated as unchanged. 0 means
+  # any movement at all counts, which is correct for devices publishing
+  # integer ppm or 0.1 C resolution.
+  sensor_flatline_min_change: 0.0
+  # Server-side value-flatline detection. OFF by default: it cannot
+  # distinguish a frozen sensor from a room that is genuinely steady,
+  # and on this fleet it produced only false positives. Turn it on for
+  # a device that publishes its own stall verdict but is not yet
+  # visible to the watchdog.
+  sensor_flatline_detection_enabled: false
 
 web:
   host: "0.0.0.0"

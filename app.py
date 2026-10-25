@@ -431,8 +431,49 @@ _SENSOR_METRIC_PATTERNS = (
     ("voltage",     ("voltage", "volt")),
     ("current",     ("current", "amp")),
     ("battery",     ("battery",)),
-    ("signal",      ("rssi", "wifi_signal", "signal_strength")),
 )
+
+
+# Name fragments that mark a channel as a diagnostic or configuration value
+# rather than an environmental reading. These legitimately hold constant (an
+# uptime counter, a revision number, a calibration count) and must not be
+# type-matched just because they contain a metric word.
+_DIAGNOSTIC_NAME_MARKERS = (
+    "uptime",
+    "calibration_revision",
+    "calibration_count",
+    "calibration_lock",
+    "last_calibrated",
+    "calibration_status",
+    "calibration_note",
+    "compliance_note",
+    "mac_address",
+    "ip_address",
+    "connected_ssid",
+    "wifi_signal",
+    "rssi",
+    "boot_count",
+    "firmware_version",
+    "esp_home_version",
+    "firmware",
+    "version",
+    "ssid",
+    "address",
+    "status",
+)
+
+
+# Diagnostics worth keeping because the device computes them and they answer
+# a question the server cannot: 'Value Stall' (the firmware's own comparison
+# of CO2/temperature against its previous reading, with a 30 minute
+# threshold) and 'Sensor Fault' (no accepted reading within the stale
+# window). Both are binary sensors published as text.
+_USEFUL_DIAGNOSTICS = ("value_stall", "sensor_fault", "stall", "fault")
+
+
+def _is_useful_diagnostic(sensor_name):
+    lname = (sensor_name or "").lower()
+    return any(k in lname for k in _USEFUL_DIAGNOSTICS)
 
 
 def _classify_sensor(sensor_name):
@@ -440,14 +481,25 @@ def _classify_sensor(sensor_name):
     diagnostic rather than a reading.
 
     The facility's sensors carry the metric in the name
-    ('maxim5_co2', 'aimon-1_pm25', 'bme680-1_pressure'), so the name is the
-    only signal available. Order is significant: 'co2' is checked before
+    ('maxim5_co2', 'airmon-1_pm25', 'bme680-1_pressure'), so the name is the
+    only signal available. Order is significant: 'co2' is matched before
     'co', and 'temperature' last so 'ground_temperature' still resolves to
     temperature.
+
+    Diagnostic channels are rejected FIRST. Substring matching alone would
+    type 'dual_temp_uptime' as temperature and
+    'portable-sense1_co2_calibration_count' as co2 - both legitimately hold
+    constant, so they would sit frozen forever and generate permanent false
+    stall alerts.
     """
     lname = (sensor_name or "").lower()
     if not lname:
         return None
+
+    for marker in _DIAGNOSTIC_NAME_MARKERS:
+        if marker in lname:
+            return None
+
     for metric, needles in _SENSOR_METRIC_PATTERNS:
         for needle in needles:
             if needle in lname:
@@ -497,10 +549,9 @@ def _retry_mqtt_write(device_id, sensor_name, sensor_type, val, now, tol):
                 ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
                     value = excluded.value, ts = excluded.ts,
                     last_change_ts = CASE
-                        WHEN ((excluded.value - value) BETWEEN -?*ABS(value) AND +?*ABS(value))
-                          OR (excluded.value = value)
-                        THEN last_change_ts ELSE excluded.ts END
-            """, (device_id, sensor_name, sensor_type, val, now, now, tol, tol))
+                        WHEN ABS(excluded.value - value) <= ? THEN last_change_ts
+                        ELSE excluded.ts END
+            """, (device_id, sensor_name, sensor_type, val, now, now, tol))
         if sensor_type == "temperature":
             cursor.execute("UPDATE devices SET last_temp=? WHERE device_id=?", (val, device_id))
         elif sensor_type == "humidity":
@@ -571,7 +622,14 @@ def on_mqtt_message(client, userdata, msg):
         return
     now = datetime.now()
     # Hoisted so the lock-retry handler always has it in scope.
-    tol = float(config.get("watchdog", {}).get("sensor_flatline_min_change_pct", 0.1)) / 100.0
+    # Absolute tolerance: "the value has not moved by more than N units".
+    # A percentage was wrong here - a CO2 sensor publishing whole ppm sits
+    # on 449.0 for many minutes in a stable room, and 0.1% of 449 is
+    # 0.45 ppm, below the device's own 1 ppm granularity, so the reading
+    # could never be seen to change. Units, not percentages, is what
+    # "frozen" means for a physical measurement.
+    tol = float(config.get("watchdog", {}).get("sensor_flatline_min_change", 0.0))
+    conn = None
     try:
         conn = get_db()
         cursor = conn.cursor()
@@ -612,19 +670,47 @@ def on_mqtt_message(client, userdata, msg):
             try:
                 val = float(payload_str)
                 if val != val:  # NaN guard (NaN != NaN)
-                    conn.close()
                     return
             except (ValueError, TypeError):
-                conn.close()
                 return
+
+            # Classify FIRST - the sentinel checks below need to know the
+            # metric type, and sensor_type must be bound before it is used.
             sensor_type = _classify_sensor(sensor_name)
             if sensor_type is None:
-                # No recognised metric in the name. Almost always a
-                # diagnostic (mac address, uptime, ip, ssid) rather than a
-                # reading. Drop silently rather than filling the DB with
-                # noise.
-                conn.close()
+                # Not an environmental metric. Some of these are worth
+                # keeping - the firmware publishes its own 'Value Stall' and
+                # 'Sensor Fault' binary sensors, which are authoritative
+                # answers to "is this sensor frozen?" and are computed on
+                # the device with knowledge we do not have server-side.
+                # Record them under a 'diagnostic' type; everything else
+                # (mac address, ip, ssid) is dropped as noise.
+                if _is_useful_diagnostic(sensor_name):
+                    sensor_type = "diagnostic"
+                else:
+                    return
+
+            # ESPHome publishes placeholder values for a sensor that has not
+            # produced a real reading yet: 0 for an unpopulated channel, and
+            # -273.15 for an uninitialised temperature. Storing those freezes
+            # the channel on a value that is not a measurement, which then
+            # reads as a permanent stall. Ignore them; the channel keeps its
+            # last real value until a genuine one arrives.
+            if sensor_type == "temperature" and val <= -100.0:
                 return
+            if sensor_type in ("pm1", "pm4", "pm10", "pm25", "particle") and val == 0.0:
+                return
+            if sensor_type == "battery" and val == 0.0:
+                return
+                # 'Sensor Fault' binary sensors, which are authoritative
+                # answers to "is this sensor frozen?" and are computed on
+                # the device with knowledge we do not have server-side.
+                # Record them under a 'diagnostic' type; everything else
+                # (mac address, ip, ssid) is dropped as noise.
+                if _is_useful_diagnostic(sensor_name):
+                    sensor_type = "diagnostic"
+                else:
+                    return
             if sensor_type is None:
                 # No recognised metric in the name. Likely a non-numeric sensor
                 # whose float() somehow succeeded, or a numeric sensor whose
@@ -659,12 +745,10 @@ def on_mqtt_message(client, userdata, msg):
                         value = excluded.value,
                         ts    = excluded.ts,
                         last_change_ts = CASE
-                            WHEN ((excluded.value - value) BETWEEN -?*ABS(value) AND +?*ABS(value))
-                              OR (excluded.value = value)
-                            THEN last_change_ts
+                            WHEN ABS(excluded.value - value) <= ? THEN last_change_ts
                             ELSE excluded.ts
                         END
-                """, (device_id, sensor_name, sensor_type, val, now, now, tol, tol))
+                """, (device_id, sensor_name, sensor_type, val, now, now, tol))
             # Roll up to devices for fast dashboard reads (last value wins per device, any sensor).
             if sensor_type == "temperature":
                 cursor.execute(
@@ -723,6 +807,15 @@ def on_mqtt_message(client, userdata, msg):
         log.exception(f"on_mqtt_message failed for topic={topic}: {e}")
     except Exception as e:
         log.exception(f"on_mqtt_message failed for topic={topic}: {e}")
+    finally:
+        # Every exit path must release the connection. Leaked SQLite
+        # connections hold read locks and starve the writer, which is how
+        # 47 open descriptors on one file turns into a wedged database.
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
 
 def start_mqtt():
     client = mqtt.Client(client_id="facility_watchdog_server")
@@ -784,26 +877,31 @@ def _detect_systemic_faults(conn, now, flatline_limit):
     A genuine per-sensor hardware failure fails the second test: ten chips
     dying simultaneously across ten rooms is not a hardware pattern.
     """
+    # NOTE: this function is called with a plain connection (no row_factory),
+    # so rows are tuples - index them positionally, never by name.
     rows = conn.execute("""
-        SELECT r.device_id, r.sensor_type, r.ts
+        SELECT r.device_id, r.sensor_type, r.ts, r.sensor_name
         FROM sensor_readings r
         WHERE r.sensor_type != 'heartbeat'
           AND r.ts IS NOT NULL
-          AND NOT EXISTS (
-              SELECT 1 FROM known_degraded k
-              WHERE k.device_id = r.device_id AND k.sensor_name = r.sensor_name
-          )
     """).fetchall()
+    # Suppression applied in Python, for the same reason as in the device
+    # loop: a correlated subquery on the write connection deadlocks it.
+    _kd = set()
+    for _r in conn.execute("SELECT device_id, sensor_name FROM known_degraded").fetchall():
+        _kd.add((_r[0], _r[1]))
+    rows = [r for r in rows if (r[0], r[3]) not in _kd]
 
     # Group silent sensors by metric.
     by_metric = {}
     for r in rows:
-        last = _parse_ts(r["ts"])
+        device_id, sensor_type, ts = r[0], r[1], r[2]
+        last = _parse_ts(ts)
         if last is None:
             continue
         silent = (now - last).total_seconds()
         if silent > flatline_limit:
-            by_metric.setdefault(r["sensor_type"], []).append((r["device_id"], silent))
+            by_metric.setdefault(sensor_type, []).append((device_id, silent))
 
     clusters = []
     for stype, items in by_metric.items():
@@ -861,7 +959,23 @@ def watchdog_eval_loop():
         offline_limit  = config["watchdog"]["default_offline_timeout_seconds"]
         heartbeat_lim  = config["watchdog"]["default_heartbeat_timeout_seconds"]
         flatline_limit  = int(config["watchdog"].get("sensor_flatline_seconds", 300))
+        # Server-side value-flatline detection. Off by default: it cannot
+        # distinguish a frozen sensor from a stable room, and on this fleet
+        # it generated only false positives. The firmware's own 'Value Stall'
+        # entity is the authoritative signal; see docs/configuration.md.
+        _flatline_enabled = bool(config["watchdog"].get("sensor_flatline_detection_enabled", False))
         nag_interval    = config["telegram"]["nagging_interval_seconds"]
+
+        # Preload the suppressed-sensor names. Doing this as a correlated
+        # NOT EXISTS subquery inside the per-device query opened a second
+        # read cursor on the same connection while the device loop's write
+        # transaction was open, which SQLite reports as "database is locked"
+        # and aborts the loop's own writes. A plain in-memory set avoids it.
+        _kd = get_db()
+        _kd_map = {}
+        for _r in _kd.execute("SELECT device_id, sensor_name FROM known_degraded"):
+            _kd_map.setdefault(_r["device_id"], set()).add(_r["sensor_name"])
+        _kd.close()
 
         for dev in cursor.execute("SELECT * FROM devices").fetchall():
             device_id = dev["device_id"]
@@ -911,16 +1025,65 @@ def watchdog_eval_loop():
                   AND sensor_type != 'heartbeat'
                   AND last_change_ts IS NOT NULL
                   AND (julianday(?) - julianday(last_change_ts)) * 86400.0 > ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM known_degraded k
-                      WHERE k.device_id = sensor_readings.device_id
-                        AND k.sensor_name = sensor_readings.sensor_name
-                  )
             """, (now.isoformat(sep=" "),
                   now.isoformat(sep=" "),
                   device_id,
                   now.isoformat(sep=" "),
                   flatline_limit)).fetchall()
+            # Apply the suppression filter in Python (see the preload note).
+            _suppressed = _kd_map.get(device_id, set())
+            if _suppressed:
+                sensor_fault = [r for r in sensor_fault
+                                if r["sensor_name"] not in _suppressed]
+
+            # The firmware publishes its own 'Value Stall' binary sensor,
+            # computed on the device against its previous reading with a
+            # 30 minute threshold. That verdict is authoritative: it knows
+            # the sensor's history and its own sampling. Where the device
+            # reports a stall, trust it; where it reports no stall, the
+            # server-side flatline heuristic is only guessing, because a
+            # stable room legitimately holds one value for hours.
+            _fw = cursor.execute("""
+                SELECT sensor_name, value FROM sensor_readings
+                WHERE device_id = ? AND sensor_type = 'diagnostic'
+            """, (device_id,)).fetchall()
+            _fw_stalled = False
+            _fw_fault = False
+            for _r in _fw:
+                _n = (_r["sensor_name"] or "").lower()
+                _v = str(_r["value"]).strip().lower()
+                _on = _v in ("on", "true", "1", "yes", "pressed")
+                if "stall" in _n and _on:
+                    _fw_stalled = True
+                elif "fault" in _n and _on:
+                    _fw_fault = True
+            if _fw_stalled or _fw_fault:
+                # Device says it is stalled/faulted - report that, not the
+                # server's guess.
+                _why = ("firmware reports value stall" if _fw_stalled
+                        else "firmware reports sensor fault")
+                sensor_fault = [{
+                    "sensor_name": "device",
+                    "sensor_type": "diagnostic",
+                    "value": 1.0,
+                    "ts": now.isoformat(sep=" "),
+                    "last_change_ts": now.isoformat(sep=" "),
+                    "silent_s": 0.0,
+                    "flat_s": 0.0,
+                    "_fw": _why,
+                }]
+            elif _fw:
+                # Firmware says everything is fine. Drop the server-side
+                # flatline guesses - they are not evidence of a fault.
+                sensor_fault = []
+            elif not _flatline_enabled:
+                # The server-side value-flatline heuristic is a GUESS. A
+                # reading that holds one value for 15 minutes is what a
+                # stable room looks like, and on this fleet it produced 10
+                # false positives against 0 confirmed faults. It stays
+                # available behind a flag for devices that publish their own
+                # stall verdict, but it is off by default.
+                sensor_fault = []
 
             if not fault_type and sensor_fault:
                 # SENSOR_SILENT takes precedence over SUSPECTED_STALL per sensor.
@@ -933,6 +1096,9 @@ def watchdog_eval_loop():
                         f"Sensor {worst['sensor_name']} ({worst['sensor_type']}) "
                         f"stopped publishing {int(worst['silent_s'])}s ago."
                     )
+                elif flat and flat[0].get("_fw"):
+                    fault_type = "SUSPECTED_STALL"
+                    fault_msg = f"Device {device_id}: {flat[0]['_fw']}."
                 else:
                     worst = max(flat, key=lambda r: r["flat_s"])
                     fault_type = "SUSPECTED_STALL"
@@ -956,20 +1122,33 @@ def watchdog_eval_loop():
                     (new_status, device_id),
                 )
 
-            # Resolve any open alerts of the same type if recovery happened
-            if not fault_type:
+            # Resolve alerts that no longer apply. This must be PER ALERT
+            # TYPE, not "resolve everything when the device is healthy": a
+            # device that is OFFLINE also has fault_type == "OFFLINE", so the
+            # old blanket branch never ran for it and its SUSPECTED_STALL
+            # alert stayed open forever.
+            if fault_type is None:
                 cursor.execute(
                     "UPDATE alerts SET resolved = 1 WHERE device_id = ? AND resolved = 0",
                     (device_id,),
                 )
-            elif new_status != prev_status:
-                # When status transitions to a different fault, leave alerts of the
-                # *previous* type alone — operators want to see the history.
-                pass
-
+            else:
+                # This device still has a fault of type `fault_type`. Resolve
+                # the OTHER fault types it is no longer in.
+                cursor.execute(
+                    "UPDATE alerts SET resolved = 1 WHERE device_id = ? "
+                    "AND resolved = 0 AND alert_type != ?",
+                    (device_id, fault_type),
+                )
             # Raise / re-nag alert
             if fault_type:
                 _raise_or_nag(cursor, device_id, fault_type, fault_msg, nag_interval, now)
+
+            # Commit per device. One transaction spanning the whole fleet
+            # holds SQLite's single write lock for the entire pass, which
+            # collides with the MQTT ingest thread and the web handlers on
+            # every cycle. Per-device commits keep each write window short.
+            conn.commit()
 
         # Release the write lock acquired by the device loop before doing the
         # heavier read-heavy passes below. WAL permits one writer; holding
@@ -1712,14 +1891,21 @@ def api_devices():
 
     # Systemic fault rollup for the dashboard banner. Needs its own
     # connection because the main one is closed by this point.
+    systemic = []
+    sysconn = None
     try:
         flatline_limit = int(config.get("watchdog", {}).get("sensor_flatline_seconds", 300))
         sysconn = get_db()
         systemic = _detect_systemic_faults(sysconn, datetime.now(), flatline_limit)
-        sysconn.close()
-    except Exception as e:
+    except Exception:
         log.exception("systemic fault detection failed")
         systemic = []
+    finally:
+        if sysconn is not None:
+            try:
+                sysconn.close()
+            except Exception:
+                pass
 
     with mqtt_health_lock:
         health = dict(mqtt_health)
