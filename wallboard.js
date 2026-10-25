@@ -18,7 +18,18 @@ const ALARM = {
     beepIntervalMs: 4000,
     autoDismissSeconds: 60,
     minFlashCount: 3,
+    // While a fault is still unacknowledged, re-arm the flash/beep every few
+    // minutes so a screen nobody is watching does not go quiet forever
+    // (review finding B7/§5.6). Set to 0 to disable re-flashing.
+    reflashSeconds: 300,
 };
+
+// Alarm run state. The previous implementation re-added the auto-dismiss class
+// (and re-beeped) on every 5s poll, so the flash never showed and the buzzer
+// never stopped. We now track which faults are already on screen and when the
+// current alarm run started, and drive flash/beep off that — not off the poll.
+let lastFaultKeys = new Set();
+let alarmSince = 0;      // ms timestamp when the current (un-dismissed) run began
 
 // Sound is synthesised with the Web Audio API: no asset to ship, works
 // offline, and browsers only permit it after a user gesture on the page.
@@ -94,11 +105,29 @@ function render(faults, mqttOk, meta) {
           + escapeHtml(meta.lastPacket || 'never') + '</div>';
         stopBeep();
         document.title = 'Sensor Watchdog - ALL CLEAR';
+        // Reset alarm run state so the next fault flashes/beeps as "new".
+        lastFaultKeys = new Set();
+        alarmSince = 0;
         return;
     }
 
     const crit = faults.filter(f => f.severity === 'CRITICAL').length;
-    stage.className = 'stage alarming';
+
+    // Decide whether this poll introduces a NEW fault (one not on screen last
+    // poll). A new fault (re-)arms the flash and the beep.
+    const keys = new Set(faults.map(f => f.device_id + '|' + f.alert_type));
+    let isNew = false;
+    keys.forEach(k => { if (!lastFaultKeys.has(k)) isNew = true; });
+    lastFaultKeys = keys;
+
+    const now = Date.now();
+    if (isNew || alarmSince === 0) {
+        alarmSince = now;
+    } else if (ALARM.reflashSeconds > 0
+               && (now - alarmSince) >= ALARM.reflashSeconds * 1000) {
+        // Still unacknowledged after the re-flash interval: arm again.
+        alarmSince = now;
+    }
 
     document.title = '!! ' + faults.length + ' FAULT' + (faults.length === 1 ? '' : 'S')
                    + ' - Sensor Watchdog';
@@ -125,16 +154,19 @@ function render(faults, mqttOk, meta) {
       + (faults.length > 12
           ? '<div class="more">+ ' + (faults.length - 12) + ' more</div>' : '');
 
-    beep(ALARM.minFlashCount);
-    if (!beepTimer) beepTimer = setInterval(() => beep(2), ALARM.beepIntervalMs);
+    // Within the auto-dismiss window → flash + beep; after it → go static and
+    // silent until a new fault (or the re-flash interval) re-arms. Derived from
+    // alarmSince, so a steady 5s poll no longer resets it every tick (B7).
+    const withinWindow = ALARM.autoDismissSeconds <= 0
+        || (now - alarmSince) < ALARM.autoDismissSeconds * 1000;
 
-    // Auto-dismiss: stop the noise, leave the list readable.
-    if (ALARM.autoDismissSeconds > 0) {
-        stage.classList.add('auto-dismissed');
-        setTimeout(() => {
-            stopBeep();
-            stage.classList.remove('auto-dismissed');
-        }, ALARM.autoDismissSeconds * 1000);
+    if (withinWindow) {
+        stage.className = 'stage alarming';          // flashing (not auto-dismissed)
+        if (isNew) beep(ALARM.minFlashCount);        // one-shot on a new fault only
+        if (!beepTimer) beepTimer = setInterval(() => beep(2), ALARM.beepIntervalMs);
+    } else {
+        stage.className = 'stage alarming auto-dismissed';  // static, readable
+        stopBeep();
     }
 }
 

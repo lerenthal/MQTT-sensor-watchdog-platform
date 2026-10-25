@@ -69,7 +69,14 @@ The env file controls secrets that should **never** live in version control:
 | `WATCHDOG_TG_TOKEN` | Telegram bot token | `@BotFather` on Telegram |
 | `WATCHDOG_TG_CHAT_ID` | Telegram target chat | Send a message to your bot, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates` |
 | `WATCHDOG_SECRET_KEY` | Flask session signing | `python -c 'import secrets; print(secrets.token_urlsafe(32))'` |
+| `WATCHDOG_TG_ENABLED` | Turn Telegram on | `true` once a real token/chat_id is set (default is off) |
 | `TZ` | Container timezone | IANA name like `Asia/Jerusalem` |
+
+> **Signing key:** if you leave `web.secret_key` as the `CHANGE_ME` placeholder
+> (and set no `WATCHDOG_SECRET_KEY`), the app generates a strong random key on
+> first boot and writes it back to `config/config.yaml`. Setting
+> `WATCHDOG_SECRET_KEY` here is still preferred — it keeps the secret out of the
+> config file entirely and overrides it.
 
 Each env var **overrides** the matching `config.yaml` value at runtime. See
 [`docs/configuration.md`](configuration.md) for full precedence.

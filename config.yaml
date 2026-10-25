@@ -17,7 +17,10 @@ mqtt:
   reconnect_max_delay_seconds: 30
 
 telegram:
-  enabled: true
+  # Disabled by default so a fresh install with placeholder credentials does
+  # not spin the long-poll loop against a bogus token. Set to true (or
+  # WATCHDOG_TG_ENABLED=true) once a real bot_token/chat_id is configured.
+  enabled: false
   bot_token: "YOUR_TELEGRAM_BOT_TOKEN_HERE"   # Get from @BotFather
   chat_id: "YOUR_TELEGRAM_CHAT_ID_HERE"       # Your personal or group chat ID
   nagging_interval_seconds: 180               # Re-send alert every 3 minutes until acked/snoozed
@@ -45,13 +48,20 @@ watchdog:
   # a device that publishes its own stall verdict but is not yet
   # visible to the watchdog.
   sensor_flatline_detection_enabled: false
+  # OUT_OF_RANGE dwell. A reading must stay outside its target range this long
+  # before it raises/pages, so a value oscillating across a limit does not flap
+  # the alert. Set to 0 for the old immediate behaviour.
+  out_of_range_hysteresis_seconds: 60
 
 web:
   host: "0.0.0.0"
   port: 5050
   # Long random string for Flask session signing. Rotate to invalidate
-  # existing logins.
-  secret_key: "mushroom_facility_secure_key_CHANGE_ME"
+  # existing logins. SECURITY: a committed/weak key lets anyone forge an admin
+  # session. If this is left as the CHANGE_ME placeholder (or shorter than 32
+  # chars), the app generates a strong random key on first boot and writes it
+  # back here. Prefer setting WATCHDOG_SECRET_KEY in .env, which overrides this.
+  secret_key: "CHANGE_ME_generated_on_first_boot"
   dashboard_refresh_seconds: 10               # Poll /api/devices (was meta-refresh, caused flash)
 
 # Web UI authentication. v1 uses a small fixed user table with per-user

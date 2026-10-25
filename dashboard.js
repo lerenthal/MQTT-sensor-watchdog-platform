@@ -20,6 +20,28 @@ function escapeHtml(s) {
     })[c]);
 }
 
+// Server's flatline window (seconds). Updated from /api/devices on each poll so
+// the per-sensor chips flag "silent/frozen" at the SAME threshold the watchdog
+// uses, rather than a hardcoded value (review finding B16).
+let FLATLINE_LIMIT = 300;
+
+// State-changing requests must be POST and carry the CSRF token (finding B9).
+// Render an inline POST form so these work without inline JS handlers.
+function postForm(action, label, cls, confirmMsg) {
+    const onsub = confirmMsg
+        ? ' onsubmit="return confirm(\'' + confirmMsg + '\')"' : '';
+    return '<form method="post" action="' + action + '" style="display:inline;margin:0"' + onsub + '>'
+         + '<input type="hidden" name="_csrf" value="' + (window.CSRF_TOKEN || '') + '">'
+         + '<button type="submit" class="' + cls + '">' + label + '</button></form>';
+}
+function postMenuItem(action, label) {
+    return '<form method="post" action="' + action + '" style="margin:0">'
+         + '<input type="hidden" name="_csrf" value="' + (window.CSRF_TOKEN || '') + '">'
+         + '<button type="submit" class="dropdown-item" '
+         + 'style="width:100%;text-align:left;background:none;border:none;'
+         + 'cursor:pointer;font:inherit;color:inherit">' + label + '</button></form>';
+}
+
 function statusBadge(s) {
     if (s === 'ONLINE')  return '<span class="badge badge-online">ONLINE</span>';
     if (s === 'STALLED') return '<span class="badge badge-stalled">STALLED</span>';
@@ -41,10 +63,10 @@ function sensorCell(d) {
     const lines = sorted.map(s => {
         const v = (typeof s.value === 'number') ? s.value.toFixed(2) : '--';
         let flag = '';
-        if (s.silent_seconds > 300) {
+        if (s.silent_seconds > FLATLINE_LIMIT) {
             flag = '<span class="badge badge-silent">silent '
                  + Math.round(s.silent_seconds / 60) + 'm</span>';
-        } else if (s.flat_seconds > 300) {
+        } else if (s.flat_seconds > FLATLINE_LIMIT) {
             flag = '<span class="badge badge-suspect">frozen '
                  + Math.round(s.flat_seconds / 60) + 'm</span>';
         } else if (s.in_range === false) {
@@ -143,21 +165,29 @@ function renderRow(d) {
           + (d.snooze_until || '').slice(0, 16) + '</span>'
         : '<span class="muted">Active</span>';
     const id = encodeURIComponent(d.device_id);
+    const restartBtn = '<button class="btn btn-sm btn-danger" '
+        + 'onclick="restart(\'' + escapeHtml(d.device_id) + '\')">Restart</button>';
+    // "Reset stale" clears a SUSPECTED_STALL / SENSOR_SILENT alert on a device
+    // whose fault is a known false positive (e.g. a sensor that holds one
+    // value in a steady room). It resolves the alert, rebases the change
+    // clock and clears any snooze.
+    const resetStaleBtn = (d.status === 'DEGRADED')
+        ? postForm('/device/' + id + '/reset_stale', 'Reset', 'btn btn-sm btn-warning',
+                   'Clear the stall alert for ' + d.device_id + '?')
+        : '';
     const actions = d.snooze_until
-        ? '<a href="/unsnooze/' + id + '" class="btn btn-sm btn-success">Unsnooze</a>'
-          + '<button class="btn btn-sm btn-danger" '
-          + 'onclick="restart(\'' + escapeHtml(d.device_id) + '\')">Restart</button>'
+        ? postForm('/unsnooze/' + id, 'Unsnooze', 'btn btn-sm btn-success')
+          + restartBtn + resetStaleBtn
         : '<div class="dropdown">'
           + '<button type="button" class="btn btn-sm btn-warning" '
           + 'onclick="this.parentElement.classList.toggle(\'open\')">Snooze &#9662;</button>'
           + '<div class="dropdown-menu">'
-          + '<a class="dropdown-item" href="/snooze/' + id + '/1">1 Hour</a>'
-          + '<a class="dropdown-item" href="/snooze/' + id + '/8">8 Hours</a>'
-          + '<a class="dropdown-item" href="/snooze/' + id + '/24">24 Hours</a>'
-          + '<a class="dropdown-item" href="/snooze/' + id + '/168">7 Days</a>'
+          + postMenuItem('/snooze/' + id + '/1', '1 Hour')
+          + postMenuItem('/snooze/' + id + '/8', '8 Hours')
+          + postMenuItem('/snooze/' + id + '/24', '24 Hours')
+          + postMenuItem('/snooze/' + id + '/168', '7 Days')
           + '</div></div>'
-          + '<button class="btn btn-sm btn-danger" '
-          + 'onclick="restart(\'' + escapeHtml(d.device_id) + '\')">Restart</button>';
+          + restartBtn + resetStaleBtn;
 
     // FIX 2: an explicit "why is this device not OK" column. Built from the
     // same signals the watchdog used, so it agrees with the status badge.
@@ -306,6 +336,7 @@ async function refresh() {
         if (res.status === 401) { window.location = '/login'; return; }
         const data = await res.json();
         ALL_DEVICES = data.devices || [];
+        if (typeof data.flatline_limit === 'number') FLATLINE_LIMIT = data.flatline_limit;
         const tbody = document.getElementById('devices-tbody');
         if (!ALL_DEVICES.length) {
             tbody.innerHTML = '<tr><td colspan="12" class="muted">'
@@ -330,7 +361,7 @@ async function refresh() {
 window.restart = async function (deviceId) {
     if (!confirm('Restart ' + deviceId + '?')) return;
     const r = await fetch('/api/restart/' + encodeURIComponent(deviceId),
-        { method: 'POST' });
+        { method: 'POST', headers: { 'X-CSRFToken': window.CSRF_TOKEN || '' } });
     const data = await r.json();
     if (!data.ok) alert('Restart failed: ' + (data.error || 'unknown'));
     refresh();
@@ -352,7 +383,7 @@ window.setFontSize = function (px) {
 // now names them, so nothing is invisible until you expand.
 function sensorSummary(d) {
     const list = (d.sensors || [])
-        .filter(s => s.sensor_type !== 'heartbeat')
+        .filter(s => s.sensor_type !== 'heartbeat' && s.sensor_type !== 'diagnostic')
         .slice()
         .sort((a, b) => {
             if (a.sensor_type !== b.sensor_type) return a.sensor_type.localeCompare(b.sensor_type);
@@ -376,8 +407,8 @@ function sensorSummary(d) {
             let cls = 'sv';
             if (s.known_degraded) cls += ' suppressed';
             else if (s.in_range === false) cls += ' bad';
-            else if (s.silent_seconds > 300) cls += ' silent';
-            else if (s.flat_seconds > 300) cls += ' flat';
+            else if (s.silent_seconds > FLATLINE_LIMIT) cls += ' silent';
+            else if (s.flat_seconds > FLATLINE_LIMIT) cls += ' flat';
             return '<span class="' + cls + '" title="' + escapeHtml(s.sensor_name) + '">'
                  + escapeHtml(short) + ' ' + escapeHtml(v) + '</span>';
         });

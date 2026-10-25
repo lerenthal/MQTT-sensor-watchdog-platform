@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS devices (
     fw_version TEXT,
     location TEXT,                            -- denormalised from device_metadata for fast dashboard reads
     role TEXT,                                -- e.g. 'producer','dup' (free text per CSV upload)
-    status TEXT DEFAULT 'ONLINE',            -- 'ONLINE', 'STALLED', 'OFFLINE'
+    status TEXT DEFAULT 'ONLINE',            -- 'ONLINE','OFFLINE','STALLED','DEGRADED' (set by watchdog_eval_loop)
     last_seen TIMESTAMP,
     last_heartbeat_time TIMESTAMP,
     last_heartbeat_value INTEGER,
@@ -63,7 +63,9 @@ CREATE TABLE IF NOT EXISTS csv_uploads (
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id TEXT NOT NULL,
-    alert_type TEXT NOT NULL,                 -- 'OFFLINE', 'STALLED'
+    alert_type TEXT NOT NULL,                 -- OFFLINE, STALLED, SENSOR_SILENT, SUSPECTED_STALL, OUT_OF_RANGE, SYSTEMIC
+                                              -- NOTE: known_degraded, sensor_thresholds and out_of_range are
+                                              -- created by _apply_migrations() in app.py, not here (schema v6/v7).
     message TEXT NOT NULL,
     triggered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_nagged_at TIMESTAMP NULL,

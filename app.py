@@ -39,6 +39,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("sensor_watchdog")
 
+# Process start time, used to tell a genuine systemic fault apart from the
+# "the watchdog was down, so everything looks stale" artefact.
+_PROCESS_START = datetime.now().timestamp()
+
+# Channels this process has actually OBSERVED alive (a packet received since
+# we started). A cluster of channels that were all stale before we came up is
+# our own downtime, not a fleet-wide fault - we cannot claim to have detected
+# something we never watched happen. Keyed by (device_id, sensor_name).
+_OBSERVED_ALIVE = set()
+_OBSERVED_LOCK = threading.Lock()
+
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
@@ -88,6 +99,11 @@ mqtt_health = {
     "last_disconnected_at": None,
     "reconnect_count": 0,
     "broker": config["mqtt"]["broker"],
+    # Alert state, so pages fire on a state TRANSITION rather than on a tick
+    # landing inside a narrow time window (review findings B5, B11).
+    "down_alerted": False,       # broker-unreachable page already sent this outage
+    "last_down_nag_at": None,    # last broker-down reminder
+    "nodata_alerted_at": None,   # last "broker up but silent" page
 }
 mqtt_health_lock = threading.Lock()
 _mqtt_client_holder = {"client": None}
@@ -117,6 +133,17 @@ def _table_exists(conn, table):
     ).fetchone() is not None
 
 def _apply_migrations(conn):
+    # schema_meta must exist before the version stamps below. _apply_migrations
+    # runs BEFORE schema.sql (so CREATE INDEX statements can see migrated
+    # columns), which means on a brand-new DB schema.sql has not yet created
+    # schema_meta — without this a fresh install crashes on first boot
+    # (review finding B20). Idempotent on an existing DB.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+    """)
     # v6 -> v7: operator-acknowledged known-degraded sensors. These are
     # excluded from alerting so a documented, accepted fault does not drown
     # the dashboard in permanent noise.
@@ -167,10 +194,16 @@ def _apply_migrations(conn):
         conn.execute("UPDATE sensor_readings SET last_change_ts = ts WHERE last_change_ts IS NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_flatline ON sensor_readings(last_change_ts)")
         log.info("Migration: added sensor_readings.last_change_ts (v4 -> v5)")
-    if not _column_exists(conn, "audit_logs", "username"):
+    # The _table_exists guards matter on a FRESH DB: _apply_migrations runs
+    # before schema.sql, so these base tables may not exist yet. Without the
+    # guard the ALTER raises "no such table" and the first boot crashes
+    # (review finding B20). On a fresh DB the tables are created by schema.sql
+    # (already carrying these columns) and the second _apply_migrations pass is
+    # a no-op; on an upgrade the tables exist and the ALTER runs.
+    if _table_exists(conn, "audit_logs") and not _column_exists(conn, "audit_logs", "username"):
         conn.execute("ALTER TABLE audit_logs ADD COLUMN username TEXT")
         log.info("Migration: added audit_logs.username")
-    if not _column_exists(conn, "devices", "location"):
+    if _table_exists(conn, "devices") and not _column_exists(conn, "devices", "location"):
         conn.execute("ALTER TABLE devices ADD COLUMN location TEXT")
         conn.execute("ALTER TABLE devices ADD COLUMN role TEXT")
         log.info("Migration: added devices.location, devices.role")
@@ -234,9 +267,24 @@ def init_db():
     conn.close()
     log.info("Database initialized successfully.")
 
-def audit(action, device_id=None, details="", username=None):
+def audit(action, device_id=None, details="", username=None, cursor=None):
     if username is None:
         username = session.get("username", "anonymous")
+    # In-transaction variant: when a caller is already inside an open write
+    # transaction (the watchdog loop), it passes its own cursor so the audit
+    # row is written on the SAME connection. Opening a second write connection
+    # mid-transaction contends for SQLite's single write lock (review finding
+    # B10 — the §7.3 "two writers" class). The caller owns the commit.
+    if cursor is not None:
+        try:
+            cursor.execute(
+                "INSERT INTO audit_logs (device_id, username, action, details) "
+                "VALUES (?, ?, ?, ?)",
+                (device_id, username, action, details),
+            )
+        except Exception:
+            log.exception("audit (in-transaction) write failed for action=%s", action)
+        return
     conn = None
     try:
         conn = get_db()
@@ -284,6 +332,33 @@ def _ensure_password_hashes():
         with open(CONFIG_FILE, "w") as f:
             yaml.safe_dump(config, f, sort_keys=False, default_flow_style=False)
         log.info("Upgraded plaintext passwords to salted sha256 hashes in config.yaml")
+
+def _ensure_secret_key():
+    """Never serve with the committed placeholder Flask secret.
+
+    A predictable/committed signing key lets anyone forge a session cookie
+    (e.g. role=admin) and bypass the whole auth table (review finding B4). On
+    first boot — when the key is empty, missing, or still a CHANGE_ME
+    placeholder — generate a strong random key and persist it to the live
+    config so it is stable across restarts (and env WATCHDOG_SECRET_KEY still
+    overrides everything).
+    """
+    web = config.setdefault("web", {})
+    key = str(web.get("secret_key") or "")
+    weak = (not key) or ("change_me" in key.lower()) or (len(key) < 32)
+    if not weak:
+        return
+    web["secret_key"] = secrets.token_hex(32)
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            yaml.safe_dump(config, f, sort_keys=False, default_flow_style=False)
+        log.warning("Generated a new random web.secret_key (placeholder/weak key "
+                    "replaced). Existing browser sessions are invalidated.")
+    except OSError:
+        # Could not persist (read-only config mount). Still use the strong
+        # in-memory key for this run rather than the placeholder.
+        log.warning("web.secret_key was weak; using a generated key for this "
+                    "run but could not persist it to %s", CONFIG_FILE)
 
 def _check_credentials(username, password):
     users = config.get("auth", {}).get("users", {})
@@ -515,6 +590,9 @@ def on_mqtt_connect(client, userdata, flags, rc, properties=None):
             mqtt_health["last_connected_at"] = datetime.now()
             if was_disconnected and mqtt_health["last_disconnected_at"]:
                 mqtt_health["reconnect_count"] += 1
+            # Clear the broker-down alert latch so the next outage pages again.
+            mqtt_health["down_alerted"] = False
+            mqtt_health["last_down_nag_at"] = None
         client.subscribe(config["mqtt"]["topic_subscription"], qos=0)
         log.info(f"MQTT connected & subscribed to {config['mqtt']['topic_subscription']}")
         if was_disconnected:
@@ -599,6 +677,7 @@ def on_mqtt_message(client, userdata, msg):
     #   scd30_1, sht41-1, ens160-1, ...   (some are pure IDs without an encoded type)
     sensor_name = ""
     metric_path = ""
+    is_binary = False
 
     if sub and sub[0] == "status":
         metric_path = "status"
@@ -616,6 +695,21 @@ def on_mqtt_message(client, userdata, msg):
         # vs '/config' vs deeper paths.
         sub = sub[2:]
         metric_path = "/".join(sub) if sub else ""
+
+    elif sub and sub[0] == "binary_sensor" and len(sub) >= 2:
+        # ESPHome publishes binary sensors (the firmware's own 'Value Stall' /
+        # 'Sensor Fault' verdicts) to binary_sensor/<name>/state with an
+        # ON/OFF text payload — a DIFFERENT topic shape and payload type than
+        # numeric sensors. Previously this branch fell through to the final
+        # 'return' and the firmware's authoritative stall verdict was silently
+        # discarded (review finding B6). Route it like a sensor but flag it so
+        # the reading handler decodes the text payload instead of float().
+        # NOTE: confirm the exact slugified topic segment against one real
+        # retained message before trusting it in production.
+        sensor_name = sub[1]
+        sub = sub[2:]
+        metric_path = "/".join(sub) if sub else ""
+        is_binary = True
 
     else:
         # Unknown substructure under env_sensor; skip silently to avoid log spam.
@@ -660,6 +754,36 @@ def on_mqtt_message(client, userdata, msg):
                     )
             except (ValueError, TypeError):
                 pass
+        elif is_binary:
+            # Firmware binary sensor ('Value Stall' / 'Sensor Fault'). Payload
+            # is ON/OFF text, not a float, so decode it explicitly and store as
+            # a 'diagnostic' reading (1.0 = active, 0.0 = clear). Only the
+            # firmware's own fault verdicts are kept; every other binary sensor
+            # is dropped as noise. Review finding B6.
+            if not _is_useful_diagnostic(sensor_name):
+                return
+            v = payload_str.strip().lower()
+            if v in ("on", "true", "1", "yes", "pressed"):
+                val = 1.0
+            elif v in ("off", "false", "0", "no", "released"):
+                val = 0.0
+            else:
+                return
+            sensor_type = "diagnostic"
+            cursor.execute("""
+                INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
+                    value = excluded.value,
+                    ts    = excluded.ts,
+                    last_change_ts = CASE
+                        WHEN excluded.value = value THEN last_change_ts
+                        ELSE excluded.ts
+                    END
+            """, (device_id, sensor_name, sensor_type, val, now, now))
+            conn.commit()
+            conn.close()
+            return
         else:
             # Sensor reading. Match metric type against sensor_name (the ESPHome
             # convention here is to encode the type in the name, e.g.
@@ -678,13 +802,11 @@ def on_mqtt_message(client, userdata, msg):
             # metric type, and sensor_type must be bound before it is used.
             sensor_type = _classify_sensor(sensor_name)
             if sensor_type is None:
-                # Not an environmental metric. Some of these are worth
-                # keeping - the firmware publishes its own 'Value Stall' and
-                # 'Sensor Fault' binary sensors, which are authoritative
-                # answers to "is this sensor frozen?" and are computed on
-                # the device with knowledge we do not have server-side.
-                # Record them under a 'diagnostic' type; everything else
-                # (mac address, ip, ssid) is dropped as noise.
+                # Not an environmental metric. A useful diagnostic published as
+                # a plain (numeric) sensor is kept under the 'diagnostic' type;
+                # everything else (mac address, ip, ssid) is dropped as noise.
+                # The firmware's ON/OFF stall/fault binary sensors are handled
+                # in the is_binary branch above, not here.
                 if _is_useful_diagnostic(sensor_name):
                     sensor_type = "diagnostic"
                 else:
@@ -702,29 +824,19 @@ def on_mqtt_message(client, userdata, msg):
                 return
             if sensor_type == "battery" and val == 0.0:
                 return
-                # 'Sensor Fault' binary sensors, which are authoritative
-                # answers to "is this sensor frozen?" and are computed on
-                # the device with knowledge we do not have server-side.
-                # Record them under a 'diagnostic' type; everything else
-                # (mac address, ip, ssid) is dropped as noise.
-                if _is_useful_diagnostic(sensor_name):
-                    sensor_type = "diagnostic"
-                else:
-                    return
-            if sensor_type is None:
-                # No recognised metric in the name. Likely a non-numeric sensor
-                # whose float() somehow succeeded, or a numeric sensor whose
-                # name doesn't encode a type. Drop silently.
-                conn.close()
-                return
+            # Record that we saw this channel alive. Used to distinguish a
+            # genuine simultaneous failure (we watched it happen) from the
+            # "watchdog was down, everything looks stale" artefact.
+            with _OBSERVED_LOCK:
+                _OBSERVED_ALIVE.add((device_id, sensor_name))
+
             # Per-sensor row. UPSERT: update value+ts on every packet, but only
-            # update last_change_ts when the value differs by more than
-            # watchdog.sensor_flatline_min_change_pct (default 0.1%). This lets
-            # us detect a value-flatline (sensor stuck) without needing a
-            # historical readings table.
-            # Heartbeat counters are exempt from the percentage tolerance: a
-            # counter sitting at 16000 that ticks to 16001 is a 0.006% delta,
-            # which the tolerance would wrongly classify as "unchanged".
+            # advance last_change_ts when the value moved by more than the
+            # absolute tolerance watchdog.sensor_flatline_min_change (default
+            # 0.0 units, i.e. any movement counts). This lets us detect a
+            # value-flatline (sensor stuck) without a historical readings table.
+            # Heartbeat counters are exempt from the tolerance: they are exact
+            # integer counters and any increment is a real tick.
             if sensor_type == "heartbeat":
                 cursor.execute("""
                     INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
@@ -876,13 +988,36 @@ def _detect_systemic_faults(conn, now, flatline_limit):
 
     A genuine per-sensor hardware failure fails the second test: ten chips
     dying simultaneously across ten rooms is not a hardware pattern.
+
+    RESTART ARTEFACT (important): if the watchdog itself was not running,
+    no packets were recorded for the whole downtime, so EVERY channel ages
+    past the window at the same moment and the detector sees a fleet-wide
+    "systemic fault" that is really just the watchdog having been down.
+    That is a false alarm and it pages people.
+
+    The discriminator is whether we were WATCHING. A channel that last
+    published before this process started was already stale when we came
+    up - we were not observing it go stale, so we cannot claim to have
+    detected a fault in it. Those channels are excluded from clustering.
+    A channel that was alive when we started and has since gone quiet IS a
+    genuine detection, however soon after the restart that happened.
     """
+    # A channel that last published BEFORE this process started was already
+    # stale when we came up - we were not watching when it went stale, so we
+    # cannot claim to have detected a fault in it. Such channels are excluded
+    # from clustering: otherwise every restart manufactures a fleet-wide
+    # "systemic fault" that is really just our own downtime.
+    #
+    # Conversely, a channel that WAS alive when we started and has since
+    # gone quiet is a genuine detection - we were watching it.
+    _started_at = datetime.fromtimestamp(_PROCESS_START)
+
     # NOTE: this function is called with a plain connection (no row_factory),
     # so rows are tuples - index them positionally, never by name.
     rows = conn.execute("""
         SELECT r.device_id, r.sensor_type, r.ts, r.sensor_name
         FROM sensor_readings r
-        WHERE r.sensor_type != 'heartbeat'
+        WHERE r.sensor_type NOT IN ('heartbeat', 'diagnostic')
           AND r.ts IS NOT NULL
     """).fetchall()
     # Suppression applied in Python, for the same reason as in the device
@@ -894,14 +1029,17 @@ def _detect_systemic_faults(conn, now, flatline_limit):
 
     # Group silent sensors by metric.
     by_metric = {}
+    _group_names = {}
     for r in rows:
-        device_id, sensor_type, ts = r[0], r[1], r[2]
+        device_id, sensor_type, ts, sensor_name = r[0], r[1], r[2], r[3]
         last = _parse_ts(ts)
         if last is None:
             continue
         silent = (now - last).total_seconds()
+        silent = (now - last).total_seconds()
         if silent > flatline_limit:
-            by_metric.setdefault(sensor_type, []).append((device_id, silent))
+            by_metric.setdefault(sensor_type, []).append((device_id, silent, last))
+            _group_names.setdefault(sensor_type, []).append((device_id, sensor_name))
 
     clusters = []
     for stype, items in by_metric.items():
@@ -909,10 +1047,32 @@ def _detect_systemic_faults(conn, now, flatline_limit):
         # metric (e.g. scd30_1 carries both 'scd30-1_co2' and 'scd30_co2').
         # Count devices, not channels, or one device inflates the cluster.
         per_device = {}
-        for dev, silent in items:
-            per_device[dev] = max(per_device.get(dev, 0), silent)
-        items = [(d, s) for d, s in per_device.items()]
+        for dev, silent, _last in items:
+            prev = per_device.get(dev)
+            if prev is None or silent > prev[0]:
+                per_device[dev] = (silent, _last)
+        items = [(d, s) for d, (s, _l) in per_device.items()]
         if len(items) < 3:
+            continue
+        # RESTART ARTEFACT GUARD. If NONE of the channels in this group was
+        # observed alive by THIS process, the whole group went stale while
+        # the watchdog was down. That is our own downtime, not a fleet-wide
+        # sensor fault, and paging it would be a false alarm.
+        # If at least one channel in the group was seen alive since we
+        # started, the group was observed going stale - a genuine detection.
+        # A channel counts as observed if we received a packet from it since
+        # we started, OR if its silence began within one flatline window of
+        # our start (i.e. we could plausibly have watched it go quiet).
+        with _OBSERVED_LOCK:
+            _observed = set(_OBSERVED_ALIVE)
+        _watch_limit = _started_at + timedelta(seconds=flatline_limit)
+        _any_observed = any(
+            (dev, name) in _observed
+            or per_device[dev][1] >= _watch_limit
+            for dev, name in _group_names.get(stype, ())
+            if dev in per_device
+        )
+        if not _any_observed:
             continue
         # Cluster by rounding the silence to the nearest 5 minutes; a shared
         # cause produces a tight cluster, independent failures spread out.
@@ -964,6 +1124,10 @@ def watchdog_eval_loop():
         # it generated only false positives. The firmware's own 'Value Stall'
         # entity is the authoritative signal; see docs/configuration.md.
         _flatline_enabled = bool(config["watchdog"].get("sensor_flatline_detection_enabled", False))
+        # OUT_OF_RANGE dwell: a reading must stay out of range this long before
+        # it pages, so a value oscillating across a limit does not flap the
+        # alert (review finding B8). 0 restores the old immediate behaviour.
+        oor_hysteresis = int(config["watchdog"].get("out_of_range_hysteresis_seconds", 60))
         nag_interval    = config["telegram"]["nagging_interval_seconds"]
 
         # Preload the suppressed-sensor names. Doing this as a correlated
@@ -976,6 +1140,17 @@ def watchdog_eval_loop():
         for _r in _kd.execute("SELECT device_id, sensor_name FROM known_degraded"):
             _kd_map.setdefault(_r["device_id"], set()).add(_r["sensor_name"])
         _kd.close()
+
+        # Detect systemic clusters UP FRONT (own connection), so a (device,
+        # metric) pair caught in a cluster can be suppressed at the per-device
+        # level before it raises its own SENSOR_SILENT alert and pages. The
+        # cluster is reported as one alert after the loop (review finding B2).
+        _sc = get_db()
+        systemic = _detect_systemic_faults(_sc, now, flatline_limit)
+        _sc.close()
+        clustered_pairs = {
+            (dev, c["sensor_type"]) for c in systemic for dev in c["devices"]
+        }
 
         for dev in cursor.execute("SELECT * FROM devices").fetchall():
             device_id = dev["device_id"]
@@ -1022,7 +1197,7 @@ def watchdog_eval_loop():
                        (julianday(?) - julianday(last_change_ts)) * 86400.0 AS flat_s
                 FROM sensor_readings
                 WHERE device_id = ?
-                  AND sensor_type != 'heartbeat'
+                  AND sensor_type NOT IN ('heartbeat', 'diagnostic')
                   AND last_change_ts IS NOT NULL
                   AND (julianday(?) - julianday(last_change_ts)) * 86400.0 > ?
             """, (now.isoformat(sep=" "),
@@ -1051,18 +1226,40 @@ def watchdog_eval_loop():
             _fw_fault = False
             for _r in _fw:
                 _n = (_r["sensor_name"] or "").lower()
-                _v = str(_r["value"]).strip().lower()
-                _on = _v in ("on", "true", "1", "yes", "pressed")
+                # Diagnostics are stored numerically (1.0 = active, 0.0 = clear)
+                # by the binary_sensor ingest; tolerate a legacy text value too.
+                try:
+                    _on = float(_r["value"]) >= 0.5
+                except (TypeError, ValueError):
+                    _on = str(_r["value"]).strip().lower() in (
+                        "on", "true", "1", "yes", "pressed")
                 if "stall" in _n and _on:
                     _fw_stalled = True
                 elif "fault" in _n and _on:
                     _fw_fault = True
+            # Split the candidates into two fundamentally different things:
+            #   SILENT = no packets at all for > window. This is a FACT, not a
+            #            guess, and must always be reported (review finding B1 —
+            #            previously it was nuked along with the flatline guess).
+            #   FLAT   = packets ARE arriving but the value has not moved. This
+            #            is a GUESS: a stable room legitimately holds one value.
+            silent = [r for r in sensor_fault if (r["silent_s"] or 0) > flatline_limit]
+            flat   = [r for r in sensor_fault if (r["silent_s"] or 0) <= flatline_limit]
+
+            # Suppress SILENT channels that are part of a systemic cluster; the
+            # cluster alert raised after the loop carries that information, and
+            # paging each device individually is the storm this avoids (B2).
+            silent = [r for r in silent
+                      if (device_id, r["sensor_type"]) not in clustered_pairs]
+
+            # The FLAT guess is only trusted when the device confirms it with
+            # its own 'Value Stall'/'Sensor Fault' verdict, or when the operator
+            # has explicitly enabled server-side flatline detection. Otherwise
+            # drop it — but SILENT facts above are kept regardless.
             if _fw_stalled or _fw_fault:
-                # Device says it is stalled/faulted - report that, not the
-                # server's guess.
                 _why = ("firmware reports value stall" if _fw_stalled
                         else "firmware reports sensor fault")
-                sensor_fault = [{
+                flat = [{
                     "sensor_name": "device",
                     "sensor_type": "diagnostic",
                     "value": 1.0,
@@ -1072,23 +1269,13 @@ def watchdog_eval_loop():
                     "flat_s": 0.0,
                     "_fw": _why,
                 }]
-            elif _fw:
-                # Firmware says everything is fine. Drop the server-side
-                # flatline guesses - they are not evidence of a fault.
-                sensor_fault = []
             elif not _flatline_enabled:
-                # The server-side value-flatline heuristic is a GUESS. A
-                # reading that holds one value for 15 minutes is what a
-                # stable room looks like, and on this fleet it produced 10
-                # false positives against 0 confirmed faults. It stays
-                # available behind a flag for devices that publish their own
-                # stall verdict, but it is off by default.
-                sensor_fault = []
+                flat = []
+
+            sensor_fault = silent + flat
 
             if not fault_type and sensor_fault:
                 # SENSOR_SILENT takes precedence over SUSPECTED_STALL per sensor.
-                silent = [r for r in sensor_fault if (r["silent_s"] or 0) > flatline_limit]
-                flat   = [r for r in sensor_fault if (r["silent_s"] or 0) <= flatline_limit]
                 if silent:
                     worst = max(silent, key=lambda r: r["silent_s"])
                     fault_type = "SENSOR_SILENT"
@@ -1177,19 +1364,24 @@ def watchdog_eval_loop():
               AND (julianday(?) - julianday(r.ts)) * 86400.0 <= ?
         """, (now.isoformat(sep=" "), max(flatline_limit, 120))).fetchall()
         # Resolve current breach state in the same read-only pass so the loop
-        # below does no reads at all - only writes.
+        # below does no reads at all - only writes. entered_at drives the dwell.
         range_state = {
-            (x["device_id"], x["sensor_name"]): x["resolved"]
-            for x in _rc.execute("SELECT device_id, sensor_name, resolved FROM out_of_range")
+            (x["device_id"], x["sensor_name"]): (x["resolved"], x["entered_at"])
+            for x in _rc.execute(
+                "SELECT device_id, sensor_name, resolved, entered_at FROM out_of_range")
         }
         _rc.close()
 
         for rf in range_faults:
             dev, name, lo, hi, sev, val, ts = rf
             breach = (lo is not None and val < lo) or (val > hi)
-            was_open = range_state.get((dev, name), 1) == 0
+            prev = range_state.get((dev, name))
+            open_now = prev is not None and prev[0] == 0
 
-            if breach and not was_open:
+            if breach and not open_now:
+                # First cycle out of range: start the dwell clock. Do NOT page
+                # yet — the value must persist out of range for oor_hysteresis
+                # seconds before it alerts (review finding B8).
                 side = ("below %.1f" % lo) if (lo is not None and val < lo) else ("above %.1f" % hi)
                 msg = "%s is %.2f (%s, limit %.1f-%.1f)" % (
                     name, val, side, lo if lo is not None else -9999, hi)
@@ -1201,16 +1393,24 @@ def watchdog_eval_loop():
                         message=excluded.message, resolved=0, resolved_at=NULL,
                         entered_at=CURRENT_TIMESTAMP
                 """, (dev, name, val, sev, msg))
-                _raise_or_nag(cursor, dev, "OUT_OF_RANGE", msg, nag_interval, now)
-                log.warning("OUT_OF_RANGE %s: %s", dev, msg)
-            elif breach and was_open:
-                # Still out of range - refresh value/message, do not re-alert.
+                if oor_hysteresis <= 0:
+                    _raise_or_nag(cursor, dev, "OUT_OF_RANGE", msg, nag_interval, now)
+                    log.warning("OUT_OF_RANGE %s: %s", dev, msg)
+            elif breach and open_now:
+                # Still out of range - refresh value/message. Page only once the
+                # dwell has elapsed; _raise_or_nag dedups so re-calling is safe.
+                entered = _parse_ts(prev[1])
+                dwell_ok = entered is None or (now - entered).total_seconds() >= oor_hysteresis
+                side = ("below %.1f" % lo) if (lo is not None and val < lo) else ("above %.1f" % hi)
+                msg = "%s is %.2f (%s, limit %.1f-%.1f)" % (
+                    name, val, side, lo if lo is not None else -9999, hi)
                 conn.execute(
                     "UPDATE out_of_range SET value=?, message=? WHERE device_id=? AND sensor_name=?",
-                    (val, "%s is %.2f (limit %.1f-%.1f)" % (
-                        name, val, lo if lo is not None else -9999, hi), dev, name),
+                    (val, msg, dev, name),
                 )
-            elif not breach and was_open:
+                if dwell_ok:
+                    _raise_or_nag(cursor, dev, "OUT_OF_RANGE", msg, nag_interval, now)
+            elif not breach and open_now:
                 conn.execute(
                     "UPDATE out_of_range SET resolved=1, resolved_at=CURRENT_TIMESTAMP "
                     "WHERE device_id=? AND sensor_name=?",
@@ -1222,36 +1422,55 @@ def watchdog_eval_loop():
                     (dev, "%" + name + "%"),
                 )
                 audit("OUT_OF_RANGE_CLEARED", device_id=dev,
-                      details="%s back in range" % name, username="watchdog")
+                      details="%s back in range" % name, username="watchdog", cursor=cursor)
                 log.info("OUT_OF_RANGE cleared: %s %s", dev, name)
 
         # Systemic faults: many devices losing the same metric in the same
         # window points at the broker, network or an ACL change rather than at
-        # N independent sensors. Suppress the per-device SENSOR_SILENT noise
-        # for devices caught in a cluster; the cluster is reported instead.
-        # Own connection again: _detect_systemic_faults scans every reading
-        # row, and running that on `conn` while its device-loop transaction
-        # is open blocks every other writer for the duration.
-        _sc = get_db()
-        systemic = _detect_systemic_faults(_sc, now, flatline_limit)
-        _sc.close()
-        if systemic:
-            summary = "; ".join(
-                "%s on %d devices" % (c["sensor_type"], c["count"]) for c in systemic
+        # N independent sensors. The clusters were detected up front (so the
+        # per-device loop already suppressed the clustered SENSOR_SILENT noise);
+        # here we raise ONE persistent, nagging alert per cluster so it is
+        # actually paged to Telegram and shown on every board, and resolve
+        # clusters that have cleared (review finding B2). Previously this path
+        # only logged + audited and paged nothing.
+        SYSTEMIC_PREFIX = "__systemic__:"
+        already_open = {
+            r["device_id"] for r in cursor.execute(
+                "SELECT device_id FROM alerts "
+                "WHERE alert_type = 'SYSTEMIC' AND resolved = 0"
+            ).fetchall()
+        }
+        current_ids = set()
+        for c in systemic:
+            syn = SYSTEMIC_PREFIX + c["sensor_type"]
+            current_ids.add(syn)
+            msg = "%s silent on %d devices (%s)" % (
+                c["sensor_type"], c["count"], ", ".join(c["devices"]))
+            # Also resolve any lingering per-device SENSOR_SILENT rows for the
+            # clustered devices, in case one slipped through before the cluster
+            # formed.
+            for dev in c["devices"]:
+                cursor.execute(
+                    "UPDATE alerts SET resolved = 1 "
+                    "WHERE device_id = ? AND alert_type = 'SENSOR_SILENT' "
+                    "AND resolved = 0 AND message LIKE ?",
+                    (dev, f"%{c['sensor_type']}%"),
+                )
+            _raise_or_nag(cursor, syn, "SYSTEMIC", msg, nag_interval, now)
+            if syn not in already_open:
+                # New cluster — audit once on the transition, not every cycle.
+                log.warning("Systemic fault detected: %s", msg)
+                audit("SYSTEMIC_FAULT", details=msg, username="watchdog", cursor=cursor)
+        # Resolve clusters that are no longer present.
+        for syn in already_open - current_ids:
+            cursor.execute(
+                "UPDATE alerts SET resolved = 1 WHERE device_id = ? "
+                "AND alert_type = 'SYSTEMIC' AND resolved = 0",
+                (syn,),
             )
-            log.warning("Systemic fault detected: %s", summary)
-            audit("SYSTEMIC_FAULT", details=summary, username="watchdog")
-            clustered = {d for c in systemic for d in c["devices"]}
-            # Resolve the individual per-device alerts for this round; the
-            # cluster alert below carries the actionable information.
-            for c in systemic:
-                for dev in c["devices"]:
-                    cursor.execute(
-                        "UPDATE alerts SET resolved = 1 "
-                        "WHERE device_id = ? AND alert_type = 'SENSOR_SILENT' "
-                        "AND resolved = 0 AND message LIKE ?",
-                        (dev, f"%{c['sensor_type']}%"),
-                    )
+            audit("SYSTEMIC_CLEARED", details=syn.split(":", 1)[-1],
+                  username="watchdog", cursor=cursor)
+            log.info("Systemic fault cleared: %s", syn)
 
         conn.commit()
         conn.close()
@@ -1262,11 +1481,15 @@ def watchdog_eval_loop():
 # Telegram polling
 # -----------------------------------------------------------------------------
 def telegram_polling_thread():
-    if not telegram_engine.enabled:
-        return
+    # Loop forever rather than returning when Telegram is disabled, so that
+    # enabling it at runtime (via /admin/config, which rebuilds the engine)
+    # resumes polling without a process restart (review finding B12).
     offset = 0
-    timeout = config["telegram"].get("poll_timeout_seconds", 25)
     while True:
+        if not telegram_engine.enabled:
+            time.sleep(10)
+            continue
+        timeout = config["telegram"].get("poll_timeout_seconds", 25)
         try:
             res = telegram_engine.session.get(
                 f"{telegram_engine.api_url}/getUpdates?offset={offset}&timeout={timeout}",
@@ -1283,39 +1506,45 @@ def telegram_polling_thread():
                 parts = (cb.get("data") or "").split(":")
                 chat = cb.get("from", {}).get("username") or "telegram"
                 cb_id = cb["id"]
+                # try/finally so the connection is released on every path,
+                # including exceptions — a leak here starves the writer, which
+                # is the §7.3 "47 open descriptors" failure (review finding B14).
                 conn = get_db()
-                cursor = conn.cursor()
-
-                if parts[0] == "ack" and len(parts) == 2:
-                    dev_id = parts[1]
-                    cursor.execute("UPDATE alerts SET acknowledged = 1 WHERE device_id = ? AND resolved = 0", (dev_id,))
-                    cursor.execute(
-                        "INSERT INTO audit_logs (device_id, username, action, details) "
-                        "VALUES (?, ?, 'ACK', 'Acknowledged via Telegram')",
-                        (dev_id, chat),
-                    )
-                    conn.commit(); conn.close()
-                    telegram_engine.answer_callback(cb_id, f"Alert for {dev_id} acknowledged.")
-                elif parts[0] == "snooze" and len(parts) == 3:
+                try:
+                    cursor = conn.cursor()
+                    if parts[0] == "ack" and len(parts) == 2:
+                        dev_id = parts[1]
+                        cursor.execute("UPDATE alerts SET acknowledged = 1 WHERE device_id = ? AND resolved = 0", (dev_id,))
+                        cursor.execute(
+                            "INSERT INTO audit_logs (device_id, username, action, details) "
+                            "VALUES (?, ?, 'ACK', 'Acknowledged via Telegram')",
+                            (dev_id, chat),
+                        )
+                        conn.commit()
+                        telegram_engine.answer_callback(cb_id, f"Alert for {dev_id} acknowledged.")
+                    elif parts[0] == "snooze" and len(parts) == 3:
+                        try:
+                            hours = int(parts[1]); dev_id = parts[2]
+                        except ValueError:
+                            telegram_engine.answer_callback(cb_id, "Invalid snooze payload.")
+                            continue
+                        snooze_until = datetime.now() + timedelta(hours=hours)
+                        cursor.execute("UPDATE devices SET snooze_until = ? WHERE device_id = ?", (snooze_until, dev_id))
+                        cursor.execute("UPDATE alerts SET resolved = 1 WHERE device_id = ? AND resolved = 0", (dev_id,))
+                        cursor.execute(
+                            "INSERT INTO audit_logs (device_id, username, action, details) "
+                            "VALUES (?, ?, 'SNOOZE', ?)",
+                            (dev_id, chat, f"Snoozed for {hours}h via Telegram"),
+                        )
+                        conn.commit()
+                        telegram_engine.answer_callback(cb_id, f"{dev_id} snoozed for {hours} hours.")
+                    else:
+                        telegram_engine.answer_callback(cb_id, "Unknown action.")
+                finally:
                     try:
-                        hours = int(parts[1]); dev_id = parts[2]
-                    except ValueError:
                         conn.close()
-                        telegram_engine.answer_callback(cb_id, "Invalid snooze payload.")
-                        continue
-                    snooze_until = datetime.now() + timedelta(hours=hours)
-                    cursor.execute("UPDATE devices SET snooze_until = ? WHERE device_id = ?", (snooze_until, dev_id))
-                    cursor.execute("UPDATE alerts SET resolved = 1 WHERE device_id = ? AND resolved = 0", (dev_id,))
-                    cursor.execute(
-                        "INSERT INTO audit_logs (device_id, username, action, details) "
-                        "VALUES (?, ?, 'SNOOZE', ?)",
-                        (dev_id, chat, f"Snoozed for {hours}h via Telegram"),
-                    )
-                    conn.commit(); conn.close()
-                    telegram_engine.answer_callback(cb_id, f"{dev_id} snoozed for {hours} hours.")
-                else:
-                    conn.close()
-                    telegram_engine.answer_callback(cb_id, "Unknown action.")
+                    except Exception:
+                        pass
         except Exception:
             log.exception("telegram polling loop crashed; sleeping 5s")
             time.sleep(5)
@@ -1326,6 +1555,41 @@ def telegram_polling_thread():
 app = Flask(__name__)
 app.secret_key = config["web"]["secret_key"]
 app.permanent_session_lifetime = timedelta(hours=12)
+# Harden the session cookie. Over plain HTTP (no TLS yet, §5.8) Secure can't be
+# forced, but HttpOnly + SameSite=Lax blunt the common theft/CSRF vectors.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
+
+# -----------------------------------------------------------------------------
+# CSRF protection (review finding B9)
+# -----------------------------------------------------------------------------
+# All state-changing requests go through POST and must carry a per-session
+# token, supplied either as a hidden `_csrf` form field or an `X-CSRFToken`
+# header (for fetch() calls). GET/HEAD/OPTIONS are never state-changing here.
+def _csrf_token():
+    tok = session.get("_csrf")
+    if not tok:
+        tok = secrets.token_hex(16)
+        session["_csrf"] = tok
+    return tok
+
+def _csrf_input():
+    return f'<input type="hidden" name="_csrf" value="{_csrf_token()}">'
+
+@app.before_request
+def _csrf_protect():
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    # /login is the pre-auth credential POST; there is no session yet to bind a
+    # token to, and it is not a cross-site state change on an existing session.
+    if request.endpoint == "login":
+        return
+    expected = session.get("_csrf")
+    sent = request.form.get("_csrf") or request.headers.get("X-CSRFToken", "")
+    if not expected or not sent or not secrets.compare_digest(expected, sent):
+        abort(400)
 
 BASE_CSS = """
 :root {
@@ -1604,6 +1868,7 @@ def _render_layout(title, body, current_tab=None, wide=False):
   <div style="display:flex;gap:.5rem;align-items:center;">{user_chip}</div>
 </div>
 <div class="container{" container-wide" if wide else ""}">{body}</div>
+<script>window.CSRF_TOKEN = "{_csrf_token()}";</script>
 <script>
 (function(){{
   var t = localStorage.getItem('watchdog-theme') || 'light';
@@ -1719,7 +1984,7 @@ def index():
     </table>
   </div>
 </div>
-<script>window.REFRESH_SECONDS = {refresh};</script>
+<script>window.REFRESH_SECONDS = {refresh}; window.CSRF_TOKEN = "{_csrf_token()}";</script>
 <script>{DASHBOARD_JS}</script>
 """
     return _render_layout("Dashboard", body, current_tab="devices", wide=True)
@@ -1845,8 +2110,8 @@ def api_devices():
         # operator sees exactly what the watchdog saw.
         healthy, suspect, silent = [], [], []
         for x in s:
-            if x["sensor_type"] == "heartbeat":
-                continue  # a health counter, not an environmental reading
+            if x["sensor_type"] in ("heartbeat", "diagnostic"):
+                continue  # health counter / firmware verdict, not a reading
             if x["silent_seconds"] is not None and x["silent_seconds"] > flatline_limit:
                 silent.append(x)
             elif x["flat_seconds"] is not None and x["flat_seconds"] > flatline_limit:
@@ -1909,7 +2174,11 @@ def api_devices():
 
     with mqtt_health_lock:
         health = dict(mqtt_health)
-    return jsonify({"devices": devices, "mqtt": health, "systemic": systemic})
+    # Expose the server's flatline window so the dashboard's per-sensor chips
+    # flag "silent/frozen" at the same threshold the watchdog uses, instead of
+    # a hardcoded 300s that disagreed with the configured value (finding B16).
+    return jsonify({"devices": devices, "mqtt": health, "systemic": systemic,
+                    "flatline_limit": flatline_limit})
 
 @app.route("/api/devices/<device_id>/sensors")
 @login_required
@@ -1924,7 +2193,7 @@ def api_device_sensors(device_id):
     conn.close()
     return jsonify({"device_id": device_id, "sensors": [dict(r) for r in rows]})
 
-@app.route("/snooze/<device_id>/<int:hours>")
+@app.route("/snooze/<device_id>/<int:hours>", methods=["POST"])
 @login_required
 def set_snooze(device_id, hours):
     snooze_until = datetime.now() + timedelta(hours=hours)
@@ -1936,7 +2205,7 @@ def set_snooze(device_id, hours):
     audit("SNOOZE", device_id=device_id, details=f"Web snooze for {hours}h")
     return redirect(url_for("index"))
 
-@app.route("/unsnooze/<device_id>")
+@app.route("/unsnooze/<device_id>", methods=["POST"])
 @login_required
 def unsnooze(device_id):
     conn = get_db()
@@ -2003,12 +2272,15 @@ def audit_page():
         "FROM audit_logs ORDER BY id DESC LIMIT 200"
     ).fetchall()
     conn.close()
+    # Escape every DB-sourced field: audit rows carry attacker-controllable
+    # text (an unauthenticated failed-login username is recorded verbatim, and
+    # device/sensor names come straight off the broker) — review finding B3.
     rows_html = "".join(
         f'<tr><td class="ts">{(r["timestamp"] or "")[:19]}</td>'
-        f'<td>{r["username"] or ""}</td>'
-        f'<td>{r["action"]}</td>'
-        f'<td>{r["device_id"] or ""}</td>'
-        f'<td class="muted">{r["details"] or ""}</td></tr>'
+        f'<td>{html_lib.escape(r["username"] or "")}</td>'
+        f'<td>{html_lib.escape(r["action"] or "")}</td>'
+        f'<td>{html_lib.escape(r["device_id"] or "")}</td>'
+        f'<td class="muted">{html_lib.escape(r["details"] or "")}</td></tr>'
         for r in rows
     ) or '<tr><td colspan="5" class="muted">No audit entries yet.</td></tr>'
     body = f"""<div class="card">
@@ -2246,6 +2518,7 @@ def admin_degraded():
         f'<td>{html_lib.escape(r["suppressed_by"] or "")}</td>'
         f'<td class="ts">{(r["created_at"] or "")[:19]}</td>'
         f'<td><form method="post" action="/admin/degraded" style="display:inline">'
+        f'{_csrf_input()}'
         f'<input type="hidden" name="action" value="remove">'
         f'<input type="hidden" name="device_id" value="{html_lib.escape(r["device_id"])}">'
         f'<input type="hidden" name="sensor_name" value="{html_lib.escape(r["sensor_name"])}">'
@@ -2260,7 +2533,7 @@ def admin_degraded():
         SELECT r.device_id, r.sensor_name, r.sensor_type,
                (julianday('now') - julianday(r.last_change_ts)) * 86400.0 AS flat_s
         FROM sensor_readings r
-        WHERE r.sensor_type != 'heartbeat'
+        WHERE r.sensor_type NOT IN ('heartbeat', 'diagnostic')
           AND r.last_change_ts IS NOT NULL
           AND (julianday('now') - julianday(r.last_change_ts)) * 86400.0 > ?
           AND NOT EXISTS (
@@ -2287,6 +2560,7 @@ def admin_degraded():
     looked at.</strong>
   </p>
   <form method="post" action="/admin/degraded">
+    {_csrf_input()}
     <input type="hidden" name="action" value="add">
     <div class="field">
       <label>Sensor (currently flagged)</label>
@@ -2325,7 +2599,7 @@ def admin_sensors_history():
   <div style="overflow-x:auto">
     <table class="table">
       <thead><tr><th>ID</th><th>Saved at</th><th>By</th><th>File</th><th>Rows</th><th>Summary</th></tr></thead>
-      <tbody>{''.join(f'<tr><td>{r["upload_id"]}</td><td class="ts">{(r["saved_at"] or "")[:19]}</td><td>{r["saved_by"]}</td><td>{html_lib.escape(r["filename"] or "")}</td><td>{r["row_count"]}</td><td class="muted">{html_lib.escape(r["diff_summary"] or "")}</td></tr>' for r in rows) or '<tr><td colspan="6" class="muted">No uploads yet.</td></tr>'}</tbody>
+      <tbody>{''.join(f'<tr><td>{r["upload_id"]}</td><td class="ts">{(r["saved_at"] or "")[:19]}</td><td>{html_lib.escape(r["saved_by"] or "")}</td><td>{html_lib.escape(r["filename"] or "")}</td><td>{r["row_count"]}</td><td class="muted">{html_lib.escape(r["diff_summary"] or "")}</td></tr>' for r in rows) or '<tr><td colspan="6" class="muted">No uploads yet.</td></tr>'}</tbody>
     </table>
   </div>
   <a class="btn" href="/admin/config">← Back to admin</a>
@@ -2395,11 +2669,14 @@ def admin_config():
     conn.close()
     history_rows = "".join(
         f'<tr><td class="ts">{(r["saved_at"] or "")[:19]}</td>'
-        f'<td>{r["saved_by"]}</td>'
-        f'<td>{r["note"] or ""}</td>'
+        f'<td>{html_lib.escape(r["saved_by"] or "")}</td>'
+        f'<td>{html_lib.escape(r["note"] or "")}</td>'
         f'<td><a class="btn btn-sm" href="/admin/config/download/{r["version_id"]}">Download</a> '
-        f'<a class="btn btn-sm btn-warning" href="/admin/config/restore/{r["version_id"]}" '
-        f'onclick="return confirm(\'Restore this version as the new live config?\')">Restore</a></td></tr>'
+        f'<form method="post" action="/admin/config/restore/{r["version_id"]}" style="display:inline" '
+        f'onsubmit="return confirm(\'Restore this version as the new live config?\')">'
+        f'{_csrf_input()}'
+        f'<button class="btn btn-sm btn-warning" type="submit">Restore</button>'
+        f'</form></td></tr>'
         for r in history
     ) or '<tr><td colspan="4" class="muted">No prior versions yet — first save seeds one.</td></tr>'
 
@@ -2414,6 +2691,7 @@ def admin_config():
     changes need a full restart; everything else reloads live.
   </p>
   <form method="post" action="/admin/config">
+    {_csrf_input()}
     <textarea name="content">{html_lib.escape(content)}</textarea>
     <div class="field" style="margin-top:1rem">
       <label>Change note (optional — saved to audit trail)</label>
@@ -2454,6 +2732,7 @@ sht41-3,,,sht41-3_temperature,24,30,WARNING</pre>
       SENSOR_SILENT rather than a misleading out-of-range.</p>
   </details>
   <form method="post" action="/admin/sensors/csv">
+    {_csrf_input()}
     <div class="field">
       <label>CSV (paste the contents here, or upload a file)</label>
       <input type="file" accept=".csv,text/csv" id="csv-file"
@@ -2510,6 +2789,7 @@ def admin_config_post():
   <p class="muted">Review the proposed changes, then save or discard.</p>
   <div class="diff">{diff_html}</div>
   <form method="post" action="/admin/config" style="margin-top:1rem">
+    {_csrf_input()}
     <input type="hidden" name="content" value="{html_lib.escape(new_content, quote=True)}">
     <input type="hidden" name="note" value="{html_lib.escape(note, quote=True)}">
     <div class="btn-group">
@@ -2532,8 +2812,21 @@ def admin_config_post():
     if "web" in new_cfg and "dashboard_refresh_seconds" in new_cfg["web"]:
         config["web"]["dashboard_refresh_seconds"] = new_cfg["web"]["dashboard_refresh_seconds"]
 
+    # Rebuild the Telegram engine so token/chat_id/enabled changes take effect
+    # live. The module-level engine was constructed once at import, so without
+    # this a UI edit silently did nothing until restart (review finding B12).
+    # The polling thread picks up the new global on its next iteration.
+    global telegram_engine
+    telegram_engine = TelegramEngine(
+        token=config["telegram"]["bot_token"],
+        chat_id=config["telegram"]["chat_id"],
+        enabled=config["telegram"]["enabled"],
+    )
+
     body = """<div class="card">
-  <div class="flash success">Configuration saved and applied (host/port changes need restart).</div>
+  <div class="flash success">Configuration saved. Telegram and watchdog settings
+  are now live; MQTT broker/credentials and web host/port still require a restart
+  (<code>./ops.sh restart</code>).</div>
   <a class="btn btn-primary" href="/admin/config">← Back to editor</a>
 </div>"""
     return _render_layout("Config saved", body, current_tab="admin")
@@ -2562,7 +2855,7 @@ def admin_config_download(version_id):
         },
     )
 
-@app.route("/admin/config/restore/<int:version_id>", methods=["GET"])
+@app.route("/admin/config/restore/<int:version_id>", methods=["POST"])
 @login_required
 def admin_config_restore(version_id):
     if session.get("role") != "admin":
@@ -2670,8 +2963,9 @@ def print_report():
         for d in devices
     ) or '<tr><td colspan="9" style="text-align:center;color:#888">No devices</td></tr>'
     alert_rows = "".join(
-        f'<tr><td>{fmt(a["triggered_at"])}</td><td>{a["device_id"]}</td>'
-        f'<td>{a["alert_type"]}</td><td>{a["message"]}</td></tr>'
+        f'<tr><td>{fmt(a["triggered_at"])}</td><td>{html_lib.escape(a["device_id"] or "")}</td>'
+        f'<td>{html_lib.escape(a["alert_type"] or "")}</td>'
+        f'<td>{html_lib.escape(a["message"] or "")}</td></tr>'
         for a in alerts
     ) or '<tr><td colspan="4" style="text-align:center;color:#888">No active alerts</td></tr>'
 
@@ -2785,7 +3079,7 @@ def wallboard():
   <span id="clock"></span>
 </div>
 <div id="stage" class="stage"></div>
-<script>window.REFRESH_SECONDS = 5;</script>
+<script>window.REFRESH_SECONDS = 5; window.CSRF_TOKEN = "{_csrf_token()}";</script>
 <script>{WALLBOARD_JS}</script>"""
     html_doc = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -2807,17 +3101,22 @@ def api_wallboard():
         WHERE resolved = 0
         ORDER BY
             CASE alert_type
-                WHEN 'OUT_OF_RANGE' THEN 0
-                WHEN 'OFFLINE'     THEN 1
-                WHEN 'STALLED'     THEN 2
-                WHEN 'SENSOR_SILENT' THEN 3
-                ELSE 4
+                WHEN 'SYSTEMIC'    THEN 0
+                WHEN 'OUT_OF_RANGE' THEN 1
+                WHEN 'OFFLINE'     THEN 2
+                WHEN 'STALLED'     THEN 3
+                WHEN 'SENSOR_SILENT' THEN 4
+                ELSE 5
             END,
             triggered_at ASC
     """).fetchall()
     total = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
     last = conn.execute("SELECT MAX(ts) FROM sensor_readings").fetchone()[0]
-    sysrows = conn.execute("SELECT COUNT(*) FROM out_of_range WHERE resolved=0").fetchone()[0]
+    # A true systemic flag: an actual same-metric/same-window cluster, NOT the
+    # count of out-of-range breaches the old code mislabelled as systemic
+    # (review finding B13).
+    flatline_limit = int(config.get("watchdog", {}).get("sensor_flatline_seconds", 300))
+    systemic = _detect_systemic_faults(conn, datetime.now(), flatline_limit)
     conn.close()
 
     faults = [{
@@ -2825,8 +3124,8 @@ def api_wallboard():
         "alert_type": r["alert_type"],
         "message": r["message"],
         "triggered_at": r["triggered_at"],
-        "severity": "CRITICAL" if r["alert_type"] in ("OUT_OF_RANGE", "OFFLINE", "STALLED")
-                    else "WARNING",
+        "severity": "CRITICAL" if r["alert_type"] in (
+            "SYSTEMIC", "OUT_OF_RANGE", "OFFLINE", "STALLED") else "WARNING",
     } for r in rows]
 
     with mqtt_health_lock:
@@ -2837,7 +3136,7 @@ def api_wallboard():
         "mqtt_ok": mqtt_ok,
         "total": total,
         "lastPacket": (last[:19] if last else None),
-        "systemic": sysrows > 0,
+        "systemic": len(systemic) > 0,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     })
 
@@ -2903,42 +3202,69 @@ def _watchdog_check_health():
          still believes it is connected.
     """
     try:
+        now = datetime.now()
         with mqtt_health_lock:
             connected = mqtt_health["connected"]
             last_disc = mqtt_health["last_disconnected_at"]
+            down_alerted = mqtt_health["down_alerted"]
+            last_down_nag = mqtt_health["last_down_nag_at"]
+            nodata_alerted_at = mqtt_health["nodata_alerted_at"]
 
-        # (2) connected but silent
+        # (2) connected but silent. Page once when silence first crosses 10
+        # minutes, then at most every 30 minutes — tracked by timestamp, not by
+        # a tick coinciding with a narrow window (review finding B11).
         if connected:
             try:
                 conn = get_db()
                 row = conn.execute("SELECT MAX(ts) FROM sensor_readings").fetchone()
                 conn.close()
+                age = None
                 if row and row[0]:
-                    age = (datetime.now() - _parse_ts(row[0])).total_seconds()
-                    if age > 600:
-                        mins = int(age // 60)
-                        # Fire at most once every 30 minutes.
-                        if mins % 30 == 0 or (600 < age < 660):
-                            telegram_engine.send_message(
-                                "⚠️ <b>No sensor data for %d minutes.</b>\n"
-                                "MQTT session is still connected, so the broker "
-                                "is reachable but not forwarding. This is a "
-                                "broker, ACL or network fault &mdash; not a "
-                                "sensor fault." % mins
-                            )
+                    last = _parse_ts(row[0])
+                    age = (now - last).total_seconds() if last else None
+                if age is not None and age > 600:
+                    if (nodata_alerted_at is None
+                            or (now - nodata_alerted_at).total_seconds() >= 1800):
+                        telegram_engine.send_message(
+                            "⚠️ <b>No sensor data for %d minutes.</b>\n"
+                            "MQTT session is still connected, so the broker "
+                            "is reachable but not forwarding. This is a "
+                            "broker, ACL or network fault &mdash; not a "
+                            "sensor fault." % int(age // 60)
+                        )
+                        with mqtt_health_lock:
+                            mqtt_health["nodata_alerted_at"] = now
+                else:
+                    # Data flowing again — clear the latch.
+                    if nodata_alerted_at is not None:
+                        with mqtt_health_lock:
+                            mqtt_health["nodata_alerted_at"] = None
             except Exception:
                 log.exception("no-data check failed")
             return
 
-        # (1) session lost
+        # (1) session lost. Page once when downtime first reaches 60s (a latch,
+        # so a 15s health tick can no longer step over a 5s trigger window —
+        # review finding B5), then re-nag every 10 minutes until reconnect.
         if last_disc is None:
             return
-        downtime = (datetime.now() - last_disc).total_seconds()
-        if 60 <= downtime < 65 or int(downtime) % 600 == 0:
+        downtime = (now - last_disc).total_seconds()
+        if downtime >= 60 and not down_alerted:
             telegram_engine.send_message(
                 "⚠️ <b>MQTT broker unreachable.</b>\n"
                 f"Down for {int(downtime)}s. Watchdog is blind until reconnect."
             )
+            with mqtt_health_lock:
+                mqtt_health["down_alerted"] = True
+                mqtt_health["last_down_nag_at"] = now
+        elif down_alerted and (last_down_nag is None
+                               or (now - last_down_nag).total_seconds() >= 600):
+            telegram_engine.send_message(
+                "⚠️ <b>MQTT broker still unreachable.</b>\n"
+                f"Down for {int(downtime)}s. Watchdog is blind until reconnect."
+            )
+            with mqtt_health_lock:
+                mqtt_health["last_down_nag_at"] = now
     except Exception:
         log.exception("_watchdog_check_health crashed")
 
@@ -2982,6 +3308,9 @@ def _rebase_stale_readings_on_boot():
 def main():
     init_db()
     _ensure_password_hashes()
+    _ensure_secret_key()
+    # Apply the (possibly freshly generated) signing key before serving.
+    app.secret_key = config["web"]["secret_key"]
     _rebase_stale_readings_on_boot()
     client = start_mqtt()
     _mqtt_client_holder["client"] = client
