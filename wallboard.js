@@ -47,15 +47,44 @@ function armAudio() {
         // A click anywhere counts as the gesture.
         document.removeEventListener('click', armAudio);
         document.removeEventListener('keydown', armAudio);
+        updateAudioWarning();
     } catch (e) {
         audioArmed = false;
+        updateAudioWarning();
     }
 }
 document.addEventListener('click', armAudio);
 document.addEventListener('keydown', armAudio);
 
+// The browser blocks audio until a real user gesture, so on a kiosk TV the
+// alarm would be silent without this prompt. Show a persistent banner until
+// the context is actually RUNNING (not merely created - a created context
+// can still be suspended).
+function updateAudioWarning() {
+    const el = document.getElementById('audio-warn');
+    if (!el) return;
+    const running = audioCtx && audioCtx.state === 'running';
+    if (audioCtx && audioCtx.state === 'suspended') {
+        audioCtx.resume().then(updateAudioWarning).catch(() => {});
+    }
+    el.style.display = (audioArmed && running) ? 'none' : '';
+}
+
+// Check periodically: some browsers create the context suspended and only
+// resume it on a later gesture.
+setInterval(updateAudioWarning, 2000);
+window.addEventListener('DOMContentLoaded', updateAudioWarning);
+
+// Play the alarm tone. Returns true if sound was actually scheduled.
+// `times` is how many two-tone bursts to play.
 function beep(times) {
-    if (!audioArmed || !audioCtx) return;   // no audio hardware: visual only
+    if (!audioArmed || !audioCtx) return false;   // no audio hardware: visual only
+    // A context can be created but left suspended by the browser's autoplay
+    // policy. Resume it - this is the call that actually unblocks sound once
+    // a real user gesture has happened.
+    if (audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(() => {});
+    }
     for (let i = 0; i < times; i++) {
         const t0 = audioCtx.currentTime + i * 0.45;
         // Two-tone: a rising pair reads as "attention" rather than "error beep".
@@ -73,6 +102,64 @@ function beep(times) {
             osc.stop(start + 0.25);
         });
     }
+    return true;
+}
+
+// BEEP TEST. Plays the same tone the alarm uses, so an operator can confirm
+// the screen can actually make a sound before they rely on it. Also reports
+// WHY it might be silent, because "no sound" is the single most likely
+// reason a wall display is not doing its job.
+window.beepTest = function () {
+    const status = document.getElementById('beep-status');
+    const setStatus = (text, cls) => {
+        if (!status) return;
+        status.textContent = text;
+        status.className = 'beep-status ' + (cls || '');
+    };
+
+    // This click IS the user gesture the browser needs, so arm first.
+    armAudio();
+
+    if (!audioCtx) {
+        setStatus('No Web Audio support in this browser - the alarm will be VISUAL ONLY.',
+                  'bad');
+        // Still flash the screen so the operator sees something happen.
+        flashTest();
+        return;
+    }
+
+    if (audioCtx.state === 'suspended') {
+        audioCtx.resume().then(() => {
+            const ok = beep(3);
+            setStatus(ok
+                ? 'Playing - if you hear nothing, check the TV/system volume.'
+                : 'Could not schedule audio.',
+                ok ? 'ok' : 'bad');
+            flashTest();
+        }).catch((err) => {
+            setStatus('Audio blocked by the browser (' + (err && err.name || 'error')
+                      + '). Click the page once, then try again.', 'bad');
+            flashTest();
+        });
+        return;
+    }
+
+    const ok = beep(3);
+    setStatus(ok
+        ? 'Playing - if you hear nothing, check the TV/system volume.'
+        : 'Could not schedule audio.',
+        ok ? 'ok' : 'bad');
+    flashTest();
+    updateAudioWarning();
+};
+
+// Briefly flash the whole screen, so the operator can also verify the
+// VISUAL alarm works even when the TV has no speakers.
+function flashTest() {
+    const stage = document.getElementById('stage');
+    if (!stage) return;
+    stage.classList.add('beep-test-flash');
+    setTimeout(() => stage.classList.remove('beep-test-flash'), 1500);
 }
 
 function stopBeep() {

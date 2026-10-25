@@ -3040,6 +3040,34 @@ body {
 .bar h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: .02em; }
 .mqtt { margin-left: auto; font-size: 1rem; font-weight: 700; padding: .3rem .9rem;
         border-radius: 999px; }
+/* Beep test control. Kept small and out of the way - this is an operator
+   aid for verifying the screen can make a sound, not a dashboard control. */
+.beep-controls { display: flex; align-items: center; gap: .6rem; }
+/* The browser blocks audio until a real user gesture. Until then the alarm
+   would be silent, which is the one failure mode a wall display must not
+   have. This banner says so explicitly instead of leaving the operator
+   wondering why the buzzer never sounds. */
+.audio-warn {
+    background: #4a3a14; color: #fbbf24; padding: .3rem .8rem;
+    border-radius: 999px; font-size: .85rem; font-weight: 600;
+    animation: pulse 1.6s infinite;
+}
+.beep-btn {
+    background: #1f2a37; color: #e6edf3; border: 1px solid #2d3a4d;
+    border-radius: 8px; padding: .35rem .7rem; font-size: .85rem;
+    cursor: pointer; font-family: inherit;
+}
+.beep-btn:hover { background: #2d3a4d; }
+.beep-status { font-size: .8rem; color: #7d8590; max-width: 34ch; }
+.beep-status.ok  { color: #4ade80; }
+.beep-status.bad { color: #f87171; }
+/* Brief full-screen flash used by the beep test, so the VISUAL alarm can be
+   verified on a screen with no speakers. */
+@keyframes beepflash {
+    0%,100% { background: #0b0f14; }
+    50%     { background: #7f1d1d; }
+}
+.stage.beep-test-flash { animation: beepflash .5s 3; }
 .mqtt.ok   { background: #10371f; color: #4ade80; }
 .mqtt.down { background: #4a1414; color: #f87171; animation: pulse 1s infinite; }
 #clock { font-size: 1.5rem; font-weight: 300; color: #7d8590;
@@ -3087,8 +3115,15 @@ table.faults td { padding: .8rem; border-bottom: 1px solid #1a222c; }
 def wallboard():
     body = f"""<div class="bar">
   <h1>&#127812; Sensor Watchdog &mdash; Facility Board</h1>
+  <span id="audio-warn" class="audio-warn" style="display:none">
+    &#128266; Click anywhere to enable the alarm sound
+  </span>
   <span id="mqtt-state" class="mqtt down">BROKER ...</span>
   <span id="clock"></span>
+  <span class="beep-controls">
+    <button class="beep-btn" onclick="beepTest()" title="Play the alarm tone and flash the screen">&#128266; Test alarm</button>
+    <span id="beep-status" class="beep-status"></span>
+  </span>
 </div>
 <div id="stage" class="stage"></div>
 <script>window.REFRESH_SECONDS = 5; window.CSRF_TOKEN = "{_csrf_token()}";</script>
