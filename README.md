@@ -62,6 +62,10 @@ To tear it back down without losing data:
 
 The doc set lives under [`docs/`](docs/). Read in this order:
 
+> **[docs/REVIEW_BRIEF.md](docs/REVIEW_BRIEF.md)** — self-contained brief
+> for an external code review (objectives, installation, codebase map,
+> known issues, incident history, open questions).
+
 | | Doc | Audience |
 |---|---|---|
 | 1 | [`docs/install.md`](docs/install.md) | Production engineer setting up a fresh host |

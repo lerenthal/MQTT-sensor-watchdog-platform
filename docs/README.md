@@ -2,6 +2,11 @@
 
 Per-topic documentation for the MQTT Sensor Watchdog Platform.
 
+> **[REVIEW_BRIEF.md](REVIEW_BRIEF.md)** — a self-contained brief for an
+> external code review: objectives, current installation, full codebase map,
+> known issues, incident history, and specific questions to answer. Start here
+> if you have been asked to review this project.
+
 | Doc | Audience | When to read |
 |---|---|---|
 | [`install.md`](install.md) | Production engineer | First-time deployment on a fresh host. |
