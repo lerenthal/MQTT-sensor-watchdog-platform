@@ -1,0 +1,58 @@
+# MQTT Sensor Watchdog — PILOT instance
+#
+# A second, independent deployment of the same image, for evaluating the
+# app on the facility big-screen TV before it goes to the production host.
+#
+#   ./pilot-ops.sh start     # build + start
+#   ./pilot-ops.sh stop      # stop (keeps pilot/data and pilot/config)
+#   ./pilot-ops.sh logs      # last 200 lines
+#   ./pilot-ops.sh status    # health + /health + recent audit rows
+#   ./pilot-ops.sh backup    # snapshot pilot/data/sensor_watchdog.db
+#   ./pilot-ops.sh shell     # shell into the pilot container
+#
+# WHY A SEPARATE INSTANCE RATHER THAN A SECOND PORT ON THE SAME ONE:
+#
+#   1. Separate database. The pilot's audit trail, alert history and
+#      operator actions are its own. Nothing done while evaluating the
+#      pilot can pollute the record you would take to production.
+#   2. Separate configuration. The pilot can be tuned (fresher dashboard
+#      poll, different thresholds) without touching the live instance.
+#   3. Separate Telegram. Both instances subscribe to the same broker, so
+#      a single fault would be detected - and paged - TWICE. The pilot
+#      ships with WATCHDOG_TG_ENABLED=false; the live instance on :5050
+#      owns the alerting channel until the pilot is ready to take over.
+
+services:
+  watchdog-pilot:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: sensor-watchdog:latest
+    container_name: sensor_watchdog_pilot
+    restart: unless-stopped
+    user: "${HOST_UID:-1001}:${HOST_GID:-1001}"
+    ports:
+      # Host 5060 -> container 5050. The container always listens on 5050;
+      # only the published host port changes.
+      - "5060:5050"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./backups:/app/backups
+    env_file:
+      - .env
+    environment:
+      WATCHDOG_CONFIG: /app/config/config.yaml
+      WATCHDOG_DB: /app/data/sensor_watchdog.db
+      TZ: ${TZ:-Asia/Jerusalem}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5050/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

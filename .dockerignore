@@ -39,3 +39,9 @@ Thumbs.db
 # Git
 .git/
 .gitignore
+
+# Pilot instance runtime state (never in the image)
+pilot/data/
+pilot/backups/
+pilot/config/
+pilot/.env

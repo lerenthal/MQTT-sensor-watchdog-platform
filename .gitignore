@@ -49,3 +49,12 @@ Thumbs.db
 *.egg-info/
 build/
 dist/
+
+# =============================================================================
+# Pilot instance (pilot/docker-compose.yml + pilot/pilot-ops.sh are committed;
+# everything else in pilot/ is runtime state or holds live secrets)
+# =============================================================================
+pilot/data/
+pilot/backups/
+pilot/config/config.yaml
+pilot/.env
