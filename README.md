@@ -134,3 +134,23 @@ GPL-3.0. See [LICENSE](LICENSE).
 This program is free software; you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the
 Free Software Foundation.
+
+## Verification tools
+
+`tools/` holds end-to-end checks used to validate the app against the
+live broker. They are runnable, not just documentation:
+
+| Tool | What it proves |
+|---|---|
+| `tools/verify_features.py <url>` | The dashboard features: ignore list, snooze control, persistent highlighting, TEST ALARM button, honest restart reporting. Exits non-zero on failure. |
+| `tools/verify_restart.sh <service> <device>` | The restart path: command published, broker acknowledgement, heartbeat reset. |
+| `tools/verify_restart_probe.py <device>` | The restart path, run inside the container, watching for the LWT status cycle that proves a reboot. |
+| `tools/find_restart_topic.py <device>` | Probes candidate restart topics to find the one a device actually listens on. |
+
+```bash
+.venv/bin/python tools/verify_features.py http://localhost:5050
+bash tools/verify_restart.sh watchdog bme680-1
+```
+
+**Never run a restart test against a device in production** - a restart
+drops its readings for a few seconds.

@@ -143,3 +143,44 @@ is no SemVer for this project.
 Initial commit. Flask + MQTT + watchdog + Telegram + dashboard in a
 single Python process, packaged in Docker Compose. Schema v1
 (`devices`, `alerts`, `audit_logs`).
+
+## 2026-10-26 - Ignore list, persistent highlighting, working restart diagnostics
+
+### Fixed
+- **MQTT reconnect storm.** Both instances used the hardcoded client_id
+  `facility_watchdog_server`. Mosquitto kicks the older session when a
+  second client connects with the same id, so the two containers pushed
+  each other off the broker continuously - 222 connects and 221
+  disconnects in 30 minutes. Each instance now uses a unique id
+  (`WATCHDOG_INSTANCE_ID`, set to `live` and `pilot` in the compose
+  files). Result: 1 connect, 0 disconnects.
+- **Snooze button missing from the table.** The compact one-line rows
+  carried no snooze control; it existed only inside the expanded detail
+  panel. The Snooze column now holds a dropdown (1h / 8h / 24h / 7d) on
+  every row, and a snoozed device shows a Resume button.
+- **Restart button reported success it could not deliver.** The API
+  published with QoS 0 and never checked the result, so a command lost
+  in a reconnect looked identical to a successful restart. It now
+  publishes with QoS 1, waits for the broker acknowledgement, refuses
+  to publish while the client is disconnected, and reports a device
+  with no MQTT button as a failure with an explanation.
+
+### Added
+- Ignore list: `watchdog.ignored_devices` in the config, an
+  **Ignore List** page at `/admin/ignored` linked from the top
+  navigation, and audited `IGNORE_ADDED` / `IGNORE_REMOVED` events.
+  An ignored device is hidden from the table and excluded from
+  alerting; its readings are still recorded.
+- Persistent status highlighting: a faulty device keeps an amber tint
+  until it is snoozed, so a fresh failure looks different from a
+  long-standing one and a handled fault looks calm.
+- Button topics are now recorded from the device's own `button/*/state`
+  topic, which is the evidence used to decide whether a device is
+  restartable.
+- `verify_features.py` and `verify_restart.sh` - end-to-end checks for
+  the dashboard features and the restart path.
+
+### Changed
+- The wall board's alarm test button is now large, high-contrast and
+  labelled **TEST ALARM**, so it can be found on a TV across a room.
+- The Snooze column was widened (7% -> 10%) to fit the dropdown.

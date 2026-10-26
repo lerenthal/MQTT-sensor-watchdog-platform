@@ -37,6 +37,11 @@ services:
       # only so the operator can SEE the override interface in one place.
       WATCHDOG_CONFIG: /app/config/config.yaml
       WATCHDOG_DB: /app/data/sensor_watchdog.db
+      # Must be UNIQUE per running instance. Mosquitto kicks the older
+      # session when two clients connect with the same client_id, which
+      # turns two instances into a reconnect war and silently breaks
+      # publishes.
+      WATCHDOG_INSTANCE_ID: live
       TZ: ${TZ:-UTC}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5050/health"]

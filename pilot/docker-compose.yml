@@ -44,6 +44,8 @@ services:
     environment:
       WATCHDOG_CONFIG: /app/config/config.yaml
       WATCHDOG_DB: /app/data/sensor_watchdog.db
+      # Unique per instance - see the note in the root docker-compose.yml.
+      WATCHDOG_INSTANCE_ID: pilot
       TZ: ${TZ:-Asia/Jerusalem}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5050/health"]

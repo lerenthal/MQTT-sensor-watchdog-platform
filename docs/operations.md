@@ -219,3 +219,65 @@ Before going live on a facility:
   alert state.
 - [ ] `./ops.sh backup && ./ops.sh restore ./backups/<that file>` works
   end-to-end before you rely on it.
+
+## Restarting a device from the dashboard
+
+The **Restart** button in a device row publishes `PRESS` to
+`facility/<device_id>/env_sensor/button/restart/cmd` with QoS 1 and waits
+for the broker to acknowledge it.
+
+**The device will only reboot if its firmware has an MQTT button that
+listens on that topic.** A device whose ESPHome configuration declares
+`button: - platform: restart` WITHOUT an `mqtt:` block has a *local-only*
+button: it appears in the Home Assistant device page and can be pressed
+there, but it does not subscribe to MQTT and will ignore the command.
+
+The watchdog detects this and says so rather than reporting a false
+success:
+
+| Situation | HTTP | Body |
+|---|---|---|
+| Device has an MQTT button | 200 | `{"ok": true, "topic": ...}` |
+| Command reached the broker, device has no MQTT button | 502 | `{"ok": false, "published": true, "error": "...will NOT reboot..."}` |
+| Broker unreachable / not acknowledged | 502 | `{"ok": false, "error": "MQTT publish was not acknowledged..."}` |
+
+Both non-success cases are audited. The second is audited as
+`RESTART_COMMAND_UNACKNOWLEDGED` so the gap is visible in the audit log
+rather than only in a browser alert.
+
+### To make a device restartable
+
+Add an MQTT button to the device's ESPHome configuration:
+
+```yaml
+mqtt:
+  id: mqtt_client
+  broker: 10.10.17.11
+  ...
+button:
+  - platform: mqtt
+    id: restart_button
+    name: "Restart"
+    command_topic: button/restart/cmd
+    payload_press: "PRESS"
+```
+
+The full topic the watchdog publishes to is
+`facility/<device_id>/env_sensor/button/restart/cmd`, so with the
+default ESPHome `mqtt:` prefix the `command_topic` above resolves to the
+right place. Verify with `mosquitto_sub -t 'facility/+/env_sensor/button/#'`
+- the device must publish a `.../button/<name>/state` topic, which is
+also the evidence the watchdog uses to decide the device is
+restartable.
+
+### Verifying a restart
+
+`./verify_restart.sh <service> <device_id>` publishes the command and
+watches the heartbeat counter. A reboot resets the counter, so the value
+drops sharply rather than continuing to increment.
+
+**Run the probe from inside the container.** The facility broker ACL
+allows the watchdog's source address (the Docker bridge) but rejects new
+logins from the host LAN address; a probe run from the host gets "not
+authorised" and sees nothing, which looks identical to a broken publish.
+

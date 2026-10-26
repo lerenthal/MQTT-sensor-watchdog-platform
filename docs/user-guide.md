@@ -293,3 +293,46 @@ change on first login.
 A: Either Telegram is not configured, or the snooze duration is shorter
 than the cooldown you expect. Wait until the timer expires (or click
 Unsnooze) and re-evaluate.
+
+## Ignore list (devices not currently in use)
+
+Some devices are physically installed but not in service - a spare, a
+bench test unit, a sensor in a room that is closed for the season. These
+would otherwise appear in the table and raise alarms.
+
+**Admin Config > Ignore List** (or `/admin/ignored`) lists them. Pick a
+device and press **Ignore this device**. It disappears from the dashboard
+and is excluded from alerting entirely - no Telegram message, no wall
+board entry, no status evaluation. Its readings are still recorded, so
+resuming monitoring restores its full history.
+
+**Resume monitoring** puts it straight back. Every change is audited as
+`IGNORE_ADDED` / `IGNORE_REMOVED`.
+
+The same list can be edited as YAML at **Admin Config**:
+
+```yaml
+watchdog:
+  ignored_devices:
+    - pt100-3
+    - spare-sensor-2
+```
+
+Saving the YAML editor hot-reloads the list; no restart is needed.
+
+## Status highlighting
+
+A row that changes status flashes for a few seconds and shows a
+`was X -> now Y` tag. After the flash it keeps a persistent amber
+tint for as long as the fault is unhandled. **The highlight clears when
+you snooze the device** - that is the signal that someone has taken
+ownership of it. A device that has been broken all shift therefore looks
+different from one that just failed, and a snoozed device looks calm.
+
+## Snoozing
+
+The **Snooze** column of the table carries a dropdown (1 hour, 8 hours,
+24 hours, 7 days) on every row, so a device can be silenced without
+expanding the row. A snoozed device shows a **Snoozed** badge with a
+**Resume** button instead.
+

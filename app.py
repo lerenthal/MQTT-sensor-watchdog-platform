@@ -712,6 +712,8 @@ def on_mqtt_message(client, userdata, msg):
     sensor_name = ""
     metric_path = ""
     is_binary = False
+    is_button = False
+    is_button_state = False
 
     if sub and sub[0] == "status":
         metric_path = "status"
@@ -729,6 +731,18 @@ def on_mqtt_message(client, userdata, msg):
         # vs '/config' vs deeper paths.
         sub = sub[2:]
         metric_path = "/".join(sub) if sub else ""
+
+    elif sub and sub[0] == "button" and len(sub) >= 2:
+        # ESPHome's MQTT button component publishes its state under
+        # <prefix>/button/<name>/state and listens on
+        # <prefix>/button/<name>/cmd. Only the STATE topic proves the
+        # device has an MQTT button; the cmd topic merely proves something
+        # was published there.
+        sensor_name = sub[1]
+        sub = sub[2:]
+        metric_path = "/".join(sub) if sub else ""
+        is_button = True
+        is_button_state = metric_path.endswith("/state")
 
     elif sub and sub[0] == "binary_sensor" and len(sub) >= 2:
         # ESPHome publishes binary sensors (the firmware's own 'Value Stall' /
@@ -788,6 +802,26 @@ def on_mqtt_message(client, userdata, msg):
                     )
             except (ValueError, TypeError):
                 pass
+        elif is_button:
+            # Only the device's own button STATE topic is evidence that
+            # it has an MQTT button component. A /cmd topic is just an
+            # echo of a command somebody published.
+            if not is_button_state:
+                conn.close()
+                return
+            try:
+                conn.execute("""
+                    INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
+                    VALUES (?, ?, 'button', 1.0, ?, ?)
+                    ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
+                        value = excluded.value, ts = excluded.ts
+                """, (device_id, sensor_name, now, now))
+                conn.commit()
+                conn.close()
+                return
+            except Exception:
+                conn.close()
+                return
         elif is_binary:
             # Firmware binary sensor ('Value Stall' / 'Sensor Fault'). Payload
             # is ON/OFF text, not a float, so decode it explicitly and store as
@@ -964,7 +998,17 @@ def on_mqtt_message(client, userdata, msg):
             pass
 
 def start_mqtt():
-    client = mqtt.Client(client_id="facility_watchdog_server")
+    # A unique client_id per instance. Mosquitto enforces "one connection
+    # per client_id" by kicking the OLDER session when a new one arrives
+    # with the same id - so two watchdog instances sharing a hardcoded id
+    # will push each other off the broker in a reconnect loop. That loop
+    # silently breaks publishes (a restart command lands in a connection
+    # that dies a second later).
+    _suffix = os.environ.get("WATCHDOG_INSTANCE_ID", "").strip()
+    if not _suffix:
+        # Fall back to the web port, which differs between instances.
+        _suffix = str(config.get("web", {}).get("port", "5050"))
+    client = mqtt.Client(client_id=f"sensor-watchdog-{_suffix}")
     if config["mqtt"].get("username"):
         client.username_pw_set(config["mqtt"]["username"], config["mqtt"]["password"])
     client.reconnect_delay_set(
@@ -1770,6 +1814,14 @@ a:hover { color: var(--accent-hover); }
 }
 tr.row-changed { animation: rowflash 1s 4; }
 tr.row-changed td { border-bottom-color: var(--warning); }
+/* Persistent highlight for a fault that is still unhandled. Cleared
+   automatically once the device is snoozed. */
+tr.row-changed-persist td { background: rgba(250, 204, 21, .10); }
+tr.row-changed-persist td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
+/* The snooze control must be usable directly in the compact row. */
+.snooze-ctl { display: inline-flex; align-items: center; gap: .25rem; }
+.snooze-ctl .dropdown-menu { right: 0; }
+.table.devices td.col-actions { white-space: nowrap; }
 /* Persistent tint by severity, so the colour still means something after
    the flash has ended. */
 tr.row-offline  td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
@@ -1804,8 +1856,8 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
 .col-reason    { width: 20%;  }
 .col-sensors   { width: 13%;  }
 .col-lastseen  { width: 8%;   }
-.col-snooze    { width: 7%;   }
-.col-actions   { width: 5%;   }
+.col-snooze    { width: 10%;  }
+.col-actions   { width: 6%;   }
 /* Values are tabular so digits line up column to column. */
 .table.devices td.num { font-variant-numeric: tabular-nums; }
 /* Narrow viewports: shed the columns an operator can recover from the
@@ -1819,8 +1871,8 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
     .col-status   { width: 11%; }
     .col-reason   { width: 28%; }
     .col-sensors  { width: 14%; }
-    .col-snooze   { width: 8%;  }
-    .col-actions  { width: 5%;  }
+    .col-snooze   { width: 11%;  }
+    .col-actions  { width: 6%;  }
 }
 @media (max-width: 860px) {
     .col-location, .col-co2 { display: none; }
@@ -1940,9 +1992,11 @@ def _render_layout(title, body, current_tab=None, wide=False):
         ("devices", "Devices", "index"),
         ("history", "Audit Log", "audit_page"),
         ("admin", "Admin Config", "admin_config"),
+        ("ignored", "Ignore List", "admin_ignored"),
     ]
     if session.get("username"):
         tabs.append(("print", "Print Report", "print_report"))
+        tabs.append(("wallboard", "Wall Board", "wallboard"))
         nav_html = "".join(
             f'<a class="nav-tab {"active" if current_tab==tid else ""}" '
             f'href="{url_for(ep)}">{label}</a>'
@@ -2371,14 +2425,82 @@ def api_restart(device_id):
     if client is None:
         return jsonify({"ok": False, "error": "MQTT client not initialized"}), 503
     topic = f"facility/{device_id}/env_sensor/button/restart/cmd"
+    conn = None
     try:
-        client.publish(topic, "PRESS", qos=0, retain=False)
-        audit("RESTART_SENT", device_id=device_id, details=f"Published to {topic}")
-        log.info(f"Restart command published for {device_id} on {topic}")
-        return jsonify({"ok": True, "topic": topic})
+        conn = get_db()
+        if not client.is_connected():
+            # paho would queue this and it would go out on the next connect,
+            # or vanish. Say so plainly instead of reporting a success the
+            # operator cannot rely on.
+            return jsonify({
+                "ok": False,
+                "error": "MQTT client is not connected - the command was NOT sent",
+            }), 503
+        info = client.publish(topic, "PRESS", qos=1, retain=False)
+        # qos=1 so the broker acknowledges; a queued-but-unsent message is
+        # then visible rather than silently lost.
+        info.wait_for_publish(timeout=5)
+        if not info.is_published():
+            return jsonify({
+                "ok": False,
+                "error": "MQTT publish was not acknowledged by the broker",
+            }), 502
+
+        # A device whose firmware has no MQTT button component will not act on
+        # the command, and the publish will look like a success. The
+        # observable proxy is whether the device has EVER published a topic
+        # under its own button/ subtree - ESPHome's button component
+        # publishes its state there. If it never has, this firmware has no
+        # MQTT button, so say so instead of implying the device rebooted.
+        _btn = conn.execute(
+            "SELECT COUNT(*) FROM sensor_readings WHERE device_id = ? "
+            "AND sensor_type = 'button'",
+            (device_id,),
+        ).fetchone()[0] if conn else 0
+        # Only rows recorded from a genuine button STATE topic count. The
+        # recorder ignores /cmd topics, so this is the device's own evidence
+        # that it has an MQTT button component.
+        has_mqtt_button = _btn > 0
+
+        if has_mqtt_button:
+            audit("RESTART_SENT", device_id=device_id,
+                  details=f"Published to {topic} (qos=1, acked)")
+            log.info(f"Restart command published for {device_id} on {topic}")
+            return jsonify({"ok": True, "topic": topic,
+                            "note": "Command delivered to the broker. The device "
+                                    "will reboot if its firmware has an MQTT "
+                                    "button on this topic."})
+
+        # No evidence of an MQTT button on this device. Report it honestly:
+        # the command reached the broker, but nothing is listening, so the
+        # device will not reboot. The operator needs to know that before
+        # they walk to the device expecting it to come back.
+        audit("RESTART_COMMAND_UNACKNOWLEDGED", device_id=device_id,
+              details=f"Published to {topic} (acked) but device has no MQTT "
+                      f"button topic - firmware change required")
+        log.warning(
+            "Restart command for %s was published to %s but the device has "
+            "never published a button/ topic, so it has no MQTT button "
+            "component and will not reboot. Firmware change required.",
+            device_id, topic)
+        return jsonify({
+            "ok": False,
+            "published": True,
+            "topic": topic,
+            "error": "Command reached the broker, but this device has no MQTT "
+                     "button component, so it will NOT reboot. Its firmware "
+                     "needs a button: - platform: mqtt with "
+                     "command_topic: button/restart/cmd.",
+        }), 502
     except Exception as e:
         log.exception("Restart publish failed")
         return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 # -----------------------------------------------------------------------------
 # Audit log
@@ -3266,10 +3388,12 @@ body {
     animation: pulse 1.6s infinite;
 }
 .beep-btn {
-    background: #1f2a37; color: #e6edf3; border: 1px solid #2d3a4d;
-    border-radius: 8px; padding: .35rem .7rem; font-size: .85rem;
+    background: #1f2937; color: #fbbf24; border: 2px solid #fbbf24;
+    border-radius: 8px; padding: .45rem 1.1rem; font-size: 1.05rem;
+    font-weight: 800; letter-spacing: .04em;
     cursor: pointer; font-family: inherit;
 }
+.beep-btn:hover { background: #fbbf24; color: #1f2937; }
 .beep-btn:hover { background: #2d3a4d; }
 .beep-status { font-size: .8rem; color: #7d8590; max-width: 34ch; }
 .beep-status.ok  { color: #4ade80; }
@@ -3334,7 +3458,7 @@ def wallboard():
   <span id="mqtt-state" class="mqtt down">BROKER ...</span>
   <span id="clock"></span>
   <span class="beep-controls">
-    <button class="beep-btn" onclick="beepTest()" title="Play the alarm tone and flash the screen">&#128266; Test alarm</button>
+    <button class="beep-btn" onclick="beepTest()" title="Play the alarm tone and flash the screen">&#128266; TEST ALARM</button>
     <span id="beep-status" class="beep-status"></span>
   </span>
 </div>

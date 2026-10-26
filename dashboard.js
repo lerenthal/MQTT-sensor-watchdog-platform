@@ -34,8 +34,13 @@ let EXPANDED_ROWS = new Set(JSON.parse(localStorage.getItem('watchdog-expanded-r
 // an hour should look calm; a device that just broke should not.
 let PREV_STATUS = new Map(JSON.parse(localStorage.getItem('watchdog-prev-status') || '[]'));
 
-// A row flashes for this long after its status changes.
-const FLASH_MS = 8000;
+// A row flashes after its status changes and KEEPS flashing until the
+// operator snoozes or otherwise acknowledges the device. A purely
+// time-limited flash is the wrong signal for a facility: the fault may
+// still be un-actioned hours later, and a wall display that has gone
+// quiet reads as "handled" when it is not.
+const FLASH_MS = 8000;      // how long the FLASH animation itself runs
+const FLASH_PERSIST = true; // keep the highlight until snoozed
 
 // State-changing requests must be POST and carry the CSRF token (finding B9).
 // Render an inline POST form so these work without inline JS handlers.
@@ -170,18 +175,40 @@ window.expandAll = function () {
     refresh();
 };
 
+// The snooze control. Present in the compact row (always visible) and again
+// in the expanded detail. It is a dropdown of the configured presets plus an
+// "Unsnooze" when the device is currently snoozed.
+function snoozeControl(d, id) {
+    if (d.snooze_until) {
+        return '<div class="snooze-ctl">'
+             + '<span class="badge badge-warning" title="Snoozed until '
+             + escapeHtml(d.snooze_until.slice(0, 16)) + '">Snoozed</span>'
+             + postForm('/unsnooze/' + id, 'Resume', 'btn btn-sm btn-success')
+             + '</div>';
+    }
+    return '<div class="dropdown snooze-ctl">'
+         + '<button type="button" class="btn btn-sm btn-warning" '
+         + 'onclick="event.stopPropagation();this.parentElement.classList.toggle(\'open\')">'
+         + 'Snooze &#9662;</button>'
+         + '<div class="dropdown-menu">'
+         + postMenuItem('/snooze/' + id + '/1', '1 Hour')
+         + postMenuItem('/snooze/' + id + '/8', '8 Hours')
+         + postMenuItem('/snooze/' + id + '/24', '24 Hours')
+         + postMenuItem('/snooze/' + id + '/168', '7 Days')
+         + '</div></div>';
+}
+
 function renderRow(d) {
     const status = statusBadge(d.status);
-    const snooze = d.snooze_until
-        ? '<span class="badge badge-warning">Snoozed until '
-          + (d.snooze_until || '').slice(0, 16) + '</span>'
-        : '<span class="muted">Active</span>';
     const id = encodeURIComponent(d.device_id);
     const isOpen = EXPANDED_ROWS.has(d.device_id);
 
     // --- Feature 2: did this device's status change since the last poll?
     const prev = PREV_STATUS.get(d.device_id);
-    const changed = prev !== undefined && prev !== d.status;
+    // A snoozed device is considered handled: it must not flash, however
+    // recently its status changed.
+    const snoozed = !!d.snooze_until;
+    const changed = prev !== undefined && prev !== d.status && !snoozed;
     const changedFrom = changed ? prev : null;
 
     const restartBtn = '<button class="btn btn-sm btn-danger" '
@@ -239,7 +266,8 @@ function renderRow(d) {
             + ' <span class="ts">since ' + escapeHtml((f.triggered_at || '').slice(0, 19))
             + '</span></div>').join('')
         + '</span></div>'
-      + '<div><span class="dl">Snooze</span><span class="dv">' + snooze + '</span></div>'
+      + '<div><span class="dl">Snooze</span><span class="dv">'
+        + snoozeControl(d, id) + '</span></div>'
       + '<div><span class="dl">Actions</span><span class="dv">' + actions + '</span></div>'
       + '</div>'
       + '<div class="detail-sensors"><span class="dl">All sensors</span>'
@@ -247,8 +275,14 @@ function renderRow(d) {
       + '</td></tr>'
     ) : '';
 
+    // A device that is faulty and NOT snoozed keeps a persistent highlight.
+    // This is what "flash until snoozed" means in practice: the flash
+    // animation is finite, the colour is not, and it clears when the
+    // operator snoozes.
+    const faulty = d.status && d.status !== 'ONLINE' && !snoozed;
     const rowClass = 'row-compact'
         + (changed ? ' row-changed' : '')
+        + (faulty ? ' row-changed-persist' : '')
         + (d.status === 'OFFLINE' ? ' row-offline' : '')
         + (d.status === 'DEGRADED' ? ' row-degraded' : '')
         + (d.status === 'STALLED' ? ' row-stalled' : '');
@@ -278,7 +312,7 @@ function renderRow(d) {
         + '<td class="col-sensors">' + sensors + '</td>'
         + '<td class="col-lastseen ts">'
           + (d.last_seen || 'Never').slice(5, 19) + '</td>'
-        + '<td class="col-snooze">' + snooze + '</td>'
+        + '<td class="col-snooze">' + snoozeControl(d, id) + '</td>'
         + '<td class="col-actions">'
           + '<button class="btn btn-sm btn-danger" onclick="event.stopPropagation();restart(\''
           + escapeHtml(d.device_id) + '\')">Restart</button>'
@@ -424,12 +458,18 @@ async function refresh() {
     } catch (e) { console.error(e); }
 }
 
-// Feature 2: a changed row flashes briefly, then settles. Without this the
-// highlight would persist for as long as the fault lasts, which defeats the
-// point - a device that has been broken for an hour should look calm.
+// Feature 2: the row FLASHES for FLASH_MS, then settles to a persistent
+// highlight while the fault is still unhandled. The highlight is removed
+// once the operator snoozes the device - renderRow re-derives the class
+// on every poll from (status changed, not snoozed), so it disappears by
+// itself when the device is snoozed.
+//
+// The CSS animation itself is finite (so it does not strobe forever); the
+// persistent colour comes from the row-changed-persist class.
 setTimeout(() => {
     document.querySelectorAll('tr.row-changed').forEach(tr => {
         tr.classList.remove('row-changed');
+        tr.classList.add('row-changed-persist');
     });
 }, FLASH_MS);
 
@@ -437,8 +477,24 @@ window.restart = async function (deviceId) {
     if (!confirm('Restart ' + deviceId + '?')) return;
     const r = await fetch('/api/restart/' + encodeURIComponent(deviceId),
         { method: 'POST', headers: { 'X-CSRFToken': window.CSRF_TOKEN || '' } });
-    const data = await r.json();
-    if (!data.ok) alert('Restart failed: ' + (data.error || 'unknown'));
+    let data = {};
+    try { data = await r.json(); } catch (e) { /* non-JSON error body */ }
+    if (r.status === 401) { window.location = '/login'; return; }
+    if (!data.ok) {
+        // Distinguish "the command never left" from "the command left but
+        // nothing on the device is listening for it" - the second needs a
+        // firmware change, the first needs a look at the broker.
+        if (data.published) {
+            alert('Command sent to the broker, but ' + deviceId + ' will NOT '
+                + 'reboot.\n\n'
+                + (data.error || '')
+                + '\n\nThis device\'s firmware has no MQTT button, so a '
+                + 'restart command has nothing to act on.');
+        } else {
+            alert('Restart failed: ' + (data.error || 'unknown'));
+        }
+        return;
+    }
     refresh();
 };
 
