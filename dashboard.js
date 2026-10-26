@@ -206,6 +206,20 @@ function snoozeControl(d, id) {
 // discovery payloads and tells us which devices are restartable. Where a
 // device is not restartable the button is disabled with the reason, rather
 // than offered and silently doing nothing.
+// The number of columns in the devices table, read from the real header.
+//
+// The detail row spans the full width with a colspan. That value used to
+// be hardcoded, and when the header had 11 columns while the detail said
+// 12 the browser created a phantom column - which showed up as a stray
+// narrow column at the right edge of every expanded row. Reading it from
+// the header means it can never drift out of step again.
+function tableColumnCount() {
+    const th = document.querySelector('table.devices thead tr th');
+    if (!th) return 12;
+    const row = th.closest('tr');
+    return row ? row.children.length : 12;
+}
+
 function restartButton(d) {
     if (d.can_restart === false) {
         return '<button class="btn btn-sm btn-muted" disabled '
@@ -269,7 +283,7 @@ function renderRow(d) {
     // --- Detail (shown only when the row is expanded).
     const detail = isOpen ? (
         '<tr class="detail-row" data-detail-for="' + escapeHtml(d.device_id) + '">'
-      + '<td colspan="12">'
+      + '<td colspan="' + tableColumnCount() + '">'
       + '<div class="detail-grid">'
       + '<div><span class="dl">Location / Role</span><span class="dv">'
         + escapeHtml(loc || '\u2014') + escapeHtml(role) + '</span></div>'
@@ -331,6 +345,7 @@ function renderRow(d) {
         + '<td class="col-sensors">' + sensors + '</td>'
         + '<td class="col-lastseen ts">'
           + (d.last_seen || 'Never').slice(5, 19) + '</td>'
+        + '<td class="col-heartbeat num">' + (d.last_heartbeat_value ?? '--') + '</td>'
         + '<td class="col-snooze">' + snoozeControl(d, id) + '</td>'
         + '<td class="col-actions">'
           + restartButton(d)
@@ -364,17 +379,30 @@ window.toggleRow = function (deviceId) {
 
 function applyFilter() {
     const q = (document.getElementById('search').value || '').toLowerCase().trim();
-    const rows = document.querySelectorAll('#devices-tbody tr');
+    const tbody = document.getElementById('devices-tbody');
+    // Only the DEVICE rows are counted and filtered. A detail row is not a
+    // device: it has no data-device, so it must never be counted in the
+    // total, and it must be hidden or shown together with the device it
+    // belongs to - otherwise a filtered-out device leaves its expanded
+    // panel stranded in the table.
+    const rows = Array.from(tbody.querySelectorAll('tr:not(.detail-row)'));
     let visible = 0;
     rows.forEach(r => {
-        if (!q) { r.style.display = ''; visible++; return; }
-        const haystack = (r.dataset.device + ' ' + r.dataset.location + ' '
-            + r.dataset.role + ' ' + r.dataset.status + ' ' + r.dataset.reason
-            + ' ' + r.dataset.temp
-            + ' ' + r.dataset.hum + ' ' + r.dataset.co2
-            + ' ' + (r.textContent || '')).toLowerCase();
-        r.style.display = haystack.includes(q) ? '' : 'none';
-        if (r.style.display !== 'none') visible++;
+        let show = true;
+        if (q) {
+            const haystack = (r.dataset.device + ' ' + r.dataset.location + ' '
+                + r.dataset.role + ' ' + r.dataset.status + ' ' + r.dataset.reason
+                + ' ' + r.dataset.temp
+                + ' ' + r.dataset.hum + ' ' + r.dataset.co2
+                + ' ' + (r.textContent || '')).toLowerCase();
+            show = haystack.includes(q);
+        }
+        r.style.display = show ? '' : 'none';
+        if (show) visible++;
+        // Keep the detail row in step with its device.
+        const detail = tbody.querySelector('tr.detail-row[data-detail-for="'
+            + r.dataset.device + '"]');
+        if (detail) detail.style.display = show ? '' : 'none';
     });
     document.getElementById('row-count').textContent =
         rows.length === 0 ? '' : (visible + ' of ' + rows.length);
@@ -383,7 +411,12 @@ function applyFilter() {
 function applySort() {
     if (!SORT_KEY) return;
     const tbody = document.getElementById('devices-tbody');
-    const rows = Array.from(tbody.querySelectorAll('tr'));
+    // Only the DEVICE rows are sortable. A detail row is not a device and
+    // has no sort values, so including it here detached it from its
+    // device and left the expanded panel stranded at the bottom of the
+    // table - the row and its detail then looked like two separate
+    // devices.
+    const rows = Array.from(tbody.querySelectorAll('tr:not(.detail-row)'));
     const key = SORT_KEY;
     const dir = SORT_DIR === 'asc' ? 1 : -1;
     rows.sort((a, b) => {
@@ -397,7 +430,15 @@ function applySort() {
         if (bv === '' && av !== '') return -1;
         return String(av).localeCompare(String(bv)) * dir;
     });
-    rows.forEach(r => tbody.appendChild(r));
+    // Re-append each device row, and immediately after it the detail row
+    // that belongs to it, so the expanded panel always stays attached to
+    // its device.
+    rows.forEach(r => {
+        tbody.appendChild(r);
+        const detail = tbody.querySelector('tr.detail-row[data-detail-for="'
+            + r.dataset.device + '"]');
+        if (detail) tbody.appendChild(detail);
+    });
     document.querySelectorAll('th[data-sort]').forEach(th => {
         const arrow = th.dataset.sort === key
             ? (SORT_DIR === 'asc' ? ' \u2191' : ' \u2193') : '';
@@ -449,7 +490,7 @@ async function refresh() {
         if (typeof data.flatline_limit === 'number') FLATLINE_LIMIT = data.flatline_limit;
         const tbody = document.getElementById('devices-tbody');
         if (!ALL_DEVICES.length) {
-            tbody.innerHTML = '<tr><td colspan="12" class="muted">'
+            tbody.innerHTML = '<tr><td colspan="' + tableColumnCount() + '" class="muted">'
                 + 'No devices yet &mdash; waiting for MQTT traffic&hellip;</td></tr>';
             document.getElementById('row-count').textContent = '';
             return;

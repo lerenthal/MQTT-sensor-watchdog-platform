@@ -248,3 +248,47 @@ single Python process, packaged in Docker Compose. Schema v1
   device reboots (heartbeat reset plus the LWT status cycle).
 - `tools/probe_restart.py` - discovers a device's real restart topic and
   tests it directly.
+
+## 2026-10-26 - Heartbeat column, shared alarm controls, detail row fixes
+
+### Fixed
+- **Expanded detail rows detached from their device.** The sort selected
+  every <tr> in the table, including the detail row, and re-appended
+  them in sorted order. A detail row has no sort values, so it was
+  appended to the bottom of the table and the device plus its expanded
+  panel looked like two separate devices. The sort now selects only the
+  device rows and re-attaches each detail row to its own device.
+- **The filter could leave a hidden device's detail panel on screen, and
+  counted detail rows as devices.** Both now operate on device rows only,
+  and a detail row is always shown or hidden together with its device.
+- **Phantom column at the right edge of the table.** The detail row
+  spanned 12 columns while the header had 11, so the browser invented a
+  column. The server-rendered "Loading..." placeholder had the same
+  problem with 11. Both colspans are now derived: the client counts the
+  real header at runtime, the server counts a shared header constant.
+- The Dockerfile did not copy `alarm.js`, so the shared alarm module was
+  missing from the image entirely.
+
+### Added
+- **Heartbeat column** (HB) back in the device table, between Last Seen
+  and Snooze, and sortable. It shows the counter the watchdog itself uses
+  to judge a stall.
+- **Alarm controls on every page.** The TEST / MUTE / tone-style control
+  now sits in the header ribbon of the dashboard as well as the wall
+  board, so the alarm can be tested and muted from any tab. The engine
+  moved into a new shared `alarm.js` - the tone list is defined once and
+  both pages use it.
+- **MUTE** silences the local alarm only. It deliberately does not stop
+  the Telegram paging or the wall board's visual alarm: a muting mistake
+  on a screen must never quiet the phone in someone's pocket.
+- `pilot-ops.sh rebuild` - the pilot needs it for the same reason the
+  live instance does.
+- `tools/test_table_structure.js` - asserts the header and the row
+  renderer produce the same columns in the same order, and that no
+  hardcoded colspan remains.
+- `tools/test_row_handling.js` - asserts that no code path treats a
+  detail row as a device.
+
+### Changed
+- The front-end assets are baked into the image, so a JS change needs an
+  explicit rebuild. Documented in the operations guide.

@@ -275,3 +275,23 @@ action for a device that will not start. It is deliberately not wired to
 any button in this app: a stray click on a wall display should never put
 a production sensor into safe mode.
 
+## Front-end changes need a rebuild
+
+`app.py`, `dashboard.js`, `wallboard.js` and `alarm.js` are **baked into
+the Docker image**, not bind-mounted. Editing one of them on disk
+changes nothing until the image is rebuilt.
+
+```bash
+./ops.sh rebuild              # live instance
+cd pilot && ./pilot-ops.sh rebuild
+```
+
+`./ops.sh restart` runs `docker compose up -d --build`, which reuses
+Docker's layer cache. That is usually enough for a Python-only change,
+but a change to a JS file that does not alter the COPY layer's checksum
+can be left out of the image. When a front-end change does not appear,
+rebuild explicitly.
+
+**The pilot instance has its own `rebuild` command** for the same
+reason. Without it the pilot would silently run stale front-end code.
+

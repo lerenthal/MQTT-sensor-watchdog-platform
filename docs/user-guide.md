@@ -439,3 +439,52 @@ start, and it is deliberately not wired to any button here - a stray
 click on a wall display should not put a production sensor into safe
 mode.
 
+## Alarm controls (on every page)
+
+The **alarm control** sits in the header ribbon of every page - the device
+table, the audit log, the admin pages and the wall board. It is not tied
+to the wall board, because the alarm belongs to the operator, not to one
+screen.
+
+```
+ALARM   [🔊 TEST]  [🔊 MUTE]  [style ▾]
+```
+
+**TEST** plays the alarm tone so you can confirm the facility can be
+heard. It is a toggle: press once and the tone repeats while the screen
+flashes; press again and it stops. The button turns amber and reads
+**STOP TEST** while it is running.
+
+**MUTE** silences the alarm on that screen. It does **not** stop the
+Telegram paging, and it does not stop the visual alarm on the wall
+board. A muting mistake on a screen should never quiet the phone in
+someone's pocket.
+
+**The style dropdown** auditions the five tones immediately. It does not
+change the site default - that is set in the config
+(`watchdog.buzzer_style`) and applies to every screen.
+
+Mute and the chosen style are remembered per browser, so the wall board
+and the operator's own machine keep their own settings.
+
+## The Heartbeat column
+
+The **HB** column shows the device's heartbeat counter - the value that
+proves the device is alive and publishing. It is the same counter the
+watchdog itself uses to decide whether a device has stalled, so a
+running counter next to a STALLED status is a strong hint that the
+device is publishing but the *reading* is stuck, rather than the device
+being dead.
+
+It is sortable, like every other column.
+
+## Expanded rows
+
+Clicking a device row expands a detail panel below it with the full
+information: location, status, last seen, heartbeat, the complete fault
+list with timestamps, snooze state, the action buttons and every sensor.
+
+The detail panel always stays attached to its device. Sorting or
+filtering the table moves the device row and its detail panel together,
+and the row count in the toolbar counts devices, not rows.
+

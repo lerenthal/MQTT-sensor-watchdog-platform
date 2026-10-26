@@ -68,10 +68,10 @@ has_snoozed_guard = "snoozed" in js
 results.append(("3. row-changed-persist class", has_persist))
 results.append(("3. snoozed devices excluded from flash", has_snoozed_guard))
 
-# ---- 4. Wall board TEST ALARM button.
+# ---- 4. The alarm control is present on the wall board.
 wb = get("/wallboard")
-has_test = "TEST ALARM" in wb and "beepTest()" in wb
-results.append(("4. wallboard TEST ALARM button", has_test))
+has_test = "alarm-test-btn" in wb and "AlarmUI.mount" in wb
+results.append(("4. wallboard alarm TEST control", has_test))
 
 # ---- 5. Restart API honesty.
 tok = re.search(r'CSRF_TOKEN = "([a-f0-9]+)"', nav)
@@ -111,20 +111,22 @@ if token:
     results.append(("1. ignore hides the device", hidden))
     results.append(("1. resume restores the device", back))
 
-# ---- 6. The alarm toggle and the five styles.
-wb = get("/wallboard")
-has_toggle = "STOP ALARM" in wb and "beepTest()" in wb
-results.append(("6. alarm button is a toggle (STOP ALARM present)", has_toggle))
+# ---- 6. The alarm toggle and the five styles, from the shared module.
+has_toggle = "STOP TEST" in wb and "toggleTest" in wb
+results.append(("6. alarm button is a toggle (STOP TEST present)", has_toggle))
 styles = ["chime", "warble", "siren", "klaxon", "continuous"]
-present = [st for st in styles if f'value="{st}"' in wb]
-results.append((f"6. all five buzzer styles in the dropdown ({len(present)}/5)",
+present = [st for st in styles if f"value=\"{st}\"" in wb or f"{{ f: {st[0]}" in wb]
+# The styles live in the shared module as a JS object, not as <option>
+# markup, so check the object keys.
+present = [st for st in styles if f"    {st}: {{" in wb]
+results.append((f"6. all five buzzer styles defined ({len(present)}/5)",
                 len(present) == 5))
-results.append(("6. style dropdown wired to setBuzzStyle",
-                "setBuzzStyle(this.value)" in wb))
+results.append(("6. the style dropdown is rendered by the shared module",
+                "alarm-style-select" in wb))
 results.append(("6. site default style injected",
                 "window.SITE_BUZZ_STYLE" in wb))
 results.append(("6. clock in the top ribbon", 'id="clock"' in wb))
-results.append(("6. buzzer button in the top ribbon", 'id="beep-btn"' in wb))
+results.append(("6. alarm control in the top ribbon", 'id="alarm-ribbon"' in wb))
 
 # ---- 7. Configuration help items.
 admin = get("/admin/config")
@@ -165,6 +167,42 @@ if tok:
     results.append((f"9. unknown device restart -> 404 (got {st})", st == 404))
     results.append(("9. unknown device restart does not claim success",
                     payload.get("ok") is False))
+
+# ---- 10. The alarm control is on the DASHBOARD ribbon, not only the
+#         wall board, and it has TEST and MUTE.
+dash = get("/")
+results.append(("10. alarm ribbon on the dashboard header",
+                'id="alarm-ribbon"' in dash))
+results.append(("10. alarm.js loaded on the dashboard",
+                "alarmAudio" in dash and "AlarmUI.mount" in dash))
+wall = get("/wallboard")
+results.append(("10. alarm ribbon on the wall board",
+                'id="alarm-ribbon"' in wall))
+# The shared module must define the TEST and MUTE controls.
+results.append(("10. shared module has a TEST control",
+                "alarm-test-btn" in dash))
+results.append(("10. shared module has a MUTE control",
+                "alarm-mute-btn" in dash))
+results.append(("10. shared module has the style dropdown",
+                "alarm-style-select" in dash))
+# The style list must be in the shared module, not duplicated.
+results.append(("10. the tone list is defined once, in the shared module",
+                dash.count("Chime (gentle)") <= 1))
+
+# ---- 11. The heartbeat column.
+rows_js = get("/")  # the page embeds dashboard.js
+results.append(("11. Heartbeat column in the header",
+                'class="col-heartbeat"' in dash))
+results.append(("11. Heartbeat column in the compact row",
+                "col-heartbeat num" in rows_js))
+# The devices table's own rendering must not hardcode a colspan. Other
+# tables on the page (audit log, config history) legitimately have their
+# own.
+_dev_js = rows_js
+_dev_marker = _dev_js.find("tableColumnCount")
+_rowspan = _dev_js[max(0, _dev_marker - 4000):_dev_marker + 2000] if _dev_marker > 0 else _dev_js
+results.append(("11. the devices table derives its colspan",
+                'colspan="' not in _rowspan))
 
 print()
 print("=== feature verification ===")

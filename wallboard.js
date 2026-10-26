@@ -35,328 +35,43 @@ let alarmSince = 0;      // ms timestamp when the current (un-dismissed) run beg
 // offline, and browsers only permit it after a user gesture on the page.
 // Browsers block audio before any interaction, so we arm it on first click
 // or keypress and remember that it is armed.
-let audioCtx = null;
-let audioArmed = false;
+// The repeating alarm timer for an unacknowledged fault. The audio engine
+// itself lives in alarm.js, shared with the operator dashboard, so the tone
+// and the mute state are the same on both screens.
 let beepTimer = null;
-
-function armAudio() {
-    if (audioArmed) return;
-    try {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        audioArmed = true;
-        // A click anywhere counts as the gesture.
-        document.removeEventListener('click', armAudio);
-        document.removeEventListener('keydown', armAudio);
-        updateAudioWarning();
-    } catch (e) {
-        audioArmed = false;
-        updateAudioWarning();
-    }
-}
-document.addEventListener('click', armAudio);
-document.addEventListener('keydown', armAudio);
-
-// The browser blocks audio until a real user gesture, so on a kiosk TV the
-// alarm would be silent without this prompt. Show a persistent banner until
-// the context is actually RUNNING (not merely created - a created context
-// can still be suspended).
-function updateAudioWarning() {
-    const el = document.getElementById('audio-warn');
-    if (!el) return;
-    const running = audioCtx && audioCtx.state === 'running';
-    if (audioCtx && audioCtx.state === 'suspended') {
-        audioCtx.resume().then(updateAudioWarning).catch(() => {});
-    }
-    el.style.display = (audioArmed && running) ? 'none' : '';
-}
-
-// Check periodically: some browsers create the context suspended and only
-// resume it on a later gesture.
-setInterval(updateAudioWarning, 2000);
-window.addEventListener('DOMContentLoaded', updateAudioWarning);
-
-// ---------------------------------------------------------------------------
-// Buzzer styles
-//
-// A facility alarm has to be noticed, but it also has to be tolerable - a
-// tone that is too aggressive gets muted and then nobody hears the real
-// one. Five styles, from a polite chime to a full klaxon, so the site can
-// pick the level that matches its noise floor and shift.
-//
-//   chime    - two soft rising notes. Almost polite. Won't carry across a
-//              noisy room.
-//   warble   - a fast alternating warble. Noticeable, still not alarming.
-//   siren    - the classic rising/falling two-tone siren. This is the
-//              default: loud enough to carry, patterned enough to read as
-//              "alarm" and not "equipment noise".
-//   klaxon   - a low braying tone with a harsh harmonic. Hard to ignore.
-//   continuous
-//            - an unbroken tone, the most intrusive option. For a site
-//              where a missed alarm is a GMP incident rather than an
-//              inconvenience.
-//
-// Each style is a list of tones: {f: Hz, t: seconds, gain: 0..1, wave:
-// oscillator type}. A tone with f = 0 is a rest.
-// ---------------------------------------------------------------------------
-const BUZZ_STYLES = {
-    chime: {
-        label: 'Chime (gentle)',
-        gap: 0.5,
-        tones: [
-            { f: 660, t: 0.18, gain: 0.16, wave: 'sine' },
-            { f: 990, t: 0.30, gain: 0.16, wave: 'sine' },
-        ],
-    },
-    warble: {
-        label: 'Warble (noticeable)',
-        gap: 0.25,
-        tones: [
-            { f: 740, t: 0.10, gain: 0.22, wave: 'square' },
-            { f: 560, t: 0.10, gain: 0.22, wave: 'square' },
-            { f: 740, t: 0.10, gain: 0.22, wave: 'square' },
-            { f: 560, t: 0.10, gain: 0.22, wave: 'square' },
-        ],
-    },
-    siren: {
-        label: 'Siren (default - recommended)',
-        gap: 0.35,
-        tones: [
-            { f: 800, t: 0.22, gain: 0.26, wave: 'square' },
-            { f: 1000, t: 0.22, gain: 0.26, wave: 'square' },
-            { f: 1200, t: 0.22, gain: 0.26, wave: 'square' },
-            { f: 1000, t: 0.22, gain: 0.26, wave: 'square' },
-        ],
-    },
-    klaxon: {
-        label: 'Klaxon (loud, harsh)',
-        gap: 0.30,
-        tones: [
-            { f: 300, t: 0.55, gain: 0.34, wave: 'sawtooth' },
-            { f: 452, t: 0.55, gain: 0.26, wave: 'sawtooth' },
-        ],
-    },
-    continuous: {
-        label: 'Continuous (most intrusive)',
-        gap: 0.15,
-        tones: [
-            { f: 620, t: 1.60, gain: 0.30, wave: 'square' },
-            { f: 933, t: 1.60, gain: 0.24, wave: 'sawtooth' },
-        ],
-    },
-};
-
-const DEFAULT_BUZZ_STYLE = 'siren';
-
-// The active style. Set from the server config, and overridable per
-// session with setBuzzStyle() so an operator can audition a style without
-// changing the site default.
-let activeStyle = DEFAULT_BUZZ_STYLE;
-
-function styleDef() {
-    return BUZZ_STYLES[activeStyle] || BUZZ_STYLES[DEFAULT_BUZZ_STYLE];
-}
-
-// Play the alarm tone. Returns true if sound was actually scheduled.
-// `times` is how many bursts to play.
-function beep(times) {
-    if (!audioArmed || !audioCtx) return false;   // no audio hardware: visual only
-    // A context can be created but left suspended by the browser's autoplay
-    // policy. Resume it - this is the call that actually unblocks sound once
-    // a real user gesture has happened.
-    if (audioCtx.state === 'suspended') {
-        audioCtx.resume().catch(() => {});
-    }
-    const st = styleDef();
-    const cycle = st.tones.reduce((a, t) => a + t.t, 0) + st.gap;
-    for (let i = 0; i < times; i++) {
-        let t0 = audioCtx.currentTime + i * cycle;
-        st.tones.forEach((tone) => {
-            const start = t0;
-            const osc = audioCtx.createOscillator();
-            const gain = audioCtx.createGain();
-            osc.type = tone.wave || 'square';
-            osc.frequency.value = tone.f;
-            gain.gain.setValueAtTime(0.0001, start);
-            gain.gain.exponentialRampToValueAtTime(tone.gain, start + 0.02);
-            gain.gain.exponentialRampToValueAtTime(0.0001, start + tone.t);
-            osc.connect(gain).connect(audioCtx.destination);
-            osc.start(start);
-            osc.stop(start + tone.t + 0.02);
-            t0 += tone.t;
-        });
-    }
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// BEEP TEST - a toggle, not a one-shot.
-//
-// Press once: the test alarm starts and keeps going (tone + screen flash).
-// Press again: it stops.
-//
-// A one-shot test that cannot be stopped is worse than useless - the
-// operator ends up hunting for the TV remote to mute it. The button
-// therefore shows what it will do next ("TEST ALARM" when idle, "STOP
-// ALARM" while running) and always offers the stop action.
-// ---------------------------------------------------------------------------
-let testAlarmTimer = null;   // repeating timer for the sustained test tone
-let testAlarmFlashTimer = null;
-let testAlarmOn = false;
-
-function setStatus(text, cls) {
-    const status = document.getElementById('beep-status');
-    if (!status) return;
-    status.textContent = text;
-    status.className = 'beep-status ' + (cls || '');
-}
-
-function updateBeepButton(on) {
-    const btn = document.getElementById('beep-btn');
-    if (!btn) return;
-    btn.classList.toggle('on', !!on);
-    btn.innerHTML = on
-        ? '&#128266; STOP ALARM'
-        : '&#128266; TEST ALARM';
-}
-
-function startTestAlarm() {
-    testAlarmOn = true;
-    updateBeepButton(true);
-
-    // Play immediately, then keep repeating so the operator can confirm it
-    // is sustained rather than a single blip.
-    beep(1);
-    testAlarmTimer = setInterval(() => beep(1), 1500);
-
-    // Keep the screen flashing too, so the visual alarm is verifiable on a
-    // display with no speakers.
-    const stage = document.getElementById('stage');
-    if (stage) {
-        stage.classList.add('beep-test-flash');
-        testAlarmFlashTimer = setInterval(() => {
-            stage.classList.remove('beep-test-flash');
-            // Force a reflow so the animation restarts.
-            void stage.offsetWidth;
-            stage.classList.add('beep-test-flash');
-        }, 1200);
-    }
-}
-
-function stopTestAlarm() {
-    testAlarmOn = false;
-    updateBeepButton(false);
-    if (testAlarmTimer) { clearInterval(testAlarmTimer); testAlarmTimer = null; }
-    if (testAlarmFlashTimer) { clearInterval(testAlarmFlashTimer); testAlarmFlashTimer = null; }
-    const stage = document.getElementById('stage');
-    if (stage) stage.classList.remove('beep-test-flash');
-    setStatus('Alarm stopped.', '');
-}
-
-// BEEP TEST. Plays the same tone the alarm uses, so an operator can confirm
-// the screen can actually make a sound before they rely on it. Also reports
-// WHY it might be silent, because "no sound" is the single most likely
-// reason a wall display is not doing its job.
-window.beepTest = function () {
-    // Tapping the button again stops whatever is running. Checked first so
-    // the stop action always works, even if audio failed to arm.
-    if (testAlarmOn) {
-        stopTestAlarm();
-        return;
-    }
-
-    // This click IS the user gesture the browser needs, so arm first.
-    armAudio();
-
-    if (!audioCtx) {
-        setStatus('No Web Audio support in this browser - the alarm will be VISUAL ONLY.',
-                  'bad');
-        // Still flash the screen so the operator sees something happen.
-        startTestAlarm();
-        return;
-    }
-
-    if (audioCtx.state === 'suspended') {
-        audioCtx.resume().then(() => {
-            const ok = beep(1);
-            setStatus(ok
-                ? 'Playing - if you hear nothing, check the TV/system volume. Press again to stop.'
-                : 'Could not schedule audio.',
-                ok ? 'ok' : 'bad');
-            startTestAlarm();
-        }).catch((err) => {
-            setStatus('Audio blocked by the browser (' + (err && err.name || 'error')
-                      + '). Click the page once, then try again.', 'bad');
-            startTestAlarm();
-        });
-        return;
-    }
-
-    const ok = beep(1);
-    setStatus(ok
-        ? 'Playing - if you hear nothing, check the TV/system volume. Press again to stop.'
-        : 'Could not schedule audio.',
-        ok ? 'ok' : 'bad');
-    startTestAlarm();
-    updateAudioWarning();
-};
-
-// Briefly flash the whole screen, so the operator can also verify the
-// VISUAL alarm works even when the TV has no speakers.
-function flashTest() {
-    const stage = document.getElementById('stage');
-    if (!stage) return;
-    stage.classList.add('beep-test-flash');
-    setTimeout(() => stage.classList.remove('beep-test-flash'), 1500);
-}
-
-function stopBeep() {
-    if (beepTimer) { clearInterval(beepTimer); beepTimer = null; }
-}
 
 // ---------------------------------------------------------------------------
 // Style selection
 //
-// The site default is set in the config (watchdog.buzzer_style). An
+// The site default is set in the config (watchdog.buzzer_style). The
 // operator can audition a different style on this screen - handy when
 // deciding which one to make the site default - and the choice sticks in
 // this browser's local storage. It does NOT change the site default.
+//
+// The engine itself lives in alarm.js, shared with the operator dashboard.
 // ---------------------------------------------------------------------------
-const STYLE_KEY = 'watchdog-buzzer-style';
-
-function applyStyle(name, persist) {
-    if (!BUZZ_STYLES[name]) return;
-    activeStyle = name;
-    if (persist) {
-        try { localStorage.setItem(STYLE_KEY, name); } catch (e) { /* private mode */ }
-    }
-    const sel = document.getElementById('buzzer-style');
-    if (sel) sel.value = name;
-    const lbl = document.getElementById('buzzer-style-label');
-    if (lbl) lbl.textContent = BUZZ_STYLES[name].label;
+// The wall board writes status text into the shared alarm control.
+function setStatus(text, cls) {
+    const s = document.getElementById('alarm-status');
+    if (!s) return;
+    s.textContent = text;
+    s.className = 'alarm-status ' + (cls || '');
 }
 
 window.setBuzzStyle = function (name) {
-    applyStyle(name, true);
+    alarmAudio.setStyle(name, true);
     const st = BUZZ_STYLES[name];
     setStatus('Style: ' + (st ? st.label : name), 'ok');
-    // Audition it immediately so the operator hears what they selected.
-    armAudio();
-    beep(1);
+    alarmAudio.arm();
+    alarmAudio.play(1);
 };
 
-function initStyle() {
-    let name = DEFAULT_BUZZ_STYLE;
-    // Server-provided site default wins on a fresh browser.
-    if (window.SITE_BUZZ_STYLE && BUZZ_STYLES[window.SITE_BUZZ_STYLE]) {
-        name = window.SITE_BUZZ_STYLE;
-    }
-    // A local override (an audition) takes precedence over the site default.
-    try {
-        const saved = localStorage.getItem(STYLE_KEY);
-        if (saved && BUZZ_STYLES[saved]) name = saved;
-    } catch (e) { /* private mode */ }
-    applyStyle(name, false);
-}
+// The wall board mounts the shared alarm control. The ribbon markup is
+// rendered by the server; AlarmUI fills it with the TEST / MUTE buttons and
+// the style dropdown.
+document.addEventListener('DOMContentLoaded', function () {
+    AlarmUI.mount('alarm-ribbon');
+});
 
 // ---------------------------------------------------------------------------
 // Rendering
@@ -441,8 +156,8 @@ function render(faults, mqttOk, meta) {
 
     if (withinWindow) {
         stage.className = 'stage alarming';          // flashing (not auto-dismissed)
-        if (isNew) beep(ALARM.minFlashCount);        // one-shot on a new fault only
-        if (!beepTimer) beepTimer = setInterval(() => beep(2), ALARM.beepIntervalMs);
+        if (isNew) alarmAudio.play(ALARM.minFlashCount);        // one-shot on a new fault only
+        if (!beepTimer) beepTimer = setInterval(() => alarmAudio.play(2), ALARM.beepIntervalMs);
     } else {
         stage.className = 'stage alarming auto-dismissed';  // static, readable
         stopBeep();
@@ -471,11 +186,10 @@ async function poll() {
           + '<span class="crit-n">WATCHDOG UNREACHABLE</span></div>'
           + '<div class="alarm-sub">Cannot reach the monitoring service</div></div>';
         document.title = '!! WATCHDOG UNREACHABLE';
-        beep(3);
-        if (!beepTimer) beepTimer = setInterval(() => beep(2), ALARM.beepIntervalMs);
+        alarmAudio.play(3);
+        if (!beepTimer) beepTimer = setInterval(() => alarmAudio.play(2), ALARM.beepIntervalMs);
     }
 }
 
-initStyle();
 poll();
 setInterval(poll, window.REFRESH_SECONDS * 1000);

@@ -22,7 +22,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Application files (config and DB come in via bind mounts, not the image).
-COPY app.py schema.sql README.md dashboard.js wallboard.js /app/
+COPY app.py schema.sql README.md dashboard.js wallboard.js alarm.js /app/
 
 # Persistent / mountable paths. ops.sh bind-mounts ./data and ./config onto these.
 RUN mkdir -p /app/data /app/config /app/backups \

@@ -5,7 +5,7 @@
 # A second deployment of the same image, used to evaluate the app on the
 # facility big-screen TV before the production rollout.
 #
-#   ./pilot-ops.sh start | stop | restart | logs | status | backup | shell
+#   ./pilot-ops.sh start | stop | restart | rebuild | logs | status | backup | shell
 #
 # The pilot is fully independent of the live instance:
 #   * its own port (5060)
@@ -62,6 +62,17 @@ cmd_stop() {
 }
 
 cmd_restart() { cmd_stop || true; cmd_start; }
+
+# The application files (app.py, dashboard.js, wallboard.js, alarm.js) are
+# baked into the image rather than bind-mounted, so a change to them only
+# takes effect after a rebuild. Without this command the pilot silently
+# runs stale front-end code.
+cmd_rebuild() {
+    log "rebuilding image from scratch"
+    "${COMPOSE[@]}" build --no-cache
+    "${COMPOSE[@]}" up -d
+    cmd_status
+}
 
 cmd_logs() {
     if [[ "${1:-}" == "follow" ]]; then
@@ -123,6 +134,7 @@ case "$cmd" in
     start)    cmd_start ;;
     stop)     cmd_stop ;;
     restart)  cmd_restart ;;
+    rebuild)  cmd_rebuild ;;
     logs)     cmd_logs "${2:-}" ;;
     status)   cmd_status ;;
     backup)   cmd_backup ;;

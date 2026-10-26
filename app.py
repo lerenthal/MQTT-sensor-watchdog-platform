@@ -1833,6 +1833,50 @@ tr.row-changed-persist td:first-child { box-shadow: inset 3px 0 0 var(--warning)
 .snooze-ctl .dropdown-menu { right: 0; }
 .table.devices td.col-actions { white-space: nowrap; }
 
+/* ---------------------------------------------------------------------------
+   Alarm controls (shared by the dashboard and the wall board)
+
+   These are operator controls, not dashboard content. They sit in the
+   header ribbon on every page so that the alarm can be tested and muted
+   from wherever the operator happens to be looking.
+   --------------------------------------------------------------------------- */
+.alarm-ribbon {
+    display: inline-flex; align-items: center; gap: .35rem;
+    padding: .2rem .35rem; border: 1px solid var(--border);
+    border-radius: 8px; background: rgba(127,127,127,.06);
+}
+.alarm-ctl-label {
+    font-size: .7rem; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted-foreground); font-weight: 700; padding: 0 .2rem;
+}
+.alarm-btn {
+    background: #1f2937; color: #fbbf24; border: 1px solid #3d4b60;
+    border-radius: 6px; padding: .25rem .5rem; font-size: .78rem;
+    font-weight: 700; cursor: pointer; font-family: inherit;
+    white-space: nowrap;
+}
+.alarm-btn:hover { border-color: #fbbf24; }
+.alarm-btn.on { background: #fbbf24; color: #1f2937; border-color: #fbbf24; }
+.alarm-btn.muted { background: #4a1414; color: #f87171; border-color: #7f1d1d; }
+.alarm-style {
+    background: #1f2937; color: #e6edf3; border: 1px solid #3d4b60;
+    border-radius: 6px; padding: .25rem .3rem; font-size: .78rem;
+    font-family: inherit; cursor: pointer; max-width: 13rem;
+}
+.alarm-style:hover { border-color: #fbbf24; }
+.alarm-status {
+    font-size: .72rem; color: var(--muted-foreground);
+    max-width: 22ch; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis;
+}
+.alarm-status.ok { color: #4ade80; }
+.alarm-status.bad { color: #f87171; }
+/* On the wall board the ribbon is dark, so the label needs to be legible
+   against it rather than against the page background. */
+.bar .alarm-ribbon { background: #1f2a37; border-color: #2d3a4d; }
+.bar .alarm-ctl-label { color: #7d8590; }
+
+
 /* Configuration help items. Each key is a collapsible summary so the
    reference stays scannable. */
 .help-list { display: flex; flex-direction: column; gap: .35rem; }
@@ -1900,6 +1944,7 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
 .col-reason    { width: 20%;  }
 .col-sensors   { width: 13%;  }
 .col-lastseen  { width: 8%;   }
+.col-heartbeat { width: 5%;   }
 .col-snooze    { width: 10%;  }
 .col-actions   { width: 6%;   }
 /* Values are tabular so digits line up column to column. */
@@ -1910,7 +1955,8 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
     .table.devices { font-size: .78rem; }
     .table.devices th, .table.devices td { padding: .4rem .35rem; }
     .col-lastseen { display: none; }
-    .col-device   { width: 17%; }
+    .col-heartbeat { display: none; }
+    .col-device   { width: 18%; }
     .col-location { width: 12%; }
     .col-status   { width: 11%; }
     .col-reason   { width: 28%; }
@@ -2035,6 +2081,27 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); ou
 }
 """
 
+# The devices table header, kept as a module-level constant so the column
+# count can be derived from it. A hardcoded colspan that drifts from the
+# header makes the browser invent a phantom column.
+_DEVICES_TABLE_HEADER = """        <th class="col-device"    data-sort="device">Device <span class="sort-arrow"></span></th>
+        <th class="col-location"  data-sort="location">Loc / Role <span class="sort-arrow"></span></th>
+        <th class="col-status"    data-sort="status">Status <span class="sort-arrow"></span></th>
+        <th class="col-temp"      data-sort="temp">°C <span class="sort-arrow"></span></th>
+        <th class="col-hum"       data-sort="hum">RH% <span class="sort-arrow"></span></th>
+        <th class="col-co2"       data-sort="co2">CO2 <span class="sort-arrow"></span></th>
+        <th class="col-reason"    data-sort="reason">Reason <span class="sort-arrow"></span></th>
+        <th class="col-sensors">Sensors</th>
+        <th class="col-lastseen"  data-sort="lastseen">Last Seen <span class="sort-arrow"></span></th>
+        <th class="col-heartbeat" data-sort="heartbeat">HB <span class="sort-arrow"></span></th>
+        <th class="col-snooze">Snooze</th>
+        <th class="col-actions">Actions</th>"""
+
+
+def _devices_column_count():
+    """The number of columns in the devices table, counted from the header."""
+    return len(re.findall(r'<th[^>]*class="col-', _DEVICES_TABLE_HEADER))
+
 def _render_layout(title, body, current_tab=None, wide=False):
     tabs = [
         ("devices", "Devices", "index"),
@@ -2053,6 +2120,7 @@ def _render_layout(title, body, current_tab=None, wide=False):
         user_chip = (
             f'<span class="user-chip">Signed in as <strong>{session["username"]}</strong> '
             f'<span class="muted">({session.get("role","operator")})</span></span>'
+            f'<span id="alarm-ribbon" class="alarm-ribbon"></span>'
             f'<button class="btn btn-sm" id="theme-toggle" title="Toggle theme">◐</button>'
             f'<a class="btn btn-sm" href="/logout">Logout</a>'
         )
@@ -2075,6 +2143,8 @@ def _render_layout(title, body, current_tab=None, wide=False):
 </div>
 <div class="container{" container-wide" if wide else ""}">{body}</div>
 <script>window.CSRF_TOKEN = "{_csrf_token()}";</script>
+<script>window.SITE_BUZZ_STYLE = "{_site_buzz_style()}";</script>
+<script>{ALARM_JS}</script>
 <script>
 (function(){{
   var t = localStorage.getItem('watchdog-theme') || 'light';
@@ -2090,6 +2160,11 @@ def _render_layout(title, body, current_tab=None, wide=False):
     document.querySelectorAll('.dropdown.open').forEach(function(d){{
       if (!d.contains(e.target)) d.classList.remove('open');
     }});
+  }});
+  // The alarm controls belong to the operator, not to one page: they are
+  // available on every tab, including the device table.
+  document.addEventListener('DOMContentLoaded', function(){{
+    AlarmUI.mount('alarm-ribbon');
   }});
 }})();
 </script>
@@ -2145,6 +2220,11 @@ def _load_js(name):
         log.warning("%s not found; that view will be non-interactive", name)
         return "console.error('%s missing');" % name
 
+# Shared alarm engine (tone styles, mute, test) used by both the wall
+# board and the operator dashboard. Defined before _render_layout, which
+# includes it in every page.
+ALARM_JS = _load_js("alarm.js")
+
 DASHBOARD_JS = _load_js("dashboard.js")
 WALLBOARD_JS = _load_js("wallboard.js")
 
@@ -2173,19 +2253,9 @@ def index():
   <div style="overflow-x:auto">
     <table class="table devices">
       <thead><tr>
-        <th class="col-device"    data-sort="device">Device <span class="sort-arrow"></span></th>
-        <th class="col-location"  data-sort="location">Loc / Role <span class="sort-arrow"></span></th>
-        <th class="col-status"    data-sort="status">Status <span class="sort-arrow"></span></th>
-        <th class="col-temp"      data-sort="temp">°C <span class="sort-arrow"></span></th>
-        <th class="col-hum"       data-sort="hum">RH% <span class="sort-arrow"></span></th>
-        <th class="col-co2"       data-sort="co2">CO2 <span class="sort-arrow"></span></th>
-        <th class="col-reason"    data-sort="reason">Reason <span class="sort-arrow"></span></th>
-        <th class="col-sensors">Sensors</th>
-        <th class="col-lastseen"  data-sort="lastseen">Last Seen <span class="sort-arrow"></span></th>
-        <th class="col-snooze">Snooze</th>
-        <th class="col-actions">Actions</th>
+{_DEVICES_TABLE_HEADER}
       </tr></thead>
-      <tbody id="devices-tbody"><tr><td colspan="11" class="muted">Loading…</td></tr></tbody>
+      <tbody id="devices-tbody"><tr><td colspan="{_devices_column_count()}" class="muted">Loading…</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -3722,7 +3792,6 @@ body {
     font-size: 1.5rem; font-weight: 800; font-variant-numeric: tabular-nums;
     color: #e6edf3; min-width: 6.5ch; text-align: right;
 }
-.beep-controls { margin-left: .5rem; }
 /* The style picker. Small on purpose - it is a setup control, not an
    alarm control. */
 .buzzer-style {
@@ -3731,32 +3800,6 @@ body {
     font-family: inherit; cursor: pointer;
 }
 .buzzer-style:hover { border-color: #fbbf24; }
-/* Beep test control. The operator must be able to find it on a TV across
-   a room, so it is deliberately large and high-contrast - it is the one
-   control that proves the wall display can raise an audible alarm. */
-.beep-controls { display: flex; align-items: center; gap: .6rem; }
-/* The browser blocks audio until a real user gesture. Until then the alarm
-   would be silent, which is the one failure mode a wall display must not
-   have. This banner says so explicitly instead of leaving the operator
-   wondering why the buzzer never sounds. */
-.audio-warn {
-    background: #4a3a14; color: #fbbf24; padding: .3rem .8rem;
-    border-radius: 999px; font-size: .85rem; font-weight: 600;
-    animation: pulse 1.6s infinite;
-}
-.beep-btn {
-    background: #1f2937; color: #fbbf24; border: 2px solid #fbbf24;
-    border-radius: 8px; padding: .45rem 1.1rem; font-size: 1.05rem;
-    font-weight: 800; letter-spacing: .04em;
-    cursor: pointer; font-family: inherit;
-}
-.beep-btn:hover { background: #fbbf24; color: #1f2937; }
-/* While the test alarm is running the button becomes the stop action. */
-.beep-btn.on { background: #fbbf24; color: #1f2937; animation: pulse 1s infinite; }
-.beep-btn.on:hover { background: #f87171; color: #1f2937; }
-.beep-status { font-size: .8rem; color: #7d8590; max-width: 34ch; }
-.beep-status.ok  { color: #4ade80; }
-.beep-status.bad { color: #f87171; }
 /* Brief full-screen flash used by the beep test, so the VISUAL alarm can be
    verified on a screen with no speakers. */
 @keyframes beepflash {
@@ -3811,23 +3854,8 @@ table.faults td { padding: .8rem; border-bottom: 1px solid #1a222c; }
 def wallboard():
     body = f"""<div class="bar">
   <h1>&#127812; Sensor Watchdog &mdash; Facility Board</h1>
-  <span id="audio-warn" class="audio-warn" style="display:none">
-    &#128266; Click anywhere to enable the alarm sound
-  </span>
   <span id="mqtt-state" class="mqtt down">BROKER ...</span>
-  <span class="beep-controls">
-    <button id="beep-btn" class="beep-btn" onclick="beepTest()"
-            title="Test the alarm - press once to start, press again to stop">&#128266; TEST ALARM</button>
-    <select id="buzzer-style" class="buzzer-style" onchange="setBuzzStyle(this.value)"
-            title="Alarm tone style">
-      <option value="chime">Chime (gentle)</option>
-      <option value="warble">Warble (noticeable)</option>
-      <option value="siren" selected>Siren (recommended)</option>
-      <option value="klaxon">Klaxon (loud, harsh)</option>
-      <option value="continuous">Continuous (most intrusive)</option>
-    </select>
-    <span id="beep-status" class="beep-status"></span>
-  </span>
+  <span id="alarm-ribbon" class="alarm-ribbon"></span>
   <span id="clock"></span>
 </div>
 <div id="stage" class="stage"></div>
@@ -3836,6 +3864,7 @@ window.REFRESH_SECONDS = 5;
 window.CSRF_TOKEN = "{_csrf_token()}";
 window.SITE_BUZZ_STYLE = "{_site_buzz_style()}";
 </script>
+<script>{ALARM_JS}</script>
 <script>{WALLBOARD_JS}</script>"""
     html_doc = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
