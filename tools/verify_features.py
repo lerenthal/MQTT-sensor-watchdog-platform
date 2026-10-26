@@ -86,11 +86,13 @@ if tok:
         payload = json.loads(body)
     except Exception:
         payload = {}
-    honest = (payload.get("published") is True
-               and payload.get("ok") is False
-               and status >= 400)
-    results.append((f"5. restart reports no-MQTT-button (HTTP {status})", honest))
-    if not honest:
+    # A device WITH a restart entity must report success AND name the real
+    # command topic - the topic it discovered, not a guess.
+    ok = (payload.get("ok") is True
+          and payload.get("topic", "").endswith("/command")
+          and status == 200)
+    results.append((f"5. restart of a restartable device succeeds (HTTP {status})", ok))
+    if not ok:
         print("      body:", body[:300])
 else:
     results.append(("5. restart API (no CSRF token found)", False))
@@ -130,6 +132,39 @@ n_help = admin.count('class="help-item"')
 results.append((f"7. configuration help items present ({n_help})", n_help >= 15))
 results.append(("7. help documents buzzer_style", "watchdog.buzzer_style" in admin))
 results.append(("7. help documents the MQTT client id", "mqtt.client_id" in admin))
+
+# ---- 8. The restart path: discovered topics, not a guessed one.
+topics = json.loads(get("/api/restart/topics"))
+results.append((f"8. restart topics discovered ({topics.get('count', 0)} devices)",
+                topics.get("count", 0) > 0))
+# No topic may be the old hardcoded guess.
+bad = [t for t in (topics.get("topics") or {}).values()
+       if t.endswith("/button/restart/cmd")]
+results.append(("8. no device uses the old hardcoded topic", not bad))
+# The topic must be the one the device actually publishes.
+sample = list((topics.get("topics") or {}).items())[:1]
+if sample:
+    dev, t = sample[0]
+    results.append((f"8. topic for {dev} is an entity command topic",
+                    t.endswith("/command")))
+
+devs = json.loads(get("/api/devices"))["devices"]
+res = [d for d in devs if d.get("can_restart")]
+results.append((f"8. devices report can_restart ({len(res)}/{len(devs)})",
+                len(res) == len(devs) and len(devs) > 0))
+
+# ---- 9. A restart for a device with no restart entity must 404, not
+#        claim success.
+tok = re.search(r'CSRF_TOKEN = "([a-f0-9]+)"', nav)
+if tok:
+    st, body = post("/api/restart/no-such-device-xyz", {"_csrf": tok.group(1)})
+    try:
+        payload = json.loads(body)
+    except Exception:
+        payload = {}
+    results.append((f"9. unknown device restart -> 404 (got {st})", st == 404))
+    results.append(("9. unknown device restart does not claim success",
+                    payload.get("ok") is False))
 
 print()
 print("=== feature verification ===")

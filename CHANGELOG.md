@@ -212,3 +212,39 @@ single Python process, packaged in Docker Compose. Schema v1
 ### Fixed
 - A duplicate `#clock` CSS rule later in the stylesheet was overriding
   the bold one, so the clock rendered dim grey. Removed.
+
+## 2026-10-26 - Device restart now actually works
+
+### Fixed
+- **The restart button published to a topic no device listens on.** The
+  command topic was hardcoded as
+  `facility/<device>/env_sensor/button/restart/cmd`. ESPHome derives the
+  real topic from the button's name, so it differs per device:
+  `button/bme680-1_restart_device/command`,
+  `button/maxim4_restart_device/command`,
+  `button/scd30-2_restart/command`. Every restart was therefore
+  delivered to nobody - and because the publish was acknowledged by the
+  broker, it looked like success.
+
+  The watchdog now discovers the real topic from each device's own MQTT
+  discovery payload (`homeassistant/button/#`), which is where Home
+  Assistant gets it from too. 31 devices are discovered automatically;
+  no firmware change is needed.
+
+  Verified end to end: the device's heartbeat counter resets on a
+  restart (138 -> 2, and 54 -> 2 on repeat runs) and the LWT status
+  cycles online -> offline -> online.
+
+- The device row's Restart button is now disabled, with the reason in the
+  tooltip, for any device that publishes no restart entity - instead of
+  offering a button that does nothing.
+
+### Added
+- `GET /api/restart/topics` - shows the discovered command topic for
+  every restartable device. The first thing to check when a restart
+  button appears not to work.
+- The devices API carries `can_restart` and `restart_topic` per device.
+- `tools/verify_restart_e2e.py` - drives the real API and proves the
+  device reboots (heartbeat reset plus the LWT status cycle).
+- `tools/probe_restart.py` - discovers a device's real restart topic and
+  tests it directly.

@@ -222,62 +222,56 @@ Before going live on a facility:
 
 ## Restarting a device from the dashboard
 
-The **Restart** button in a device row publishes `PRESS` to
-`facility/<device_id>/env_sensor/button/restart/cmd` with QoS 1 and waits
-for the broker to acknowledge it.
+The **Restart** button in a device row publishes `PRESS` to the device's
+own MQTT restart entity with QoS 1, and waits for the broker to
+acknowledge it. The device reboots: its heartbeat counter resets to zero
+and its LWT status cycles offline -> online.
 
-**The device will only reboot if its firmware has an MQTT button that
-listens on that topic.** A device whose ESPHome configuration declares
-`button: - platform: restart` WITHOUT an `mqtt:` block has a *local-only*
-button: it appears in the Home Assistant device page and can be pressed
-there, but it does not subscribe to MQTT and will ignore the command.
+**The command topic is discovered, not configured.** ESPHome derives the
+topic from the button's name, so it differs per device:
 
-The watchdog detects this and says so rather than reporting a false
-success:
-
-| Situation | HTTP | Body |
-|---|---|---|
-| Device has an MQTT button | 200 | `{"ok": true, "topic": ...}` |
-| Command reached the broker, device has no MQTT button | 502 | `{"ok": false, "published": true, "error": "...will NOT reboot..."}` |
-| Broker unreachable / not acknowledged | 502 | `{"ok": false, "error": "MQTT publish was not acknowledged..."}` |
-
-Both non-success cases are audited. The second is audited as
-`RESTART_COMMAND_UNACKNOWLEDGED` so the gap is visible in the audit log
-rather than only in a browser alert.
-
-### To make a device restartable
-
-Add an MQTT button to the device's ESPHome configuration:
-
-```yaml
-mqtt:
-  id: mqtt_client
-  broker: 10.10.17.11
-  ...
-button:
-  - platform: mqtt
-    id: restart_button
-    name: "Restart"
-    command_topic: button/restart/cmd
-    payload_press: "PRESS"
+```
+facility/bme680-1/env_sensor/button/bme680-1_restart_device/command
+facility/maxim4/env_sensor/button/maxim4_restart_device/command
+facility/scd30_2/env_sensor/button/scd30-2_restart/command
 ```
 
-The full topic the watchdog publishes to is
-`facility/<device_id>/env_sensor/button/restart/cmd`, so with the
-default ESPHome `mqtt:` prefix the `command_topic` above resolves to the
-right place. Verify with `mosquitto_sub -t 'facility/+/env_sensor/button/#'`
-- the device must publish a `.../button/<name>/state` topic, which is
-also the evidence the watchdog uses to decide the device is
-restartable.
+The watchdog subscribes to `homeassistant/button/#` at startup and reads
+the real topic from each device's discovery payload - the same place
+Home Assistant gets it from. **No firmware change is needed** for a
+device that already has a restart button, and a newly provisioned device
+is picked up automatically.
+
+A device that publishes no restart entity gets a disabled Restart button
+and a 404 from the API. The watchdog never claims a restart it could not
+deliver.
+
+To inspect what was discovered:
+
+```
+GET /api/restart/topics
+```
 
 ### Verifying a restart
 
-`./verify_restart.sh <service> <device_id>` publishes the command and
-watches the heartbeat counter. A reboot resets the counter, so the value
-drops sharply rather than continuing to increment.
+`./tools/verify_restart_e2e.py <base_url> <device>` drives the real API
+and proves the device reboots - it watches for the heartbeat reset and
+the status cycle.
+
+**Never run a restart test against a device in production** - a restart
+drops its readings for a few seconds and the device briefly shows as
+OFFLINE.
 
 **Run the probe from inside the container.** The facility broker ACL
 allows the watchdog's source address (the Docker bridge) but rejects new
 logins from the host LAN address; a probe run from the host gets "not
 authorised" and sees nothing, which looks identical to a broken publish.
+
+### Safe mode is deliberately not exposed
+
+Some devices publish a "safe mode" button alongside the restart button.
+Safe mode boots the device with a minimal configuration - a recovery
+action for a device that will not start. It is deliberately not wired to
+any button in this app: a stray click on a wall display should never put
+a production sensor into safe mode.
 

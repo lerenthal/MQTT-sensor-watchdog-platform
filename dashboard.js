@@ -198,6 +198,25 @@ function snoozeControl(d, id) {
          + '</div></div>';
 }
 
+// The Restart button.
+//
+// A device can only be restarted if its firmware publishes an MQTT restart
+// entity. The command topic is derived by ESPHome from the button's name
+// and differs per device, so the server discovers it from the MQTT
+// discovery payloads and tells us which devices are restartable. Where a
+// device is not restartable the button is disabled with the reason, rather
+// than offered and silently doing nothing.
+function restartButton(d) {
+    if (d.can_restart === false) {
+        return '<button class="btn btn-sm btn-muted" disabled '
+             + 'title="This device publishes no MQTT restart entity, so there '
+             + 'is nothing to command. Its firmware would need a restart '
+             + 'button with an mqtt: command_topic.">Restart</button>';
+    }
+    return '<button class="btn btn-sm btn-danger" onclick="event.stopPropagation();restart(\''
+         + escapeHtml(d.device_id) + '\')">Restart</button>';
+}
+
 function renderRow(d) {
     const status = statusBadge(d.status);
     const id = encodeURIComponent(d.device_id);
@@ -314,8 +333,7 @@ function renderRow(d) {
           + (d.last_seen || 'Never').slice(5, 19) + '</td>'
         + '<td class="col-snooze">' + snoozeControl(d, id) + '</td>'
         + '<td class="col-actions">'
-          + '<button class="btn btn-sm btn-danger" onclick="event.stopPropagation();restart(\''
-          + escapeHtml(d.device_id) + '\')">Restart</button>'
+          + restartButton(d)
           + '</td>'
         + '</tr>';
 
@@ -481,15 +499,12 @@ window.restart = async function (deviceId) {
     try { data = await r.json(); } catch (e) { /* non-JSON error body */ }
     if (r.status === 401) { window.location = '/login'; return; }
     if (!data.ok) {
-        // Distinguish "the command never left" from "the command left but
-        // nothing on the device is listening for it" - the second needs a
-        // firmware change, the first needs a look at the broker.
-        if (data.published) {
-            alert('Command sent to the broker, but ' + deviceId + ' will NOT '
-                + 'reboot.\n\n'
-                + (data.error || '')
-                + '\n\nThis device\'s firmware has no MQTT button, so a '
-                + 'restart command has nothing to act on.');
+        // 404 means the device publishes no restart entity at all - there
+        // is nothing to command, and the firmware would need one. Other
+        // failures are transport problems (not connected, not acked).
+        if (r.status === 404) {
+            alert('Cannot restart ' + deviceId + '.\n\n'
+                + (data.error || 'No restart entity is published for it.'));
         } else {
             alert('Restart failed: ' + (data.error || 'unknown'));
         }

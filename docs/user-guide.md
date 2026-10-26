@@ -396,3 +396,46 @@ indistinguishable from a frozen sensor.
 
 Click any item to expand it.
 
+## Restarting a device
+
+Every device row has a **Restart** button. It works the same way as the
+restart button on your Home Assistant device page: the watchdog publishes
+a PRESS to the device's own MQTT restart entity, and the device reboots.
+You can see the reboot on the dashboard - the heartbeat counter resets to
+zero and the status cycles offline -> online within a few seconds.
+
+**How the command topic is found.** ESPHome derives the command topic
+from the button's name, so it is different on every device:
+
+```
+facility/bme680-1/env_sensor/button/bme680-1_restart_device/command
+facility/maxim4/env_sensor/button/maxim4_restart_device/command
+facility/scd30_2/env_sensor/button/scd30-2_restart/command
+```
+
+The watchdog therefore reads the real topic from the device's own MQTT
+discovery payload rather than assuming one. It subscribes to
+`homeassistant/button/#` at startup and keeps the map fresh, so a newly
+provisioned device is picked up automatically.
+
+If a device publishes no restart entity at all, its Restart button is
+**disabled** with the reason in the tooltip, and the API answers 404
+rather than pretending to have sent something.
+
+To see what was discovered:
+
+```
+GET /api/restart/topics
+```
+
+**What you will see while it reboots.** The device drops off the broker
+for a few seconds, so the watchdog briefly reports it as OFFLINE before
+it comes back. That is the reboot, not a fault.
+
+**Safe mode is not exposed.** Some devices also publish a "safe mode"
+button, which boots the device into safe mode with a minimal
+configuration. That is a recovery action for a device that will not
+start, and it is deliberately not wired to any button here - a stray
+click on a wall display should not put a production sensor into safe
+mode.
+

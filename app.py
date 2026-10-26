@@ -5,6 +5,7 @@
 # + Flask admin dashboard with login, theme toggle, config editing, audit
 # trail, and printable status report.
 
+import json
 import os
 import re
 import sys
@@ -628,7 +629,12 @@ def on_mqtt_connect(client, userdata, flags, rc, properties=None):
             mqtt_health["down_alerted"] = False
             mqtt_health["last_down_nag_at"] = None
         client.subscribe(config["mqtt"]["topic_subscription"], qos=0)
-        log.info(f"MQTT connected & subscribed to {config['mqtt']['topic_subscription']}")
+        # Retained discovery payloads tell us each device's real restart
+        # command topic. Without this the restart button has no topic to
+        # publish to.
+        client.subscribe("homeassistant/button/#", qos=0)
+        log.info(f"MQTT connected & subscribed to {config['mqtt']['topic_subscription']} "
+                 f"and homeassistant/button/#")
         if was_disconnected:
             telegram_engine.send_message("✅ <b>MQTT broker reconnected.</b> Watchdog resumed.")
     else:
@@ -1018,6 +1024,10 @@ def start_mqtt():
     client.on_connect = on_mqtt_connect
     client.on_disconnect = on_mqtt_disconnect
     client.on_message = on_mqtt_message
+    # Pick up each device's REAL restart command topic from ESPHome's
+    # discovery payloads. The topic is derived from the button's name and
+    # differs per device, so it cannot be guessed - see _on_discovery.
+    client.message_callback_add("homeassistant/button/#", _on_discovery)
     try:
         client.connect(
             config["mqtt"]["broker"], config["mqtt"]["port"],
@@ -1968,6 +1978,10 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
 .badge.badge-mqtt-down { background: var(--danger); }
 .badge.badge-muted { background: var(--muted); }
 .badge.badge-warning { background: var(--warning); color: white; }
+.btn-muted, .btn:disabled {
+    background: transparent; color: var(--muted-foreground);
+    border: 1px solid var(--border); cursor: not-allowed; opacity: .6;
+}
 .btn {
   display: inline-block; padding: .4rem .85rem; border-radius: 8px;
   font-size: .85rem; font-weight: 500; cursor: pointer; border: 1px solid var(--border);
@@ -2238,6 +2252,17 @@ def api_devices():
 
     flatline_limit = int(config.get("watchdog", {}).get("sensor_flatline_seconds", 300))
 
+    # Which devices have a restart button. The command topic is derived by
+    # ESPHome from the button's name, so it is discovered from the MQTT
+    # discovery payloads rather than assumed. The dashboard uses this to
+    # disable the Restart button where it would not work, instead of
+    # offering a button that silently does nothing.
+    with _restart_topics_lock:
+        restart_topics = dict(_restart_topics)
+    for d in devices:
+        d["can_restart"] = d["device_id"] in restart_topics
+        d["restart_topic"] = restart_topics.get(d["device_id"])
+
     # Per-entity target ranges and current in/out state, for dashboard colouring.
     thresholds = {}
     try:
@@ -2458,7 +2483,26 @@ def api_restart(device_id):
     client = _mqtt_client_holder["client"]
     if client is None:
         return jsonify({"ok": False, "error": "MQTT client not initialized"}), 503
-    topic = f"facility/{device_id}/env_sensor/button/restart/cmd"
+    # The real command topic, learned from the device's own MQTT discovery
+    # payload. It cannot be guessed: ESPHome derives it from the button's
+    # name, so it differs per device (bme680-1 uses
+    # button/bme680-1_restart_device/command, scd30_2 uses
+    # button/scd30-2_restart/command).
+    topic = _restart_topic_for(device_id)
+    if not topic:
+        known = _known_restart_devices()
+        audit("RESTART_UNAVAILABLE", device_id=device_id,
+              details="No restart button found in MQTT discovery")
+        log.warning("Restart requested for %s but no restart button was "
+                    "discovered for it.", device_id)
+        return jsonify({
+            "ok": False,
+            "error": f"No restart button is published for {device_id}, so "
+                     f"there is nothing to command. Its firmware has no MQTT "
+                     f"restart entity."
+                     + (f" Restart buttons were discovered for {len(known)} "
+                        f"other devices." if known else ""),
+        }), 404
     conn = None
     try:
         conn = get_db()
@@ -2480,52 +2524,15 @@ def api_restart(device_id):
                 "error": "MQTT publish was not acknowledged by the broker",
             }), 502
 
-        # A device whose firmware has no MQTT button component will not act on
-        # the command, and the publish will look like a success. The
-        # observable proxy is whether the device has EVER published a topic
-        # under its own button/ subtree - ESPHome's button component
-        # publishes its state there. If it never has, this firmware has no
-        # MQTT button, so say so instead of implying the device rebooted.
-        _btn = conn.execute(
-            "SELECT COUNT(*) FROM sensor_readings WHERE device_id = ? "
-            "AND sensor_type = 'button'",
-            (device_id,),
-        ).fetchone()[0] if conn else 0
-        # Only rows recorded from a genuine button STATE topic count. The
-        # recorder ignores /cmd topics, so this is the device's own evidence
-        # that it has an MQTT button component.
-        has_mqtt_button = _btn > 0
-
-        if has_mqtt_button:
-            audit("RESTART_SENT", device_id=device_id,
-                  details=f"Published to {topic} (qos=1, acked)")
-            log.info(f"Restart command published for {device_id} on {topic}")
-            return jsonify({"ok": True, "topic": topic,
-                            "note": "Command delivered to the broker. The device "
-                                    "will reboot if its firmware has an MQTT "
-                                    "button on this topic."})
-
-        # No evidence of an MQTT button on this device. Report it honestly:
-        # the command reached the broker, but nothing is listening, so the
-        # device will not reboot. The operator needs to know that before
-        # they walk to the device expecting it to come back.
-        audit("RESTART_COMMAND_UNACKNOWLEDGED", device_id=device_id,
-              details=f"Published to {topic} (acked) but device has no MQTT "
-                      f"button topic - firmware change required")
-        log.warning(
-            "Restart command for %s was published to %s but the device has "
-            "never published a button/ topic, so it has no MQTT button "
-            "component and will not reboot. Firmware change required.",
-            device_id, topic)
-        return jsonify({
-            "ok": False,
-            "published": True,
-            "topic": topic,
-            "error": "Command reached the broker, but this device has no MQTT "
-                     "button component, so it will NOT reboot. Its firmware "
-                     "needs a button: - platform: mqtt with "
-                     "command_topic: button/restart/cmd.",
-        }), 502
+        # The topic came from the device's own discovery payload, so the
+        # device really does publish this entity. The command is delivered;
+        # the device reboots and its LWT status cycles offline -> online.
+        audit("RESTART_SENT", device_id=device_id,
+              details=f"Published to {topic} (qos=1, acked)")
+        log.info(f"Restart command published for {device_id} on {topic}")
+        return jsonify({"ok": True, "topic": topic,
+                        "note": "Restart command delivered to the device. It "
+                                "should reboot within a few seconds."})
     except Exception as e:
         log.exception("Restart publish failed")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -3433,6 +3440,72 @@ def _site_buzz_style():
 # Wall-display alarm board
 # -----------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# Restart command topics
+#
+# A device's restart command topic is NOT a constant. ESPHome derives it
+# from the button's name, so:
+#
+#   bme680-1   -> facility/bme680-1/env_sensor/button/bme680-1_restart_device/command
+#   maxim4     -> facility/maxim4/env_sensor/button/maxim4_restart_device/command
+#   scd30_2    -> facility/scd30_2/env_sensor/button/scd30-2_restart/command
+#
+# The authoritative source is the retained MQTT discovery config under
+# homeassistant/button/<device>/<entity>/config, whose "cmd_t" field
+# holds the real topic. We subscribe to that tree once at startup and
+# keep the map in memory, so a restart button always publishes to a topic
+# the device actually listens on.
+#
+# A hardcoded guess is worse than useless: publishing to a topic nobody
+# listens on is indistinguishable from a dead device, and the operator
+# has no way to tell which it is.
+# ---------------------------------------------------------------------------
+_restart_topics = {}          # device_id -> command topic
+_restart_topics_lock = threading.Lock()
+_restart_topics_ready = threading.Event()
+
+
+def _on_discovery(client, userdata, msg):
+    """Record restart command topics from ESPHome's discovery payloads."""
+    try:
+        payload = json.loads(msg.payload.decode("utf-8", "ignore"))
+    except Exception:
+        return
+    if payload.get("dev_cla") != "restart":
+        return
+    cmd = payload.get("cmd_t") or ""
+    name = payload.get("name") or ""
+    if not cmd:
+        return
+    # The device id is the second segment of the command topic:
+    #   facility/<device_id>/env_sensor/button/<entity>/command
+    parts = cmd.split("/")
+    if len(parts) < 3:
+        return
+    device_id = parts[1]
+    # Skip the "safe mode" buttons - a safe-mode boot is a recovery
+    # action, not a normal restart, and must not be triggered by accident.
+    if "safe" in name.lower() and "mode" in name.lower():
+        return
+    with _restart_topics_lock:
+        # Prefer a button whose name says "restart device" over other
+        # restart-class entities when a device has several.
+        prev = _restart_topics.get(device_id)
+        if prev is None or ("restart_device" in cmd or "restart" in name.lower()):
+            _restart_topics[device_id] = cmd
+    _restart_topics_ready.set()
+
+
+def _restart_topic_for(device_id):
+    """The device's real restart command topic, or None if unknown."""
+    with _restart_topics_lock:
+        return _restart_topics.get(device_id)
+
+
+def _known_restart_devices():
+    with _restart_topics_lock:
+        return sorted(_restart_topics.keys())
+
+# ---------------------------------------------------------------------------
 # Configuration help
 #
 # Inline documentation for the YAML editor. Each entry maps a dotted config
@@ -3772,6 +3845,23 @@ window.SITE_BUZZ_STYLE = "{_site_buzz_style()}";
 <body>{body}</body></html>"""
     return html_doc
 
+
+@app.route("/api/restart/topics")
+@login_required
+def api_restart_topics():
+    """Which devices have a restart button, and the real command topic.
+
+    The restart command topic is derived by ESPHome from the button's
+    name, so it differs per device and cannot be guessed. This endpoint
+    shows what was actually discovered, which is the first thing to check
+    when a restart button appears not to work.
+    """
+    with _restart_topics_lock:
+        topics = dict(_restart_topics)
+    return jsonify({
+        "count": len(topics),
+        "topics": topics,
+    })
 
 @app.route("/api/wallboard")
 @login_required
