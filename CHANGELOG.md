@@ -8,6 +8,50 @@ is no SemVer for this project.
 
 ## Unreleased
 
+### Fixed (second review, 2026-10-26)
+- **Timestamps were two hours wrong.** Every SQL write used SQLite's
+  `CURRENT_TIMESTAMP`, which is **UTC**, while all Python comparisons use
+  local time (`Asia/Jerusalem`). The GMP audit trail, every alert's
+  "triggered at", `device_status_history` and `out_of_range.entered_at` were
+  all stamped at the UTC offset. This also silently defeated the
+  `OUT_OF_RANGE` dwell (it computed `local now − UTC entered`, always past
+  the threshold). All writes are now explicit local wall-clock.
+- **An out-of-range sensor paged every 30 seconds.** The per-device loop
+  blanket-resolved every alert for a device it judged healthy, including
+  `OUT_OF_RANGE`, which the range pass then re-created — so `_raise_or_nag`
+  saw "no active alert" each cycle and sent a brand-new Telegram page,
+  bypassing `nagging_interval_seconds` entirely (~120 pages/hour from one
+  sensor). The loop now only resolves the alert types it owns.
+- **Flapping.** 879 device status changes were recorded in 12 hours
+  (portable-sense1 alone flapped 237 times) and the SYSTEMIC fault fired and
+  cleared every ~15 minutes, because a single fixed staleness window cannot
+  fit channels that publish on very different cadences. Staleness is now
+  judged per channel against its own measured publish interval
+  (`sensor_stale_interval_multiplier`), with `sensor_flatline_seconds` as the
+  floor. `OUT_OF_RANGE` gained a clear-side deadband
+  (`out_of_range_clear_margin_pct`) so a value parked on a limit cannot
+  resolve and re-raise on alternating cycles.
+- **Stale readings looked live.** The dashboard printed
+  `devices.last_temp/last_hum/last_co2`, which are overwritten by whichever
+  channel published last and are never aged out. `airmon-1` displayed a CO2
+  value from two days earlier as a plain number next to an ONLINE badge.
+  Headline readings are now derived from the actual channels, carry their
+  age, and show the freshest channel plus a count when a device has several.
+  A stale reading is still shown — dimmed, with its age.
+- `/api/devices` opened a SQLite connection per poll without closing it and
+  ran a status-history query per device (N+1). Now one grouped query on a
+  connection that is explicitly closed.
+
+### Added (second review)
+- Fleet summary strip above the device table: counts by status plus "stale
+  readings" and "out of range", each a one-click filter.
+- `tests/test_followup_fixes.py` — regression tests for all of the above.
+
+### Changed (second review)
+- Product name is now **PsygaBio Device Watchdog**, configurable via
+  `facility.app_name`, applied to the header, browser tab and wall board.
+
+
 ### Fixed (code review 2026-10-25)
 - **Missed alarm:** per-device `SENSOR_SILENT` (a channel that stopped
   publishing) now fires again. It had been suppressed together with the
@@ -292,3 +336,50 @@ single Python process, packaged in Docker Compose. Schema v1
 ### Changed
 - The front-end assets are baked into the image, so a JS change needs an
   explicit rebuild. Documented in the operations guide.
+
+## 2026-10-26 - Review follow-up: local timestamps, honest readings, safe template
+
+Applied the C1-C6 review findings (see `docs/REVIEW_2026-10-26.md`) and
+closed the gaps it left open.
+
+### Fixed
+- **All SQL timestamps were UTC while every Python comparison used local
+  time** - a two-hour offset between the GMP audit trail and the device
+  timeline. The oldest `alerts.triggered_at` rows were stamped
+  `08:52:07` (the container's start time in UTC) while the Python-written
+  readings started at `08:26:08` local. Every SQL write is now explicit
+  local wall-clock, and the column defaults are
+  `datetime('now','localtime')`. Historical rows keep their original
+  timestamps: rewriting an audit trail would be worse than leaving it.
+- **The timezone fix depended on the container's `TZ` env var.** SQLite's
+  `localtime` takes the process timezone, and the live compose file
+  defaulted to `TZ: ${TZ:-UTC}` - so a container started without a `.env`
+  would have written UTC again and the defect would have silently
+  returned. The timezone is now pinned explicitly at startup from
+  `facility.timezone` / `WATCHDOG_TZ`, and the app **verifies that
+  SQLite and Python agree**, logging `TIMEZONE MISMATCH` if they do not.
+  The compose default is `Asia/Jerusalem`.
+- **The committed template carried working credentials.** `config.yaml` in
+  git held salted SHA-256 hashes that crack instantly from `mushroom` and
+  `operator` - the live passwords. Anyone with the repository could log
+  in as admin. The template now carries a placeholder that no password can
+  produce, and the app refuses every login attempt against a placeholder
+  account, so a fresh install is unloggable-in until a password is set.
+- **The pilot config had no `facility.app_name`**, so the pilot used the
+  fallback rather than the configured product name.
+- The v9 migration logged "v7 -> v8" while stamping version 9.
+
+### Added
+- **Readings show their age.** The headline temperature, humidity and CO2
+  are derived from the device's actual channels - the freshest one - not
+  from the denormalised `devices.last_*` columns, which are overwritten
+  by whichever channel published last and were never aged out. A stale
+  value is dimmed and badged with its age; the value is still shown
+  because a CO2-stalled device must still display its CO2, but it can no
+  longer masquerade as current.
+- **A fleet summary strip** above the table: online / offline / stalled /
+  degraded / stale readings / out of range, each a one-click filter.
+  Zero counts are dimmed.
+- `tests/test_followup_security.py` - 14 checks covering the placeholder
+  refusal, the timezone pinning and agreement, the compose TZ default and
+  the headline age reporting.

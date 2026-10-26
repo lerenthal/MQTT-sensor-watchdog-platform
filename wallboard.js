@@ -98,7 +98,7 @@ function render(faults, mqttOk, meta) {
           + meta.total + ' devices monitored &middot; last packet '
           + escapeHtml(meta.lastPacket || 'never') + '</div>';
         stopBeep();
-        document.title = 'Sensor Watchdog - ALL CLEAR';
+        document.title = (window.APP_NAME || 'Device Watchdog') + ' - ALL CLEAR';
         // Reset alarm run state so the next fault flashes/beeps as "new".
         lastFaultKeys = new Set();
         alarmSince = 0;
@@ -124,7 +124,7 @@ function render(faults, mqttOk, meta) {
     }
 
     document.title = '!! ' + faults.length + ' FAULT' + (faults.length === 1 ? '' : 'S')
-                   + ' - Sensor Watchdog';
+                   + ' - ' + (window.APP_NAME || 'Device Watchdog');
 
     const rows = faults.slice(0, 12).map(f =>
         '<tr><td>' + badge(f.severity, f.severity === 'CRITICAL' ? 'crit' : 'warn')

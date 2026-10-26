@@ -295,3 +295,54 @@ rebuild explicitly.
 **The pilot instance has its own `rebuild` command** for the same
 reason. Without it the pilot would silently run stale front-end code.
 
+## First-time setup: setting a password
+
+The committed `config.yaml` ships with **no password set**. Each account
+carries a placeholder that no password can produce, and the app refuses
+every login attempt against it. A fresh install therefore cannot be
+logged into until a password is chosen — that is deliberate, so a
+published repository never carries working credentials.
+
+To set the admin password, edit `config/config.yaml`:
+
+```yaml
+auth:
+  users:
+    yaniv:
+      role: admin
+      password: <the password>
+```
+
+The app upgrades a plaintext `password:` to a salted SHA-256 hash on the
+next start and removes the plaintext. The Admin Config page's YAML editor
+accepts the same thing.
+
+**Do not commit `config/config.yaml`.** It is gitignored, and it holds
+the MQTT broker password and the Flask session key.
+
+## Rotating a password
+
+Change the `password:` field in `config/config.yaml` and restart. The
+app re-hashes it on startup. Existing sessions stay valid until the
+`web.secret_key` changes — so if you also want to invalidate every
+session, rotate the secret key at the same time:
+
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Paste the result into `web.secret_key` and restart. Every browser will
+be logged out.
+
+## Checking the timezone
+
+The app logs this at every start:
+
+```
+Timezone pinned to Asia/Jerusalem (('IST', 'IDT')); SQLite and Python agree (2026-10-26 16:31:46)
+```
+
+If it ever says `TIMEZONE MISMATCH`, the database timestamps would be
+wrong — check `facility.timezone` and the container's `TZ`. The compose
+files default to `Asia/Jerusalem` for exactly this reason.
+

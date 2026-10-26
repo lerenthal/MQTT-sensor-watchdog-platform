@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS devices (
     last_hum REAL,
     last_co2 REAL,
     snooze_until TIMESTAMP NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT (datetime('now','localtime'))
 );
 
 CREATE TABLE IF NOT EXISTS sensor_readings (
@@ -29,8 +29,9 @@ CREATE TABLE IF NOT EXISTS sensor_readings (
     sensor_name TEXT NOT NULL,                -- e.g. 'maxim5_ground_temperature', informational
     sensor_type TEXT NOT NULL,                -- 'temperature','humidity','co2','light','pressure','heartbeat'
     value REAL NOT NULL,
-    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ts TIMESTAMP DEFAULT (datetime('now','localtime')),
     last_change_ts TIMESTAMP,                 -- timestamp of last value change; null until second observation
+    publish_interval_s REAL,                  -- EWMA of observed seconds between packets (adaptive staleness)
     UNIQUE(device_id, sensor_name, sensor_type)
 );
 
@@ -46,13 +47,13 @@ CREATE TABLE IF NOT EXISTS device_metadata (
     location TEXT,
     role TEXT,
     source TEXT,                              -- 'csv:<upload_id>' or 'manual'
-    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    uploaded_at TIMESTAMP DEFAULT (datetime('now','localtime')),
     uploaded_by TEXT
 );
 
 CREATE TABLE IF NOT EXISTS csv_uploads (
     upload_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    saved_at TIMESTAMP DEFAULT (datetime('now','localtime')),
     saved_by TEXT NOT NULL,
     filename TEXT,
     row_count INTEGER,
@@ -67,7 +68,7 @@ CREATE TABLE IF NOT EXISTS alerts (
                                               -- NOTE: known_degraded, sensor_thresholds and out_of_range are
                                               -- created by _apply_migrations() in app.py, not here (schema v6/v7).
     message TEXT NOT NULL,
-    triggered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    triggered_at TIMESTAMP DEFAULT (datetime('now','localtime')),
     last_nagged_at TIMESTAMP NULL,
     acknowledged INTEGER DEFAULT 0,           -- 0 = No, 1 = Yes
     resolved INTEGER DEFAULT 0,               -- 0 = Active, 1 = Resolved
@@ -76,7 +77,7 @@ CREATE TABLE IF NOT EXISTS alerts (
 
 CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    timestamp TIMESTAMP DEFAULT (datetime('now','localtime')),
     device_id TEXT,
     username TEXT,                            -- 'anonymous' for legacy rows or Telegram without a known user
     action TEXT NOT NULL,                     -- 'LOGIN','LOGOUT','LOGIN_FAIL','SNOOZE','UNSNOOZE','ACK','RESTART_SENT','CONFIG_SAVE','CONFIG_ROLLBACK'
@@ -85,7 +86,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 
 CREATE TABLE IF NOT EXISTS config_history (
     version_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    saved_at TIMESTAMP DEFAULT (datetime('now','localtime')),
     saved_by TEXT NOT NULL,
     note TEXT,                                -- free-text reason from the editor
     content TEXT NOT NULL                     -- full YAML text snapshot

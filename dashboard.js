@@ -59,6 +59,52 @@ function postMenuItem(action, label) {
          + 'cursor:pointer;font:inherit;color:inherit">' + label + '</button></form>';
 }
 
+// Compact human age: 45s / 12m / 3h / 2d. Operators read a duration far
+// faster than a timestamp when the question is "is this current?".
+function fmtAge(s) {
+    if (s == null) return '?';
+    if (s < 60) return Math.round(s) + 's';
+    if (s < 3600) return Math.round(s / 60) + 'm';
+    if (s < 86400) return (s / 3600).toFixed(s < 36000 ? 1 : 0) + 'h';
+    return (s / 86400).toFixed(1) + 'd';
+}
+
+// A headline reading (temperature / humidity / CO2) rendered HONESTLY.
+//
+// The old cell printed devices.last_co2 as a bare number. That column is
+// overwritten by whichever channel published last and is never aged out, so a
+// CO2 reading from two days ago (airmon-1 showed 438 ppm from 2 days prior)
+// looked exactly like a live one, and a device whose CO2 had stopped while its
+// temperature kept flowing still showed a plausible CO2 figure next to an
+// ONLINE badge. That is the misleading-healthy-signal failure this whole
+// system exists to prevent.
+//
+// So: always SHOW the value (the operator asked to still see CO2 on a
+// CO2-stalled device) but never let a stale one masquerade as current — it is
+// dimmed and carries its age. Multi-channel devices show the channel count.
+function metricCell(h, unit, dp) {
+    if (!h) return '<span class="muted">&mdash;</span>';
+    const v = (typeof h.value === 'number') ? h.value.toFixed(dp) : '--';
+    let cls = 'mval';
+    if (h.known_degraded)        cls += ' mval-supp';
+    else if (h.stale)            cls += ' mval-stale';
+    else if (h.in_range === false) cls += ' mval-bad';
+
+    const tip = h.sensor_name + ' = ' + v + unit
+        + '\nlast packet ' + fmtAge(h.age_seconds) + ' ago (' + (h.ts || '?') + ')'
+        + (h.channels > 1 ? '\n' + h.channels + ' channels of this metric; showing the freshest' : '')
+        + (h.stale ? '\nSTALE: past this channel’s expected interval' : '')
+        + (h.in_range === false ? '\nOUT OF RANGE' : '')
+        + (h.known_degraded ? '\nalerting suppressed (known degraded)' : '');
+
+    let out = '<span class="' + cls + '" title="' + escapeHtml(tip) + '">' + v + '</span>';
+    if (h.stale) out += '<span class="mage" title="age of the last packet">'
+                      + fmtAge(h.age_seconds) + '</span>';
+    if (h.channels > 1) out += '<span class="mch" title="' + h.channels
+                             + ' channels; freshest shown">&times;' + h.channels + '</span>';
+    return out;
+}
+
 function statusBadge(s) {
     if (s === 'ONLINE')  return '<span class="badge badge-online">ONLINE</span>';
     if (s === 'STALLED') return '<span class="badge badge-stalled">STALLED</span>';
@@ -236,6 +282,13 @@ function renderRow(d) {
     const id = encodeURIComponent(d.device_id);
     const isOpen = EXPANDED_ROWS.has(d.device_id);
 
+    // Headline readings come from the server's per-channel rollup, which knows
+    // each value's age — not from the never-aged devices.last_* columns.
+    const hl = d.headline || {};
+    const hTemp = hl.temperature, hHum = hl.humidity, hCo2 = hl.co2;
+    const anyStale = [hTemp, hHum, hCo2].some(h => h && h.stale);
+    const anyOor   = [hTemp, hHum, hCo2].some(h => h && h.in_range === false);
+
     // --- Feature 2: did this device's status change since the last poll?
     const prev = PREV_STATUS.get(d.device_id);
     // A snoozed device is considered handled: it must not flash, however
@@ -325,11 +378,15 @@ function renderRow(d) {
         + '" data-location="' + escapeHtml(d.location || '')
         + '" data-role="' + escapeHtml(d.role || '')
         + '" data-reason="' + escapeHtml(d.reason || '')
-        + '" data-temp="' + (d.last_temp ?? '')
-        + '" data-hum="' + (d.last_hum ?? '')
-        + '" data-co2="' + (d.last_co2 ?? '')
+        + '" data-temp="' + (hTemp ? hTemp.value : '')
+        + '" data-hum="' + (hHum ? hHum.value : '')
+        + '" data-co2="' + (hCo2 ? hCo2.value : '')
         + '" data-lastseen="' + (d.last_seen || '')
         + '" data-heartbeat="' + (d.last_heartbeat_value ?? '')
+        // Flags the summary chips filter on.
+        + '" data-stale="' + (anyStale ? '1' : '')
+        + '" data-oor="' + (anyOor ? '1' : '')
+        + '" data-snoozed="' + (snoozed ? '1' : '')
         + '" onclick="toggleRow(\'' + escapeHtml(d.device_id) + '\')">'
         + '<td class="col-device"><span class="expand-caret">'
           + (isOpen ? '&#9662;' : '&#9656;') + '</span> <strong>'
@@ -338,9 +395,9 @@ function renderRow(d) {
           + (d.role ? '<br><span class="muted" style="font-size:.75rem">'
                      + escapeHtml(d.role) + '</span>' : '') + '</td>'
         + '<td class="col-status">' + status + changedTag + '</td>'
-        + '<td class="col-temp num">' + (d.last_temp ?? '--') + '</td>'
-        + '<td class="col-hum num">' + (d.last_hum ?? '--') + '</td>'
-        + '<td class="col-co2 num">' + (d.last_co2 ?? '--') + '</td>'
+        + '<td class="col-temp num">' + metricCell(hTemp, '°C', 1) + '</td>'
+        + '<td class="col-hum num">' + metricCell(hHum, '%', 1) + '</td>'
+        + '<td class="col-co2 num">' + metricCell(hCo2, ' ppm', 0) + '</td>'
         + '<td class="col-reason">' + reasonShort + '</td>'
         + '<td class="col-sensors">' + sensors + '</td>'
         + '<td class="col-lastseen ts">'
@@ -397,6 +454,11 @@ function applyFilter() {
                 + ' ' + (r.textContent || '')).toLowerCase();
             show = haystack.includes(q);
         }
+        // A summary chip can filter on a condition that is not text, e.g.
+        // "has a stale reading". Those use the row's data flags.
+        if (show && ACTIVE_FLAG === '__stale__')   show = r.dataset.stale === '1';
+        if (show && ACTIVE_FLAG === '__oor__')     show = r.dataset.oor === '1';
+        if (show && ACTIVE_FLAG === '__snoozed__') show = r.dataset.snoozed === '1';
         r.style.display = show ? '' : 'none';
         if (show) visible++;
         // Keep the detail row in step with its device.
@@ -481,6 +543,62 @@ function renderSystemic(list) {
     ).join('');
 }
 
+// Fleet summary strip. On a 31-device table the operator's first question is
+// "is anything wrong, and how much", which previously required reading every
+// row. Each chip is also a one-click filter into the table.
+function renderSummary(devices) {
+    const el = document.getElementById('fleet-summary');
+    if (!el) return;
+    const by = {ONLINE: 0, OFFLINE: 0, STALLED: 0, DEGRADED: 0};
+    let staleMetrics = 0, outOfRange = 0, snoozed = 0;
+    devices.forEach(d => {
+        by[d.status] = (by[d.status] || 0) + 1;
+        if (d.snooze_until) snoozed++;
+        const hl = d.headline || {};
+        ['temperature', 'humidity', 'co2'].forEach(m => {
+            const h = hl[m];
+            if (!h) return;
+            if (h.stale) staleMetrics++;
+            if (h.in_range === false) outOfRange++;
+        });
+    });
+    const chip = (label, n, cls, filter, tip) =>
+        '<button class="sumchip ' + cls + (n ? '' : ' sumchip-zero') + '"'
+        + ' title="' + escapeHtml(tip) + '"'
+        + ' onclick="summaryFilter(\'' + filter + '\')">'
+        + '<span class="sumn">' + n + '</span> ' + label + '</button>';
+
+    el.innerHTML =
+        chip('online',    by.ONLINE   || 0, 'sum-ok',    'ONLINE',   'Devices reporting normally')
+      + chip('offline',   by.OFFLINE  || 0, 'sum-crit',  'OFFLINE',  'No MQTT traffic at all')
+      + chip('stalled',   by.STALLED  || 0, 'sum-warn',  'STALLED',  'Heartbeat counter frozen')
+      + chip('degraded',  by.DEGRADED || 0, 'sum-degr',  'DEGRADED', 'Device up, at least one channel bad')
+      + chip('stale readings', staleMetrics, 'sum-stale', '__stale__',
+             'Headline readings older than their channel’s expected interval')
+      + chip('out of range', outOfRange, 'sum-oor', '__oor__',
+             'Fresh readings outside their configured target range')
+      + (snoozed ? chip('snoozed', snoozed, 'sum-muted', '__snoozed__',
+             'Alerting silenced by an operator') : '')
+      + '<button class="sumchip sumchip-clear" onclick="summaryFilter(\'\')"'
+      + ' title="Clear the filter">show all</button>';
+}
+
+// Clicking a summary chip filters the table through the existing search box,
+// so filter state stays in exactly one place.
+window.summaryFilter = function (token) {
+    const box = document.getElementById('search');
+    if (!box) return;
+    if (token === '__stale__' || token === '__oor__' || token === '__snoozed__') {
+        ACTIVE_FLAG = token;
+        box.value = '';
+    } else {
+        ACTIVE_FLAG = null;
+        box.value = token;
+    }
+    applyFilter();
+};
+let ACTIVE_FLAG = null;
+
 async function refresh() {
     try {
         const res = await fetch('/api/devices');
@@ -504,6 +622,7 @@ async function refresh() {
         localStorage.setItem('watchdog-prev-status', JSON.stringify([...PREV_STATUS]));
 
         tbody.innerHTML = ALL_DEVICES.map(renderRow).join('');
+        renderSummary(ALL_DEVICES);
         applyFilter();
         applySort();
 

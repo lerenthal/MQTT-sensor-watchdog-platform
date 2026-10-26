@@ -42,7 +42,7 @@ services:
       # turns two instances into a reconnect war and silently breaks
       # publishes.
       WATCHDOG_INSTANCE_ID: live
-      TZ: ${TZ:-UTC}
+      TZ: ${TZ:-Asia/Jerusalem}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5050/health"]
       interval: 30s

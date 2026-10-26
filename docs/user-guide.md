@@ -488,3 +488,46 @@ The detail panel always stays attached to its device. Sorting or
 filtering the table moves the device row and its detail panel together,
 and the row count in the toolbar counts devices, not rows.
 
+## Reading the fleet summary strip
+
+Above the device table there is a strip of chips: `online`, `offline`,
+`stalled`, `degraded`, `stale readings`, `out of range`, and `snoozed` if
+any device is silenced. Each shows a count, and each is a **one-click
+filter** into the table. Counts of zero are dimmed so your eye lands on
+what is actually non-zero.
+
+On a 30-device fleet the first question is "is anything wrong, and how
+much" — the strip answers it without reading a single row.
+
+## Readings show their age
+
+The temperature, humidity and CO₂ columns now show **how old the reading
+is**, not just its value:
+
+- A **fresh** value is shown plainly.
+- A **stale** value is dimmed and carries a compact age badge (`2.3d`,
+  `15m`). Hover it for the channel name and the exact timestamp.
+- An **out-of-range** value is shown in red.
+- A **suppressed** (known-degraded) value is struck through.
+
+The value is still shown even when stale — you asked to still see CO₂ on
+a CO₂-stalled device — but it can no longer masquerade as current. A
+device whose temperature is alive while its CO₂ has been frozen for two
+days is exactly the case this makes visible.
+
+Where a device has **several channels** for the same metric, the freshest
+one is used and the column shows `×N` so it is obvious you are looking at
+one of several.
+
+## The timezone
+
+Every timestamp in this system — the audit trail, the alert history, the
+status changes, the sensor readings — is **local wall-clock** (Israel
+time). The audit trail has to line up with the device timeline and with
+your own clock; a GMP record two hours out from the event is worse than
+no record.
+
+The timezone is pinned at startup from `facility.timezone` in the config
+and the app verifies that its database and its own clock agree, logging a
+`TIMEZONE MISMATCH` error if they ever do not.
+

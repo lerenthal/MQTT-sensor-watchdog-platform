@@ -24,6 +24,18 @@ watchdog:
   - spare-1
   - spare-2
   out_of_range_hysteresis_seconds: 60
+  # Adaptive staleness. A channel counts as silent only after
+  # max(sensor_flatline_seconds, this x its own measured publish interval).
+  # The fleet's channels publish on very different cadences; with a single
+  # fixed window the slow ones sat permanently on the threshold and flapped
+  # in and out of DEGRADED/SYSTEMIC on every cycle. 0 restores the old
+  # fixed-window behaviour.
+  sensor_stale_interval_multiplier: 3.0
+  # Clear-side deadband for OUT_OF_RANGE, as a percentage of the configured
+  # band (max-min). A value must come back inside the limits by this margin
+  # before the breach resolves, so a reading parked on the limit cannot
+  # resolve and re-raise on alternating cycles. 0 disables.
+  out_of_range_clear_margin_pct: 2.0
   # Alarm tone for the wall board. One of:
   #   chime       - gentle two-note chime; easy to live with, may not carry
   #   warble      - fast alternation; noticeable
@@ -37,22 +49,43 @@ web:
   secret_key: CHANGE_ME_generated_on_first_boot
   dashboard_refresh_seconds: 10
 auth:
+  # These accounts have NO password set. The placeholder below cannot be
+  # produced by any password, so this template is safe to publish: a fresh
+  # install refuses every login until a real password is set. The working
+  # credentials live in config/config.yaml, which is gitignored.
+  #
+  # To set a password, either edit the live config's auth block, or use
+  # the Admin Config page - the YAML editor accepts:
+  #     yaniv:
+  #       role: admin
+  #       password: <the password>
+  # and the app upgrades it to a salted hash on the next start.
   users:
     yaniv:
       role: admin
       password_hash:
-        salt: 443eba6511184694
-        hash: ba540f939d0fd28f98586a4bfa9fc3d944db5addc79507f2f1eccdeb53fbabbb
+        salt: ""
+        hash: "!"
     operator:
       role: operator
       password_hash:
-        salt: 1164c9df8fbe1c8a
-        hash: 7c7f906086b2ee480e2ba9a54ac036d1bc55f75ffa924b0b9e098ba1272217cd
+        salt: ""
+        hash: "!"
   config_history_max_versions: 50
 facility:
+  # app_name is the product name shown in the page header, the browser tab and
+  # the wall board. facility.name is the SITE being monitored and appears in
+  # the printed report header.
+  app_name: PsygaBio Device Watchdog
+  # The timezone every timestamp is recorded in. Everything in this system
+  # is LOCAL wall-clock: the audit trail has to line up with the device
+  # timeline and with the operator's own clock. The app pins this at
+  # startup and verifies that SQLite and Python agree, so a container
+  # started without TZ cannot silently write UTC.
+  timezone: Asia/Jerusalem
   name: Mushroom Cultivation Facility
   location: Israel
-  report_title: Sensor Watchdog Status Report
+  report_title: Device Watchdog Status Report
 snooze_presets:
 - label: 1 Hour
   hours: 1

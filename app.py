@@ -1,5 +1,5 @@
 # =============================================================================
-# Mushroom Facility Sensor Watchdog
+# PsygaBio Device Watchdog (product name is configurable: facility.app_name)
 # =============================================================================
 # Independent MQTT subscriber + watchdog evaluator + Telegram nagging engine
 # + Flask admin dashboard with login, theme toggle, config editing, audit
@@ -137,6 +137,61 @@ _mqtt_client_holder = {"client": None}
 # -----------------------------------------------------------------------------
 # Database
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Timezone
+#
+# Every timestamp in this system is LOCAL wall-clock: the audit trail has to
+# line up with the device timeline and with the operator's own clock, and a
+# GMP record two hours out from the event is worse than no record.
+#
+# Python's datetime.now() and SQLite's datetime('now','localtime') each take
+# the timezone of the PROCESS they run in. Both are the same process here,
+# so they agree - but only for as long as the process timezone is what we
+# think it is. A container started without TZ set would fall back to UTC,
+# and the two would then silently disagree with every other timestamp in
+# the database.
+#
+# So the timezone is pinned ONCE, explicitly, at startup, from
+# WATCHDOG_TZ (or the config), and the SQLite connection is told to use it.
+# After that the process timezone and the database agree by construction.
+# -----------------------------------------------------------------------------
+def _configure_timezone():
+    """Pin the process timezone so SQLite and Python cannot disagree."""
+    tz = (os.environ.get("WATCHDOG_TZ")
+          or (config.get("facility") or {}).get("timezone")
+          or os.environ.get("TZ")
+          or "Asia/Jerusalem")
+    os.environ["TZ"] = tz
+    try:
+        time.tzset()
+    except AttributeError:      # not POSIX (Windows)
+        pass
+    # Prove the two agree: SQLite's localtime and Python's now() must be
+    # the same wall clock. If they are not, every timestamp in the
+    # database is wrong, so say so loudly at startup.
+    try:
+        _probe = sqlite3.connect(":memory:")
+        _sql_now = _probe.execute(
+            "SELECT datetime('now','localtime')").fetchone()[0]
+        _probe.close()
+        _py_now = datetime.now().isoformat(sep=" ", timespec="seconds")
+        _drift = abs((datetime.fromisoformat(_sql_now)
+                      - datetime.fromisoformat(_py_now)).total_seconds())
+        if _drift > 2:
+            log.error("TIMEZONE MISMATCH: SQLite localtime=%s but Python "
+                      "now()=%s (%ds apart). Database timestamps would be "
+                      "wrong - check WATCHDOG_TZ / TZ.",
+                      _sql_now, _py_now, _drift)
+        else:
+            log.info("Timezone pinned to %s (%s); SQLite and Python agree "
+                     "(%s)", tz, time.tzname, _sql_now)
+    except Exception as e:
+        log.warning("Could not verify the timezone: %s", e)
+    return tz
+
+
+_configure_timezone()
+
 def get_db():
     conn = sqlite3.connect(DB_FILE, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -177,12 +232,28 @@ def _apply_migrations(conn):
         CREATE TABLE IF NOT EXISTS device_status_history (
             device_id TEXT NOT NULL,
             status     TEXT NOT NULL,
-            changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            changed_at TIMESTAMP DEFAULT (datetime('now','localtime')),
             seen_at    INTEGER DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_status_history_device
             ON device_status_history(device_id, changed_at DESC);
     """)
+    # v8 -> v9: per-channel observed publish interval. A fixed staleness
+    # window cannot serve a fleet whose channels publish on very different
+    # cadences: with sensor_flatline_seconds=900 a channel that genuinely
+    # publishes every ~16 minutes sits permanently on the edge of the
+    # threshold, so it is declared silent just before every publish and
+    # healthy again just after. That produced 879 recorded status changes in
+    # 12 hours (portable-sense1 alone flapped 237 times) and a SYSTEMIC
+    # fault that fired and cleared every ~15 minutes. A watchdog that cries
+    # wolf gets ignored, so staleness is now judged against each channel's
+    # OWN measured cadence (see _stale_threshold_sql).
+    if _table_exists(conn, "sensor_readings") and not _column_exists(
+            conn, "sensor_readings", "publish_interval_s"):
+        conn.execute("ALTER TABLE sensor_readings ADD COLUMN publish_interval_s REAL")
+        log.info("Migration: added sensor_readings.publish_interval_s "
+                 "(schema version 8 -> 9)")
+
     # v6 -> v7: operator-acknowledged known-degraded sensors. These are
     # excluded from alerting so a documented, accepted fault does not drown
     # the dashboard in permanent noise.
@@ -192,7 +263,7 @@ def _apply_migrations(conn):
             sensor_name TEXT NOT NULL,
             reason      TEXT,
             suppressed_by TEXT,
-            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at  TIMESTAMP DEFAULT (datetime('now','localtime')),
             PRIMARY KEY (device_id, sensor_name)
         );
     """)
@@ -204,7 +275,7 @@ def _apply_migrations(conn):
             min_value   REAL,
             max_value   REAL NOT NULL,
             severity    TEXT NOT NULL DEFAULT 'WARNING',
-            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at  TIMESTAMP DEFAULT (datetime('now','localtime')),
             PRIMARY KEY (device_id, sensor_name)
         );
         CREATE TABLE IF NOT EXISTS out_of_range (
@@ -213,7 +284,7 @@ def _apply_migrations(conn):
             value       REAL,
             severity    TEXT,
             message     TEXT,
-            entered_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            entered_at  TIMESTAMP DEFAULT (datetime('now','localtime')),
             resolved    INTEGER DEFAULT 0,
             resolved_at TIMESTAMP,
             PRIMARY KEY (device_id, sensor_name)
@@ -250,7 +321,7 @@ def _apply_migrations(conn):
             location TEXT,
             role TEXT,
             source TEXT,                  -- 'csv:<file>' or 'manual'
-            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            uploaded_at TIMESTAMP DEFAULT (datetime('now','localtime')),
             uploaded_by TEXT
         );
         CREATE TABLE IF NOT EXISTS sensor_readings (
@@ -259,8 +330,9 @@ def _apply_migrations(conn):
             sensor_name TEXT NOT NULL,              -- e.g. 'maxim5_ground_temperature', informational
             sensor_type TEXT NOT NULL,              -- 'temperature','humidity','co2','light','pressure','heartbeat'
             value REAL NOT NULL,
-            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ts TIMESTAMP DEFAULT (datetime('now','localtime')),
             last_change_ts TIMESTAMP,             -- timestamp of last value change; NULL until second observation
+            publish_interval_s REAL,              -- EWMA of observed seconds between packets
             UNIQUE(device_id, sensor_name, sensor_type)
         );
         CREATE INDEX IF NOT EXISTS idx_readings_device_sensor
@@ -276,7 +348,7 @@ def _apply_migrations(conn):
         log.info("Migration: renamed sensor_readings.sensor_id -> sensor_name")
 
     conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','8')"
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','9')"
     )
 
 def init_db():
@@ -313,8 +385,8 @@ def audit(action, device_id=None, details="", username=None, cursor=None):
     if cursor is not None:
         try:
             cursor.execute(
-                "INSERT INTO audit_logs (device_id, username, action, details) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO audit_logs (device_id, username, action, details, timestamp) "
+                "VALUES (?, ?, ?, ?, datetime('now','localtime'))",
                 (device_id, username, action, details),
             )
         except Exception:
@@ -324,8 +396,8 @@ def audit(action, device_id=None, details="", username=None, cursor=None):
     try:
         conn = get_db()
         conn.execute(
-            "INSERT INTO audit_logs (device_id, username, action, details) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO audit_logs (device_id, username, action, details, timestamp) "
+            "VALUES (?, ?, ?, ?, datetime('now','localtime'))",
             (device_id, username, action, details),
         )
         conn.commit()
@@ -395,10 +467,32 @@ def _ensure_secret_key():
         log.warning("web.secret_key was weak; using a generated key for this "
                     "run but could not persist it to %s", CONFIG_FILE)
 
+# The password hash a user carries when no password has been set yet. It
+# is deliberately a value that no password can produce, so the committed
+# template can never be logged into. The salt is empty, which cannot occur
+# in a real hash (secrets.token_hex(8) always produces 16 hex chars).
+PLACEHOLDER_PASSWORD_SALT = ""
+PLACEHOLDER_PASSWORD_HASH = "!"
+
+
+def _is_placeholder_password(u):
+    """True when the account still carries the never-set placeholder."""
+    ph = u.get("password_hash") or {}
+    return (ph.get("salt") == PLACEHOLDER_PASSWORD_SALT
+            and ph.get("hash") == PLACEHOLDER_PASSWORD_HASH)
+
+
 def _check_credentials(username, password):
     users = config.get("auth", {}).get("users", {})
     u = users.get(username)
     if not u or "password_hash" not in u:
+        return False, None
+    # An account whose password was never set cannot be logged into. This
+    # is what makes the committed template safe to publish: it carries a
+    # placeholder, not a working credential.
+    if _is_placeholder_password(u):
+        log.warning("Login refused for %s: no password has been set for this "
+                    "account yet.", username)
         return False, None
     expected = u["password_hash"]["hash"]
     got = _hash_password(password, u["password_hash"]["salt"])
@@ -645,6 +739,40 @@ def on_mqtt_disconnect(client, userdata, rc, properties=None):
         mqtt_health["connected"] = False
         mqtt_health["last_disconnected_at"] = datetime.now()
     log.warning(f"MQTT disconnected (rc={rc}); paho will auto-reconnect.")
+
+# Adaptive staleness, part 1 of 2: maintain an exponentially-weighted moving
+# average of the observed seconds between packets for each channel, inside the
+# existing UPSERT (no extra query, no history table). Part 2 is
+# _stale_threshold_sql(), which judges silence against this instead of one
+# global window.
+#
+# Gaps outside 1..7200s are ignored so that a container restart, a broker
+# outage or a retained-message burst cannot poison the estimate: those produce
+# either a near-zero gap (burst) or an enormous one (downtime), neither of
+# which is the channel's real cadence.
+_INTERVAL_EWMA_SQL = """
+                        publish_interval_s = CASE
+                            WHEN (julianday(excluded.ts) - julianday(ts)) * 86400.0
+                                 BETWEEN 1 AND 7200
+                            THEN COALESCE(
+                                   0.3 * ((julianday(excluded.ts) - julianday(ts)) * 86400.0)
+                                   + 0.7 * publish_interval_s,
+                                   (julianday(excluded.ts) - julianday(ts)) * 86400.0)
+                            ELSE publish_interval_s
+                        END"""
+
+
+def _stale_threshold_sql(column="publish_interval_s"):
+    """SQL expression for how long THIS channel may be silent before it counts
+    as silent, as `MAX(floor, multiplier * observed_interval)`.
+
+    Takes two bound parameters, in order: the floor (watchdog.
+    sensor_flatline_seconds) and the multiplier
+    (watchdog.sensor_stale_interval_multiplier). A channel whose cadence is
+    not yet known falls back to the floor alone, which is the old behaviour.
+    """
+    return f"MAX(?, ? * COALESCE({column}, 0))"
+
 
 def _retry_mqtt_write(device_id, sensor_name, sensor_type, val, now, tol):
     """Re-attempt a single sensor write on a fresh connection."""
@@ -921,10 +1049,10 @@ def on_mqtt_message(client, userdata, msg):
                         last_change_ts = CASE
                             WHEN excluded.value = value THEN last_change_ts
                             ELSE excluded.ts
-                        END
+                        END,""" + _INTERVAL_EWMA_SQL + """
                 """, (device_id, sensor_name, sensor_type, val, now, now))
             else:
-                cursor.execute(f"""
+                cursor.execute("""
                     INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
                     VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
@@ -933,7 +1061,7 @@ def on_mqtt_message(client, userdata, msg):
                         last_change_ts = CASE
                             WHEN ABS(excluded.value - value) <= ? THEN last_change_ts
                             ELSE excluded.ts
-                        END
+                        END,""" + _INTERVAL_EWMA_SQL + """
                 """, (device_id, sensor_name, sensor_type, val, now, now, tol))
             # Roll up to devices for fast dashboard reads (last value wins per device, any sensor).
             if sensor_type == "temperature":
@@ -1050,9 +1178,13 @@ def _raise_or_nag(cursor, device_id, fault_type, fault_msg, nag_interval_s, now)
     ).fetchone()
     if active is None:
         cursor.execute(
-            "INSERT INTO alerts (device_id, alert_type, message, last_nagged_at) "
-            "VALUES (?, ?, ?, ?)",
-            (device_id, fault_type, fault_msg, now),
+            # triggered_at is set EXPLICITLY from local wall-clock. Relying on
+            # the column default meant SQLite's CURRENT_TIMESTAMP (UTC) while
+            # every comparison and every other timestamp in this app is local,
+            # so every alert was stamped hours in the past.
+            "INSERT INTO alerts (device_id, alert_type, message, last_nagged_at, triggered_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (device_id, fault_type, fault_msg, now, now),
         )
         telegram_engine.send_nag_alert(device_id, fault_type, fault_msg)
         return
@@ -1064,7 +1196,14 @@ def _raise_or_nag(cursor, device_id, fault_type, fault_msg, nag_interval_s, now)
         telegram_engine.send_nag_alert(device_id, fault_type, fault_msg)
         cursor.execute("UPDATE alerts SET last_nagged_at = ? WHERE id = ?", (now, active["id"]))
 
-def _detect_systemic_faults(conn, now, flatline_limit):
+# Alert types owned by the per-device loop in watchdog_eval_loop. OUT_OF_RANGE
+# is owned by the target-range pass and SYSTEMIC by the cluster pass; the
+# device loop must never resolve those or it destroys their nag state.
+_DEVICE_ALERT_TYPES = ("OFFLINE", "STALLED", "SENSOR_SILENT", "SUSPECTED_STALL")
+_DEVICE_ALERT_TYPES_SQL = ",".join("?" * len(_DEVICE_ALERT_TYPES))
+
+
+def _detect_systemic_faults(conn, now, flatline_limit, stale_mult=3.0):
     """Find faults that share a metric AND a time window across many devices.
 
     A single broker, ACL or network fault will stop one metric on every
@@ -1103,7 +1242,7 @@ def _detect_systemic_faults(conn, now, flatline_limit):
     # NOTE: this function is called with a plain connection (no row_factory),
     # so rows are tuples - index them positionally, never by name.
     rows = conn.execute("""
-        SELECT r.device_id, r.sensor_type, r.ts, r.sensor_name
+        SELECT r.device_id, r.sensor_type, r.ts, r.sensor_name, r.publish_interval_s
         FROM sensor_readings r
         WHERE r.sensor_type NOT IN ('heartbeat', 'diagnostic')
           AND r.ts IS NOT NULL
@@ -1119,13 +1258,16 @@ def _detect_systemic_faults(conn, now, flatline_limit):
     by_metric = {}
     _group_names = {}
     for r in rows:
-        device_id, sensor_type, ts, sensor_name = r[0], r[1], r[2], r[3]
+        device_id, sensor_type, ts, sensor_name, interval = r[0], r[1], r[2], r[3], r[4]
         last = _parse_ts(ts)
         if last is None:
             continue
         silent = (now - last).total_seconds()
-        silent = (now - last).total_seconds()
-        if silent > flatline_limit:
+        # Adaptive threshold: judge this channel against its OWN cadence, with
+        # flatline_limit as the floor. A 16-minute channel no longer joins a
+        # "systemic" cluster simply because it is 15 minutes into its cycle.
+        limit = max(flatline_limit, stale_mult * (interval or 0))
+        if silent > limit:
             by_metric.setdefault(sensor_type, []).append((device_id, silent, last))
             _group_names.setdefault(sensor_type, []).append((device_id, sensor_name))
 
@@ -1216,6 +1358,17 @@ def watchdog_eval_loop():
         # it pages, so a value oscillating across a limit does not flap the
         # alert (review finding B8). 0 restores the old immediate behaviour.
         oor_hysteresis = int(config["watchdog"].get("out_of_range_hysteresis_seconds", 60))
+        # How many of a channel's own publish intervals of silence before it
+        # counts as silent. sensor_flatline_seconds remains the floor, so a
+        # fast channel is still caught quickly; a channel that genuinely
+        # publishes every 16 minutes gets proportional headroom instead of
+        # flapping on every cycle.
+        stale_mult = float(config["watchdog"].get("sensor_stale_interval_multiplier", 3.0))
+        # Clear-side deadband for OUT_OF_RANGE, as a percentage of the
+        # configured band. A value parked on the limit (24.15 against a 24.0
+        # ceiling) otherwise resolves and re-raises every cycle: 43 such
+        # clear events were recorded in one morning.
+        oor_clear_pct = float(config["watchdog"].get("out_of_range_clear_margin_pct", 2.0))
         nag_interval    = config["telegram"]["nagging_interval_seconds"]
 
         # Preload the suppressed-sensor names. Doing this as a correlated
@@ -1234,7 +1387,7 @@ def watchdog_eval_loop():
         # level before it raises its own SENSOR_SILENT alert and pages. The
         # cluster is reported as one alert after the loop (review finding B2).
         _sc = get_db()
-        systemic = _detect_systemic_faults(_sc, now, flatline_limit)
+        systemic = _detect_systemic_faults(_sc, now, flatline_limit, stale_mult)
         _sc.close()
         clustered_pairs = {
             (dev, c["sensor_type"]) for c in systemic for dev in c["devices"]
@@ -1288,20 +1441,27 @@ def watchdog_eval_loop():
             # Heartbeat is excluded from the per-sensor checks: it is a health
             # counter, not an environmental measurement, and the STALLED rule
             # above already covers it. Counting it here would double-report.
-            sensor_fault = cursor.execute("""
+            # `stale_limit` is this channel's OWN adaptive threshold, carried
+            # out of SQL so the Python split below and the dashboard agree with
+            # it instead of each re-deriving a fixed window.
+            sensor_fault = cursor.execute(f"""
                 SELECT sensor_name, sensor_type, value, ts, last_change_ts,
+                       publish_interval_s,
+                       {_stale_threshold_sql()}                        AS stale_limit,
                        (julianday(?) - julianday(ts)) * 86400.0        AS silent_s,
                        (julianday(?) - julianday(last_change_ts)) * 86400.0 AS flat_s
                 FROM sensor_readings
                 WHERE device_id = ?
                   AND sensor_type NOT IN ('heartbeat', 'diagnostic')
                   AND last_change_ts IS NOT NULL
-                  AND (julianday(?) - julianday(last_change_ts)) * 86400.0 > ?
-            """, (now.isoformat(sep=" "),
+                  AND (julianday(?) - julianday(last_change_ts)) * 86400.0
+                      > {_stale_threshold_sql()}
+            """, (flatline_limit, stale_mult,
+                  now.isoformat(sep=" "),
                   now.isoformat(sep=" "),
                   device_id,
                   now.isoformat(sep=" "),
-                  flatline_limit)).fetchall()
+                  flatline_limit, stale_mult)).fetchall()
             # Apply the suppression filter in Python (see the preload note).
             _suppressed = _kd_map.get(device_id, set())
             if _suppressed:
@@ -1345,8 +1505,10 @@ def watchdog_eval_loop():
             #            previously it was nuked along with the flatline guess).
             #   FLAT   = packets ARE arriving but the value has not moved. This
             #            is a GUESS: a stable room legitimately holds one value.
-            silent = [r for r in sensor_fault if (r["silent_s"] or 0) > flatline_limit]
-            flat   = [r for r in sensor_fault if (r["silent_s"] or 0) <= flatline_limit]
+            silent = [r for r in sensor_fault
+                      if (r["silent_s"] or 0) > (r["stale_limit"] or flatline_limit)]
+            flat   = [r for r in sensor_fault
+                      if (r["silent_s"] or 0) <= (r["stale_limit"] or flatline_limit)]
 
             # Suppress SILENT channels that are part of a systemic cluster; the
             # cluster alert raised after the loop carries that information, and
@@ -1423,7 +1585,7 @@ def watchdog_eval_loop():
                 # failure from a long-standing one.
                 cursor.execute(
                     "INSERT INTO device_status_history(device_id, status, changed_at) "
-                    "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    "VALUES (?, ?, datetime('now','localtime'))",
                     (device_id, new_status),
                 )
 
@@ -1432,18 +1594,32 @@ def watchdog_eval_loop():
             # device that is OFFLINE also has fault_type == "OFFLINE", so the
             # old blanket branch never ran for it and its SUSPECTED_STALL
             # alert stayed open forever.
+            # IMPORTANT: only resolve the alert types THIS loop owns.
+            #
+            # The device loop previously resolved every open alert for the
+            # device, including OUT_OF_RANGE, which it does not manage — the
+            # range pass further down does. The result was that a sensor
+            # sitting out of range had its alert resolved at the top of every
+            # cycle and re-created at the bottom, so _raise_or_nag always saw
+            # "no active alert" and sent a BRAND NEW Telegram page every 30
+            # seconds: 120 pages an hour from one sensor, with
+            # nagging_interval_seconds bypassed entirely. Verified by counting
+            # a fresh alert row per cycle. SYSTEMIC is likewise owned by the
+            # systemic pass (and keyed on a synthetic device id).
             if fault_type is None:
                 cursor.execute(
-                    "UPDATE alerts SET resolved = 1 WHERE device_id = ? AND resolved = 0",
-                    (device_id,),
+                    "UPDATE alerts SET resolved = 1 WHERE device_id = ? AND resolved = 0 "
+                    f"AND alert_type IN ({_DEVICE_ALERT_TYPES_SQL})",
+                    (device_id, *_DEVICE_ALERT_TYPES),
                 )
             else:
                 # This device still has a fault of type `fault_type`. Resolve
-                # the OTHER fault types it is no longer in.
+                # the OTHER device-level fault types it is no longer in.
                 cursor.execute(
                     "UPDATE alerts SET resolved = 1 WHERE device_id = ? "
-                    "AND resolved = 0 AND alert_type != ?",
-                    (device_id, fault_type),
+                    "AND resolved = 0 AND alert_type != ? "
+                    f"AND alert_type IN ({_DEVICE_ALERT_TYPES_SQL})",
+                    (device_id, fault_type, *_DEVICE_ALERT_TYPES),
                 )
             # Raise / re-nag alert
             if fault_type:
@@ -1496,6 +1672,21 @@ def watchdog_eval_loop():
             prev = range_state.get((dev, name))
             open_now = prev is not None and prev[0] == 0
 
+            # Clear-side deadband. Entering the breach uses the raw limits, but
+            # LEAVING it requires the value to come back inside by a margin, so
+            # a reading parked on the boundary (24.15 against a 24.0 ceiling)
+            # cannot resolve and re-raise on alternating cycles. Expressed as a
+            # percentage of the configured band so it is meaningful for °C and
+            # ppm alike; 0 disables it.
+            if open_now and not breach and oor_clear_pct > 0:
+                band = (hi - lo) if (lo is not None) else abs(hi)
+                margin = abs(band) * (oor_clear_pct / 100.0)
+                still_near = (val > hi - margin) or (lo is not None and val < lo + margin)
+                if still_near:
+                    # Inside the limits but not yet clear of the deadband:
+                    # hold the breach open and do not touch the alert.
+                    continue
+
             if breach and not open_now:
                 # First cycle out of range: start the dwell clock. Do NOT page
                 # yet — the value must persist out of range for oor_hysteresis
@@ -1503,13 +1694,19 @@ def watchdog_eval_loop():
                 side = ("below %.1f" % lo) if (lo is not None and val < lo) else ("above %.1f" % hi)
                 msg = "%s is %.2f (%s, limit %.1f-%.1f)" % (
                     name, val, side, lo if lo is not None else -9999, hi)
+                # entered_at drives the dwell clock, so it MUST be local
+                # wall-clock to match `now`. With the old UTC default the
+                # dwell computed as (local now - UTC entered) = offset + real
+                # elapsed, which was always past the threshold — the
+                # hysteresis never actually gated anything and OUT_OF_RANGE
+                # flapped exactly as before.
                 conn.execute("""
-                    INSERT INTO out_of_range(device_id, sensor_name, value, severity, message)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO out_of_range(device_id, sensor_name, value, severity, message, entered_at)
+                    VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))
                     ON CONFLICT(device_id, sensor_name) DO UPDATE SET
                         value=excluded.value, severity=excluded.severity,
                         message=excluded.message, resolved=0, resolved_at=NULL,
-                        entered_at=CURRENT_TIMESTAMP
+                        entered_at=datetime('now','localtime')
                 """, (dev, name, val, sev, msg))
                 if oor_hysteresis <= 0:
                     _raise_or_nag(cursor, dev, "OUT_OF_RANGE", msg, nag_interval, now)
@@ -1530,7 +1727,7 @@ def watchdog_eval_loop():
                     _raise_or_nag(cursor, dev, "OUT_OF_RANGE", msg, nag_interval, now)
             elif not breach and open_now:
                 conn.execute(
-                    "UPDATE out_of_range SET resolved=1, resolved_at=CURRENT_TIMESTAMP "
+                    "UPDATE out_of_range SET resolved=1, resolved_at=datetime('now','localtime') "
                     "WHERE device_id=? AND sensor_name=?",
                     (dev, name),
                 )
@@ -1634,8 +1831,8 @@ def telegram_polling_thread():
                         dev_id = parts[1]
                         cursor.execute("UPDATE alerts SET acknowledged = 1 WHERE device_id = ? AND resolved = 0", (dev_id,))
                         cursor.execute(
-                            "INSERT INTO audit_logs (device_id, username, action, details) "
-                            "VALUES (?, ?, 'ACK', 'Acknowledged via Telegram')",
+                            "INSERT INTO audit_logs (device_id, username, action, details, timestamp) "
+                            "VALUES (?, ?, 'ACK', 'Acknowledged via Telegram', datetime('now','localtime'))",
                             (dev_id, chat),
                         )
                         conn.commit()
@@ -1650,8 +1847,8 @@ def telegram_polling_thread():
                         cursor.execute("UPDATE devices SET snooze_until = ? WHERE device_id = ?", (snooze_until, dev_id))
                         cursor.execute("UPDATE alerts SET resolved = 1 WHERE device_id = ? AND resolved = 0", (dev_id,))
                         cursor.execute(
-                            "INSERT INTO audit_logs (device_id, username, action, details) "
-                            "VALUES (?, ?, 'SNOOZE', ?)",
+                            "INSERT INTO audit_logs (device_id, username, action, details, timestamp) "
+                            "VALUES (?, ?, 'SNOOZE', ?, datetime('now','localtime'))",
                             (dev_id, chat, f"Snoozed for {hours}h via Telegram"),
                         )
                         conn.commit()
@@ -1986,6 +2183,54 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
 }
 .systemic-banner strong { color: var(--danger); }
 .systemic-banner .muted { color: var(--muted); }
+
+/* ---- Fleet summary strip -------------------------------------------------
+   The first question on a 31-device table is "is anything wrong, and how
+   much". Answering it required reading every row, so the counts are hoisted
+   to the top and double as one-click filters. */
+.fleet-summary {
+    display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem;
+    align-items: center;
+}
+.sumchip {
+    display: inline-flex; align-items: baseline; gap: .4rem;
+    padding: .45rem .8rem; border-radius: 999px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface);
+    color: var(--text); font: inherit; font-size: .85rem; font-weight: 500;
+    transition: transform .1s, box-shadow .15s;
+}
+.sumchip:hover { transform: translateY(-1px); box-shadow: var(--shadow); }
+.sumchip .sumn { font-size: 1.15rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+/* A zero count must not shout. Dimming it keeps the eye on what is non-zero. */
+.sumchip-zero { opacity: .45; font-weight: 400; }
+.sum-ok    { border-color: var(--success); color: var(--success); }
+.sum-crit  { border-color: var(--danger);  color: var(--danger); }
+.sum-warn  { border-color: var(--warning); color: var(--warning); }
+.sum-degr  { border-color: #6d28d9;        color: #6d28d9; }
+.sum-stale { border-color: #0891b2;        color: #0891b2; }
+.sum-oor   { border-color: var(--danger);  color: var(--danger); }
+.sum-muted { border-color: var(--muted);   color: var(--muted); }
+.sumchip-clear { margin-left: auto; color: var(--muted); font-size: .8rem; }
+
+/* ---- Honest headline readings -------------------------------------------
+   A reading is only meaningful together with its age. A stale value is shown
+   (the operator still wants to see CO2 on a CO2-stalled device) but is
+   visually demoted and carries its age, so it can never be mistaken for a
+   live one. */
+.mval { font-variant-numeric: tabular-nums; font-weight: 600; }
+.mval-stale { opacity: .5; font-weight: 400; text-decoration: underline dotted; }
+.mval-bad   { color: var(--danger); font-weight: 700; }
+.mval-supp  { opacity: .45; text-decoration: line-through; }
+.mage {
+    display: inline-block; margin-left: .25rem; padding: 0 .25rem;
+    border-radius: 4px; font-size: .68rem; font-weight: 600;
+    background: rgba(8,145,178,.14); color: #0891b2;
+    font-variant-numeric: tabular-nums; vertical-align: middle;
+}
+.mch {
+    display: inline-block; margin-left: .15rem; font-size: .65rem;
+    color: var(--muted); vertical-align: super;
+}
 .reason-line:last-child { margin-bottom: 0; }
 .reason-summary {
     display: inline-block; vertical-align: middle;
@@ -2102,6 +2347,17 @@ def _devices_column_count():
     """The number of columns in the devices table, counted from the header."""
     return len(re.findall(r'<th[^>]*class="col-', _DEVICES_TABLE_HEADER))
 
+
+def app_name():
+    """Product name for the page header, browser tab and wall board.
+
+    Read from config (facility.app_name) so it is branding, not a literal
+    scattered through the templates. facility.name remains the SITE name and
+    is used in the printed report.
+    """
+    return str(config.get("facility", {}).get("app_name")
+               or "PsygaBio Device Watchdog")
+
 def _render_layout(title, body, current_tab=None, wide=False):
     tabs = [
         ("devices", "Devices", "index"),
@@ -2132,12 +2388,12 @@ def _render_layout(title, body, current_tab=None, wide=False):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{title} — Sensor Watchdog</title>
+<title>{title} — {html_lib.escape(app_name())}</title>
 <style>{BASE_CSS}</style>
 </head>
 <body data-theme="light">
 <div class="app-header">
-  <h1>🍄 Mushroom Facility Sensor Watchdog</h1>
+  <h1>{html_lib.escape(app_name())}</h1>
   <nav class="nav-tabs">{nav_html}</nav>
   <div style="display:flex;gap:.5rem;align-items:center;">{user_chip}</div>
 </div>
@@ -2247,8 +2503,9 @@ def index():
   <button class="btn btn-sm" onclick="collapseAll()" title="Collapse all sensor panels and fault details">&#9656; Collapse all</button>
   <span style="margin-left:auto"><a class="btn btn-primary" href="{{{{ url_for('print_report') }}}}">🖨 Print Report</a></span>
 </div>
+<div id="fleet-summary" class="fleet-summary"></div>
 <div class="card">
-  <h3>Monitored Devices <span class="muted" style="font-weight:400;font-size:.85rem">— click a column header to sort</span></h3>
+  <h3>Monitored Devices <span class="muted" style="font-weight:400;font-size:.85rem">— click a row to expand, a column header to sort</span></h3>
   <div id="systemic-banner"></div>
   <div style="overflow-x:auto">
     <table class="table devices">
@@ -2263,6 +2520,45 @@ def index():
 <script>{DASHBOARD_JS}</script>
 """
     return _render_layout("Dashboard", body, current_tab="devices", wide=True)
+
+def _headline_metric(sensors, metric, stale_after):
+    """The authoritative value for one headline metric on one device.
+
+    Derived from the device's actual channels, NOT from the denormalised
+    devices.last_temp/last_hum/last_co2 columns. Those columns are overwritten
+    by whichever channel published most recently, so a device carrying two CO2
+    channels (maxim4 has maxim4_co2 and maxim4_scd30_co2) flip-flops between
+    two different readings, and — worse — they are never aged out. A CO2
+    reading from two days ago renders as a plain number that looks current.
+    For a GMP facility that is the dangerous failure mode: a stale value that
+    looks live. §7.1/§7.2 of the review brief are both this bug.
+
+    So we report the FRESHEST channel for the metric plus the facts needed to
+    show it honestly: how old it is, which channel it came from, how many
+    channels contributed, and whether it is past the staleness window.
+    Returning the value even when stale is deliberate — the operator asked to
+    still see CO2 on a CO2-stalled device; it is just labelled as stale.
+    """
+    cand = [x for x in sensors
+            if x["sensor_type"] == metric
+            and x["value"] is not None
+            and x["silent_seconds"] is not None]
+    if not cand:
+        return None
+    best = min(cand, key=lambda x: x["silent_seconds"])
+    return {
+        "value": best["value"],
+        "age_seconds": best["silent_seconds"],
+        "flat_seconds": best["flat_seconds"],
+        "sensor_name": best["sensor_name"],
+        "ts": best["ts"],
+        "channels": len(cand),
+        "stale": best["silent_seconds"] > stale_after,
+        "in_range": best.get("in_range"),
+        "threshold": best.get("threshold"),
+        "known_degraded": best.get("known_degraded", False),
+    }
+
 
 @app.route("/api/devices")
 @login_required
@@ -2351,7 +2647,6 @@ def api_devices():
     # Operator-acknowledged known-degraded sensors. Excluded from alerting,
     # but still shown so the operator can see the sensor exists and is
     # knowingly suppressed.
-    hconn = get_db()
     try:
         kc = get_db()
         degraded = {}
@@ -2369,6 +2664,30 @@ def api_devices():
     except Exception:
         log.exception("known_degraded lookup failed")
         degraded = {}
+
+    # Status history for the "was X, now Y" tag, prefetched in ONE query and
+    # on a connection that is explicitly closed. This used to be a query per
+    # device *inside* the loop (31 round-trips per 10s poll) on a connection
+    # that was never closed — it relied on the garbage collector to release it
+    # and held a read snapshot open for the whole loop, which blocks WAL
+    # checkpointing. Open descriptors on the live container were creeping up.
+    status_hist = {}
+    hconn = get_db()
+    try:
+        for r in hconn.execute(
+            "SELECT device_id, status, changed_at FROM device_status_history "
+            "ORDER BY device_id, changed_at DESC"
+        ):
+            lst = status_hist.setdefault(r["device_id"], [])
+            if len(lst) < 2:                       # only the latest two matter
+                lst.append({"status": r["status"], "changed_at": r["changed_at"]})
+    except Exception:
+        log.exception("status history lookup failed")
+    finally:
+        try:
+            hconn.close()
+        except Exception:
+            pass
 
     for d in devices:
         thr = thresholds.get(d["device_id"], {})
@@ -2391,6 +2710,13 @@ def api_devices():
         d["thresholds"] = thr
         d["sensors"] = s
         d["sensor_count"] = len({x["sensor_name"] for x in s})
+        # Honest headline metrics, derived from the channels (see
+        # _headline_metric). The dashboard renders these instead of the
+        # never-aged devices.last_* columns.
+        d["headline"] = {
+            m: _headline_metric(s, m, flatline_limit)
+            for m in ("temperature", "humidity", "co2")
+        }
         d["location"] = d.get("location") or ""
         d["role"] = d.get("role") or ""
         d["faults"] = faults_by_device.get(d["device_id"], [])
@@ -2445,17 +2771,9 @@ def api_devices():
         # Feature 2: was this status reached recently, and what was it before?
         # The dashboard uses this to flash a changed row and to say
         # "was ONLINE, now OFFLINE".
-        try:
-            hist = hconn.execute(
-                "SELECT status, changed_at FROM device_status_history "
-                "WHERE device_id = ? ORDER BY changed_at DESC LIMIT 2",
-                (d["device_id"],),
-            ).fetchall()
-            d["status_changed_at"] = hist[0]["changed_at"] if hist else None
-            d["previous_status"] = hist[1]["status"] if len(hist) > 1 else None
-        except Exception:
-            d["status_changed_at"] = None
-            d["previous_status"] = None
+        hist = status_hist.get(d["device_id"], [])
+        d["status_changed_at"] = hist[0]["changed_at"] if hist else None
+        d["previous_status"] = hist[1]["status"] if len(hist) > 1 else None
 
     # Systemic fault rollup for the dashboard banner. Needs its own
     # connection because the main one is closed by this point.
@@ -2463,8 +2781,9 @@ def api_devices():
     sysconn = None
     try:
         flatline_limit = int(config.get("watchdog", {}).get("sensor_flatline_seconds", 300))
+        _mult = float(config.get("watchdog", {}).get("sensor_stale_interval_multiplier", 3.0))
         sysconn = get_db()
-        systemic = _detect_systemic_faults(sysconn, datetime.now(), flatline_limit)
+        systemic = _detect_systemic_faults(sysconn, datetime.now(), flatline_limit, _mult)
     except Exception:
         log.exception("systemic fault detection failed")
         systemic = []
@@ -2534,7 +2853,7 @@ def reset_device_stale(device_id):
     )
     cursor.execute("""
         UPDATE sensor_readings
-        SET last_change_ts = CURRENT_TIMESTAMP
+        SET last_change_ts = datetime('now','localtime')
         WHERE device_id = ?
     """, (device_id,))
     cursor.execute(
@@ -2765,8 +3084,8 @@ def admin_sensors_csv():
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO csv_uploads (saved_by, filename, row_count, applied, diff_summary) "
-        "VALUES (?, ?, ?, 0, ?)",
+        "INSERT INTO csv_uploads (saved_by, filename, row_count, applied, diff_summary, saved_at) "
+        "VALUES (?, ?, ?, 0, ?, datetime('now','localtime'))",
         (session.get("username","?"), filename, len(rows), diff_summary),
     )
     upload_id = cursor.lastrowid
@@ -2774,12 +3093,12 @@ def admin_sensors_csv():
     for r in rows:
         cursor.execute("""
             INSERT INTO device_metadata(device_id, location, role, source, uploaded_at, uploaded_by)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            VALUES (?, ?, ?, ?, datetime('now','localtime'), ?)
             ON CONFLICT(device_id) DO UPDATE SET
                 location    = excluded.location,
                 role        = excluded.role,
                 source      = excluded.source,
-                uploaded_at = CURRENT_TIMESTAMP,
+                uploaded_at = datetime('now','localtime'),
                 uploaded_by = excluded.uploaded_by
         """, (r["device_id"], r["location"], r["role"], source, session.get("username","?")))
         cursor.execute("""
@@ -2940,11 +3259,11 @@ def admin_degraded():
         conn = get_db()
         conn.execute("""
             INSERT INTO known_degraded(device_id, sensor_name, reason, suppressed_by, created_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, datetime('now','localtime'))
             ON CONFLICT(device_id, sensor_name) DO UPDATE SET
                 reason = excluded.reason,
                 suppressed_by = excluded.suppressed_by,
-                created_at = CURRENT_TIMESTAMP
+                created_at = datetime('now','localtime')
         """, (device_id, sensor_name, reason, who))
         conn.commit(); conn.close()
         audit("KNOWN_DEGRADED_ADDED", device_id=device_id,
@@ -3063,7 +3382,8 @@ def _read_config_text():
 def _save_config_history(content, saved_by, note):
     conn = get_db()
     conn.execute(
-        "INSERT INTO config_history (saved_by, note, content) VALUES (?, ?, ?)",
+        "INSERT INTO config_history (saved_by, note, content, saved_at) "
+        "VALUES (?, ?, ?, datetime('now','localtime'))",
         (saved_by, note, content),
     )
     cap = int(config.get("auth", {}).get("config_history_max_versions", 50))
@@ -3853,7 +4173,7 @@ table.faults td { padding: .8rem; border-bottom: 1px solid #1a222c; }
 @login_required
 def wallboard():
     body = f"""<div class="bar">
-  <h1>&#127812; Sensor Watchdog &mdash; Facility Board</h1>
+  <h1>{html_lib.escape(app_name())} &mdash; Facility Board</h1>
   <span id="mqtt-state" class="mqtt down">BROKER ...</span>
   <span id="alarm-ribbon" class="alarm-ribbon"></span>
   <span id="clock"></span>
@@ -3861,6 +4181,7 @@ def wallboard():
 <div id="stage" class="stage"></div>
 <script>
 window.REFRESH_SECONDS = 5;
+window.APP_NAME = "{html_lib.escape(app_name())}";
 window.CSRF_TOKEN = "{_csrf_token()}";
 window.SITE_BUZZ_STYLE = "{_site_buzz_style()}";
 </script>
@@ -3869,7 +4190,7 @@ window.SITE_BUZZ_STYLE = "{_site_buzz_style()}";
     html_doc = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sensor Watchdog - Facility Board</title>
+<title>{html_lib.escape(app_name())} - Facility Board</title>
 <style>{WALL_CSS}</style></head>
 <body>{body}</body></html>"""
     return html_doc
@@ -3918,7 +4239,8 @@ def api_wallboard():
     # count of out-of-range breaches the old code mislabelled as systemic
     # (review finding B13).
     flatline_limit = int(config.get("watchdog", {}).get("sensor_flatline_seconds", 300))
-    systemic = _detect_systemic_faults(conn, datetime.now(), flatline_limit)
+    _mult = float(config.get("watchdog", {}).get("sensor_stale_interval_multiplier", 3.0))
+    systemic = _detect_systemic_faults(conn, datetime.now(), flatline_limit, _mult)
     conn.close()
 
     faults = [{
@@ -4087,7 +4409,7 @@ def _rebase_stale_readings_on_boot():
     cursor = conn.cursor()
     rebase_count = cursor.execute("""
         UPDATE sensor_readings
-        SET last_change_ts = CURRENT_TIMESTAMP
+        SET last_change_ts = datetime('now','localtime')
         WHERE last_change_ts IS NULL
            OR (julianday('now') - julianday(last_change_ts)) * 86400.0 > ?
     """, (flatline_limit * 4,)).rowcount  # 4x the limit: only rebase genuinely stale.
