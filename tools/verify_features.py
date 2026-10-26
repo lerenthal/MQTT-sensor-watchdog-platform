@@ -109,6 +109,28 @@ if token:
     results.append(("1. ignore hides the device", hidden))
     results.append(("1. resume restores the device", back))
 
+# ---- 6. The alarm toggle and the five styles.
+wb = get("/wallboard")
+has_toggle = "STOP ALARM" in wb and "beepTest()" in wb
+results.append(("6. alarm button is a toggle (STOP ALARM present)", has_toggle))
+styles = ["chime", "warble", "siren", "klaxon", "continuous"]
+present = [st for st in styles if f'value="{st}"' in wb]
+results.append((f"6. all five buzzer styles in the dropdown ({len(present)}/5)",
+                len(present) == 5))
+results.append(("6. style dropdown wired to setBuzzStyle",
+                "setBuzzStyle(this.value)" in wb))
+results.append(("6. site default style injected",
+                "window.SITE_BUZZ_STYLE" in wb))
+results.append(("6. clock in the top ribbon", 'id="clock"' in wb))
+results.append(("6. buzzer button in the top ribbon", 'id="beep-btn"' in wb))
+
+# ---- 7. Configuration help items.
+admin = get("/admin/config")
+n_help = admin.count('class="help-item"')
+results.append((f"7. configuration help items present ({n_help})", n_help >= 15))
+results.append(("7. help documents buzzer_style", "watchdog.buzzer_style" in admin))
+results.append(("7. help documents the MQTT client id", "mqtt.client_id" in admin))
+
 print()
 print("=== feature verification ===")
 fails = 0

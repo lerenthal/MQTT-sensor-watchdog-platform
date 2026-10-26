@@ -336,3 +336,63 @@ The **Snooze** column of the table carries a dropdown (1 hour, 8 hours,
 expanding the row. A snoozed device shows a **Snoozed** badge with a
 **Resume** button instead.
 
+## The wall board alarm controls
+
+The top ribbon of the wall board is always visible. From left to right:
+the board title, the broker status light, the **alarm controls** and the
+**clock**. The clock is deliberately large and bright - it has to be
+readable from across the room.
+
+### Testing the alarm
+
+**TEST ALARM** is a toggle, not a one-shot:
+
+- **Press once** - the alarm tone starts and repeats, and the screen
+  flashes. The button turns amber and its label changes to **STOP
+  ALARM**.
+- **Press again** - everything stops. The button returns to **TEST
+  ALARM**.
+
+A test you cannot stop is worse than useless: the operator ends up
+hunting for the TV remote to mute it.
+
+The first press also confirms whether the screen can make a sound at
+all. Browsers block audio until the page has been interacted with, so
+if the tone is silent, click once anywhere on the page and press the
+button again. The status text next to the button says what happened.
+
+### Choosing an alarm tone
+
+Five styles, from gentle to intrusive:
+
+| Style | Sound | Use when |
+|---|---|---|
+| **Chime** | Soft two-note rise | Quiet rooms, night shift. May not carry across a noisy space. |
+| **Warble** | Fast alternating tone | Noticeable without being alarming. |
+| **Siren** *(default)* | Rising/falling two-tone | The recommended balance - loud enough to carry, patterned enough to read as an alarm. |
+| **Klaxon** | Low harsh bray | You need it heard over machinery. |
+| **Continuous** | Unbroken tone | A missed alarm would be a compliance event, not an inconvenience. |
+
+The dropdown next to the button **auditions** a style immediately. It
+does NOT change the site default - that is set in the config:
+
+```yaml
+watchdog:
+  buzzer_style: siren
+```
+
+Valid values: `chime`, `warble`, `siren`, `klaxon`, `continuous`. An
+unknown value is rejected on save rather than silently ignored. A
+config change applies to the wall board on its next page load.
+
+## Configuration help
+
+**Admin Config** opens with a **Configuration help** section above the
+YAML editor. Every setting is listed with what it does, its default, the
+unit, and the practical consequence of changing it - for example that
+the MQTT client id must be unique per instance, or that flatline
+detection is off by default because a constant reading is
+indistinguishable from a frozen sensor.
+
+Click any item to expand it.
+

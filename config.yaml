@@ -24,6 +24,13 @@ watchdog:
   - spare-1
   - spare-2
   out_of_range_hysteresis_seconds: 60
+  # Alarm tone for the wall board. One of:
+  #   chime       - gentle two-note chime; easy to live with, may not carry
+  #   warble      - fast alternation; noticeable
+  #   siren       - rising/falling two-tone (recommended default)
+  #   klaxon      - loud and harsh
+  #   continuous  - unbroken tone; most intrusive
+  buzzer_style: siren
 web:
   host: 0.0.0.0
   port: 5050

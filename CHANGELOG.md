@@ -184,3 +184,31 @@ single Python process, packaged in Docker Compose. Schema v1
 - The wall board's alarm test button is now large, high-contrast and
   labelled **TEST ALARM**, so it can be found on a TV across a room.
 - The Snooze column was widened (7% -> 10%) to fit the dropdown.
+
+## 2026-10-26 - Wall board alarm controls, configuration help
+
+### Added
+- Five alarm tone styles: chime, warble, siren (default), klaxon and
+  continuous. Each is a distinct tone pattern with its own waveform and
+  gain, ordered by how intrusive it is. The site default is
+  `watchdog.buzzer_style` in the config; an unknown value is rejected
+  on save rather than silently falling back. The dropdown on the wall
+  board auditions a style without changing the site default.
+- **Configuration help** on the Admin Config page: every configuration
+  key documented with its purpose, default, unit and the practical
+  consequence of changing it. The YAML editor is unforgiving - a typo
+  in a key name is silently ignored - so the reference sits next to it.
+
+### Changed
+- The alarm test button is now a toggle. Press once to start the tone
+  and the screen flash; press again to stop. The button shows what it
+  will do next and turns amber while the alarm runs. A test that
+  cannot be stopped leaves the operator hunting for the TV remote.
+- The wall board ribbon now always shows the alarm controls and the
+  clock together at the right, with the clock bright and bold instead
+  of dim grey. The buzzer and the time are the two things an operator
+  must be able to see and reach at a glance.
+
+### Fixed
+- A duplicate `#clock` CSS rule later in the stylesheet was overriding
+  the bold one, so the clock rendered dim grey. Removed.

@@ -146,6 +146,7 @@ live broker. They are runnable, not just documentation:
 | `tools/verify_restart.sh <service> <device>` | The restart path: command published, broker acknowledgement, heartbeat reset. |
 | `tools/verify_restart_probe.py <device>` | The restart path, run inside the container, watching for the LWT status cycle that proves a reboot. |
 | `tools/find_restart_topic.py <device>` | Probes candidate restart topics to find the one a device actually listens on. |
+| `tools/test_wallboard.js` | Headless test of the alarm toggle and style selector - no browser needed. |
 
 ```bash
 .venv/bin/python tools/verify_features.py http://localhost:5050

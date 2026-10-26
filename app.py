@@ -1822,6 +1822,40 @@ tr.row-changed-persist td:first-child { box-shadow: inset 3px 0 0 var(--warning)
 .snooze-ctl { display: inline-flex; align-items: center; gap: .25rem; }
 .snooze-ctl .dropdown-menu { right: 0; }
 .table.devices td.col-actions { white-space: nowrap; }
+
+/* Configuration help items. Each key is a collapsible summary so the
+   reference stays scannable. */
+.help-list { display: flex; flex-direction: column; gap: .35rem; }
+.help-item {
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--card-alt, rgba(127,127,127,.05));
+}
+.help-item > summary {
+    cursor: pointer; padding: .55rem .75rem; list-style: none;
+    display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap;
+}
+.help-item > summary::-webkit-details-marker { display: none; }
+.help-item > summary::before {
+    content: '\25B8'; color: var(--muted-foreground); font-size: .9rem;
+    transition: transform .15s ease;
+}
+.help-item[open] > summary::before { transform: rotate(90deg); }
+.help-item code {
+    background: rgba(127,127,127,.14); padding: .1rem .4rem;
+    border-radius: 4px; font-size: .85rem; font-weight: 600;
+}
+.help-title { font-weight: 600; }
+.help-body {
+    padding: 0 .75rem .7rem 2rem; font-size: .9rem;
+    color: var(--muted-foreground);
+}
+.help-body p { margin: 0 0 .5rem; }
+.help-body dl {
+    display: grid; grid-template-columns: max-content 1fr;
+    gap: .2rem .8rem; margin: 0;
+}
+.help-body dt { font-weight: 600; color: var(--foreground); }
+.help-body dd { margin: 0; }
 /* Persistent tint by severity, so the colour still means something after
    the flash has ended. */
 tr.row-offline  td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
@@ -3019,6 +3053,14 @@ def admin_config():
 
     body = f"""{flash_html}
 <div class="card">
+  <h3>Configuration help</h3>
+  <p class="muted" style="margin-top:0">
+    What each setting does, its default, and what changes when you alter
+    it. Click any item to expand it.
+  </p>
+  <div class="help-list">{_config_help_html()}</div>
+</div>
+<div class="card">
   <h3>Edit configuration</h3>
   <p class="muted" style="margin-top:0">
     Saving snapshots the current config to history before overwriting it.
@@ -3156,6 +3198,21 @@ def admin_config_post():
         _ign = [_ign]
     config.setdefault("watchdog", {})["ignored_devices"] = sorted(
         {str(d).strip() for d in _ign if str(d).strip()})
+
+    # Validate the buzzer style. An unknown value would silently fall back
+    # to the default, and the operator would think their setting applied.
+    _bz = str((config.get("watchdog") or {}).get("buzzer_style") or "").strip()
+    if _bz and _bz not in BUZZ_STYLES:
+        return _render_layout(
+            "Admin",
+            f'<div class="card"><div class="flash error">Unknown buzzer_style '
+            f'{html_lib.escape(_bz)!r}. Valid values: '
+            f'{", ".join(BUZZ_STYLES)}.</div>'
+            f'<a class="btn" href="/admin/config">&#8592; Back to editor</a></div>',
+            current_tab="admin",
+        )
+    if _bz:
+        config["watchdog"]["buzzer_style"] = _bz
     if "web" in new_cfg and "dashboard_refresh_seconds" in new_cfg["web"]:
         config["web"]["dashboard_refresh_seconds"] = new_cfg["web"]["dashboard_refresh_seconds"]
 
@@ -3357,9 +3414,220 @@ def print_report():
 </div>
 </body></html>"""
 
+# The five alarm styles offered on the wall board. The site default comes
+# from watchdog.buzzer_style in the config; an operator can audition
+# another style on the screen without changing the site default.
+BUZZ_STYLES = ("chime", "warble", "siren", "klaxon", "continuous")
+DEFAULT_BUZZ_STYLE = "siren"
+
+
+def _site_buzz_style():
+    """The configured default alarm style, or the built-in default."""
+    try:
+        style = str((config.get("watchdog") or {}).get("buzzer_style") or "").strip()
+    except Exception:
+        style = ""
+    return style if style in BUZZ_STYLES else DEFAULT_BUZZ_STYLE
+
 # -----------------------------------------------------------------------------
 # Wall-display alarm board
 # -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Configuration help
+#
+# Inline documentation for the YAML editor. Each entry maps a dotted config
+# path to what the key does, its default, the unit, and the practical
+# consequence of changing it. Rendered beside the editor and in a
+# dedicated Help section, so an operator does not have to read the file to
+# find out what a knob does.
+# ---------------------------------------------------------------------------
+CONFIG_HELP = [
+    {
+        "path": "mqtt.broker",
+        "title": "MQTT broker address",
+        "what": "Host name or IP of the MQTT broker the sensors publish to.",
+        "default": "10.10.17.11",
+        "unit": "hostname or IP",
+        "notes": "The watchdog only READS from this broker. Restart required "
+                 "if changed.",
+    },
+    {
+        "path": "mqtt.port",
+        "title": "MQTT broker port",
+        "what": "TCP port of the MQTT broker.",
+        "default": "1883",
+        "unit": "port",
+        "notes": "Restart required if changed.",
+    },
+    {
+        "path": "mqtt.username / mqtt.password",
+        "title": "MQTT credentials",
+        "what": "Credentials used to authenticate to the broker.",
+        "default": "(none - set via WATCHDOG_MQTT_PASSWORD in .env)",
+        "unit": "-",
+        "notes": "Prefer the environment variable so the secret is not in "
+                 "the config file. The broker ACL is per-source-address: the "
+                 "watchdog's Docker bridge address is allowed, the host LAN "
+                 "address may not be.",
+    },
+    {
+        "path": "mqtt.client_id",
+        "title": "MQTT client id",
+        "what": "Identity this instance presents to the broker.",
+        "default": "sensor-watchdog-<instance id>",
+        "unit": "-",
+        "notes": "MUST be unique per running instance. Mosquitto allows one "
+                 "connection per client id and kicks the older session, so two "
+                 "instances sharing an id push each other off the broker in a "
+                 "reconnect loop. Set WATCHDOG_INSTANCE_ID in the compose file.",
+    },
+    {
+        "path": "watchdog.check_interval_seconds",
+        "title": "Evaluation interval",
+        "what": "How often the watchdog evaluates stall, offline and range rules.",
+        "default": "30",
+        "unit": "seconds",
+        "notes": "Shorter detects faults faster but increases database and "
+                 "CPU load. Also the granularity at which a stale alert is "
+                 "resolved.",
+    },
+    {
+        "path": "watchdog.default_heartbeat_timeout_seconds",
+        "title": "Heartbeat timeout",
+        "what": "A device is STALLED when its heartbeat counter has not "
+                "advanced for this long.",
+        "default": "180",
+        "unit": "seconds",
+        "notes": "This is the 'device is alive but not reporting' rule. A "
+                 "device that stops publishing entirely trips the OFFLINE "
+                 "rule instead, which is usually faster.",
+    },
+    {
+        "path": "watchdog.default_offline_timeout_seconds",
+        "title": "Offline timeout",
+        "what": "A device is OFFLINE when nothing has been received from it "
+                "for this long.",
+        "default": "120",
+        "unit": "seconds",
+        "notes": "Should be shorter than the heartbeat timeout - no data at "
+                 "all is a stronger signal than a stale heartbeat.",
+    },
+    {
+        "path": "watchdog.sensor_flatline_detection_enabled",
+        "title": "Value flatline detection",
+        "what": "Detects a sensor whose VALUE stops changing, even though the "
+                "device is still publishing heartbeats.",
+        "default": "false",
+        "unit": "-",
+        "notes": "OFF by default and should stay off in a stable "
+                 "environment: a constant reading is indistinguishable from "
+                 "a frozen sensor, so this produces false alarms. The "
+                 "firmware's own stall verdict is trusted when present "
+                 "instead.",
+    },
+    {
+        "path": "watchdog.sensor_flatline_seconds",
+        "title": "Flatline window",
+        "what": "How long a value must be unchanged before it counts as a "
+                "flatline.",
+        "default": "900",
+        "unit": "seconds",
+        "notes": "Only used when flatline detection is enabled.",
+    },
+    {
+        "path": "watchdog.out_of_range_hysteresis_seconds",
+        "title": "Out-of-range hysteresis",
+        "what": "How long a reading must stay outside its target range "
+                "before an alert is raised, and how long it must come back "
+                "before the alert clears.",
+        "default": "60",
+        "unit": "seconds",
+        "notes": "Prevents a reading hovering on the limit from flapping the "
+                 "alert on and off.",
+    },
+    {
+        "path": "watchdog.ignored_devices",
+        "title": "Ignore list",
+        "what": "Devices that are installed but not currently in use.",
+        "default": "[] (empty)",
+        "unit": "device ids",
+        "notes": "An ignored device is hidden from the dashboard AND excluded "
+                 "from alerting entirely - no Telegram message, no wall board "
+                 "entry, no status evaluation. Its readings are still "
+                 "recorded, so resuming monitoring restores its history. "
+                 "Manage from Admin Config > Ignore List.",
+    },
+    {
+        "path": "watchdog.buzzer_style",
+        "title": "Alarm tone style",
+        "what": "The tone the wall board uses for a new fault.",
+        "default": "siren",
+        "unit": "chime | warble | siren | klaxon | continuous",
+        "notes": "chime = gentle two-note chime, easy to live with but may "
+                 "not carry across a noisy room. warble = fast alternation, "
+                 "noticeable. siren = rising/falling two-tone, the "
+                 "recommended default. klaxon = loud and harsh. continuous = "
+                 "unbroken tone, most intrusive - use where a missed alarm "
+                 "is a compliance event. The operator can audition any style "
+                 "from the dropdown on the wall board without changing this "
+                 "default.",
+    },
+    {
+        "path": "telegram.enabled",
+        "title": "Telegram paging",
+        "what": "Send fault notifications to a Telegram chat.",
+        "default": "false",
+        "unit": "-",
+        "notes": "Needs telegram.token and telegram.chat_id. The bot token is "
+                 "best supplied via WATCHDOG_TG_TOKEN in .env.",
+    },
+    {
+        "path": "telegram.repeat_minutes",
+        "title": "Repeat interval",
+        "what": "How often an unacknowledged fault is re-sent.",
+        "default": "15",
+        "unit": "minutes",
+        "notes": "This is what makes the paging persistent: a fault keeps "
+                 "nagging until someone acknowledges or snoozes it.",
+    },
+    {
+        "path": "web.port",
+        "title": "Web port",
+        "what": "Port the dashboard and wall board listen on.",
+        "default": "5050",
+        "unit": "port",
+        "notes": "Restart required if changed. The pilot instance uses 5060.",
+    },
+    {
+        "path": "web.require_login",
+        "title": "Require login",
+        "what": "Force authentication before the dashboard is served.",
+        "default": "true",
+        "unit": "-",
+        "notes": "Do not disable this on a network that is not trusted.",
+    },
+]
+
+
+def _config_help_html():
+    """Render CONFIG_HELP as HTML for the config page."""
+    rows = []
+    for h in CONFIG_HELP:
+        rows.append(
+            f'<details class="help-item">'
+            f'<summary><code>{html_lib.escape(h["path"])}</code> '
+            f'<span class="help-title">{html_lib.escape(h["title"])}</span></summary>'
+            f'<div class="help-body">'
+            f'<p>{html_lib.escape(h["what"])}</p>'
+            f'<dl>'
+            f'<dt>Default</dt><dd>{html_lib.escape(h["default"])}</dd>'
+            f'<dt>Unit</dt><dd>{html_lib.escape(h["unit"])}</dd>'
+            f'<dt>Notes</dt><dd>{html_lib.escape(h["notes"])}</dd>'
+            f'</dl></div></details>'
+        )
+    return "".join(rows)
+
+
 WALL_CSS = """
 * { box-sizing: border-box; margin: 0; }
 body {
@@ -3375,6 +3643,21 @@ body {
 .bar h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: .02em; }
 .mqtt { margin-left: auto; font-size: 1rem; font-weight: 700; padding: .3rem .9rem;
         border-radius: 999px; }
+/* The clock and the buzzer are the two things an operator must always be
+   able to see and reach, so they are pinned to the right of the ribbon. */
+#clock {
+    font-size: 1.5rem; font-weight: 800; font-variant-numeric: tabular-nums;
+    color: #e6edf3; min-width: 6.5ch; text-align: right;
+}
+.beep-controls { margin-left: .5rem; }
+/* The style picker. Small on purpose - it is a setup control, not an
+   alarm control. */
+.buzzer-style {
+    background: #1f2a37; color: #e6edf3; border: 1px solid #3d4b60;
+    border-radius: 6px; padding: .3rem .4rem; font-size: .8rem;
+    font-family: inherit; cursor: pointer;
+}
+.buzzer-style:hover { border-color: #fbbf24; }
 /* Beep test control. The operator must be able to find it on a TV across
    a room, so it is deliberately large and high-contrast - it is the one
    control that proves the wall display can raise an audible alarm. */
@@ -3395,6 +3678,9 @@ body {
     cursor: pointer; font-family: inherit;
 }
 .beep-btn:hover { background: #fbbf24; color: #1f2937; }
+/* While the test alarm is running the button becomes the stop action. */
+.beep-btn.on { background: #fbbf24; color: #1f2937; animation: pulse 1s infinite; }
+.beep-btn.on:hover { background: #f87171; color: #1f2937; }
 .beep-status { font-size: .8rem; color: #7d8590; max-width: 34ch; }
 .beep-status.ok  { color: #4ade80; }
 .beep-status.bad { color: #f87171; }
@@ -3407,8 +3693,8 @@ body {
 .stage.beep-test-flash { animation: beepflash .5s 3; }
 .mqtt.ok   { background: #10371f; color: #4ade80; }
 .mqtt.down { background: #4a1414; color: #f87171; animation: pulse 1s infinite; }
-#clock { font-size: 1.5rem; font-weight: 300; color: #7d8590;
-         font-variant-numeric: tabular-nums; }
+/* (the #clock rule above is the live one - it is intentionally bright and
+   bold, because the time must be readable from across the room) */
 .stage { flex: 1; padding: 2rem; overflow-y: auto; }
 .clear-mark { font-size: 12rem; color: #16a34a; text-align: center; line-height: 1;
               margin-top: 4vh; }
@@ -3456,14 +3742,27 @@ def wallboard():
     &#128266; Click anywhere to enable the alarm sound
   </span>
   <span id="mqtt-state" class="mqtt down">BROKER ...</span>
-  <span id="clock"></span>
   <span class="beep-controls">
-    <button class="beep-btn" onclick="beepTest()" title="Play the alarm tone and flash the screen">&#128266; TEST ALARM</button>
+    <button id="beep-btn" class="beep-btn" onclick="beepTest()"
+            title="Test the alarm - press once to start, press again to stop">&#128266; TEST ALARM</button>
+    <select id="buzzer-style" class="buzzer-style" onchange="setBuzzStyle(this.value)"
+            title="Alarm tone style">
+      <option value="chime">Chime (gentle)</option>
+      <option value="warble">Warble (noticeable)</option>
+      <option value="siren" selected>Siren (recommended)</option>
+      <option value="klaxon">Klaxon (loud, harsh)</option>
+      <option value="continuous">Continuous (most intrusive)</option>
+    </select>
     <span id="beep-status" class="beep-status"></span>
   </span>
+  <span id="clock"></span>
 </div>
 <div id="stage" class="stage"></div>
-<script>window.REFRESH_SECONDS = 5; window.CSRF_TOKEN = "{_csrf_token()}";</script>
+<script>
+window.REFRESH_SECONDS = 5;
+window.CSRF_TOKEN = "{_csrf_token()}";
+window.SITE_BUZZ_STYLE = "{_site_buzz_style()}";
+</script>
 <script>{WALLBOARD_JS}</script>"""
     html_doc = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
