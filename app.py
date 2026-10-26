@@ -3375,8 +3375,9 @@ body {
 .bar h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: .02em; }
 .mqtt { margin-left: auto; font-size: 1rem; font-weight: 700; padding: .3rem .9rem;
         border-radius: 999px; }
-/* Beep test control. Kept small and out of the way - this is an operator
-   aid for verifying the screen can make a sound, not a dashboard control. */
+/* Beep test control. The operator must be able to find it on a TV across
+   a room, so it is deliberately large and high-contrast - it is the one
+   control that proves the wall display can raise an audible alarm. */
 .beep-controls { display: flex; align-items: center; gap: .6rem; }
 /* The browser blocks audio until a real user gesture. Until then the alarm
    would be silent, which is the one failure mode a wall display must not
@@ -3394,7 +3395,6 @@ body {
     cursor: pointer; font-family: inherit;
 }
 .beep-btn:hover { background: #fbbf24; color: #1f2937; }
-.beep-btn:hover { background: #2d3a4d; }
 .beep-status { font-size: .8rem; color: #7d8590; max-width: 34ch; }
 .beep-status.ok  { color: #4ade80; }
 .beep-status.bad { color: #f87171; }
