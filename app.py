@@ -2132,18 +2132,21 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
 .dv { font-size: .85rem; }
 .detail-sensors { margin-top: .6rem; padding-top: .5rem; border-top: 1px solid var(--border); }
 
-.col-device    { width: 13%;  }
+/* Column widths. The Sensors cell is now ONE line, so it needs less room
+   than the old multi-line version, and the table fits a 16:9 screen at
+   100% zoom without scrolling sideways. */
+.col-device    { width: 12%;  }
 .col-location  { width: 9%;   }
 .col-status    { width: 9%;   }
 .col-temp      { width: 5%;   }
 .col-hum       { width: 5%;   }
-.col-co2       { width: 6%;   }
-.col-reason    { width: 20%;  }
-.col-sensors   { width: 13%;  }
-.col-lastseen  { width: 8%;   }
-.col-heartbeat { width: 5%;   }
-.col-snooze    { width: 10%;  }
-.col-actions   { width: 6%;   }
+.col-co2       { width: 5%;   }
+.col-reason    { width: 17%;  }
+.col-sensors   { width: 17%;  }
+.col-lastseen  { width: 7%;   }
+.col-heartbeat { width: 4%;   }
+.col-snooze    { width: 6%;   }
+.col-actions   { width: 4%;   }
 /* Values are tabular so digits line up column to column. */
 .table.devices td.num { font-variant-numeric: tabular-nums; }
 /* Narrow viewports: shed the columns an operator can recover from the
@@ -2156,10 +2159,10 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
     .col-device   { width: 18%; }
     .col-location { width: 12%; }
     .col-status   { width: 11%; }
-    .col-reason   { width: 28%; }
-    .col-sensors  { width: 14%; }
-    .col-snooze   { width: 11%;  }
-    .col-actions  { width: 6%;  }
+    .col-reason   { width: 25%; }
+    .col-sensors  { width: 18%; }
+    .col-snooze   { width: 10%;  }
+    .col-actions  { width: 6%;   }
 }
 @media (max-width: 860px) {
     .col-location, .col-co2 { display: none; }
@@ -2244,8 +2247,15 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
 }
 /* FIX 1: keep the expanded sensor panel readable inside a table cell. */
 .sensor-line { padding: .1rem 0; }
-/* Compact per-sensor chips in the collapsed cell. */
-.svwrap { font-size: .82em; line-height: 1.45; }
+/* The Sensors cell: ONE line by default, with the full per-channel list
+   behind a toggle. The operator asked for a compact row per device with
+   the other sensor data on demand, rather than a wide table that has to
+   be scrolled sideways. */
+.svwrap { font-size: .82em; line-height: 1.3; }
+.svline {
+    display: flex; align-items: center; gap: .2rem;
+    white-space: nowrap; overflow: hidden;
+}
 .svrow { margin-bottom: .15rem; }
 .svtype {
     display: inline-block; min-width: 62px; color: var(--muted);
@@ -2256,12 +2266,31 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
     border-radius: 4px; background: var(--bg); border: 1px solid var(--border);
     white-space: nowrap; font-variant-numeric: tabular-nums;
 }
+/* The summary chip in the collapsed line. */
+.svhead { margin: 0; }
+/* "xN" badge when a metric has more than one channel. */
+.svcount {
+    display: inline-block; font-size: .8em; font-weight: 700;
+    color: var(--muted-foreground); vertical-align: super; margin-left: .1rem;
+}
+/* The expand/collapse toggle for the sensor panel. */
+.svtoggle {
+    padding: 0 .3rem; font-size: .7rem; line-height: 1.4;
+    flex-shrink: 0; margin-left: .15rem;
+}
+/* The panel holding every channel. */
+.svpanel {
+    margin-top: .4rem; padding: .45rem .5rem; border-radius: 6px;
+    background: var(--bg); font-size: .85rem;
+    border-left: 2px solid var(--border);
+}
+.svpanel .sensor-line { white-space: normal; }
 .sv.silent     { border-color: #0891b2; color: #0891b2; }
 .sv.flat       { border-color: #d97706; color: #d97706; }
 .sv.bad        { border-color: var(--danger); color: var(--danger); font-weight: 600; }
 .sv.suppressed { opacity: .5; text-decoration: line-through; }
 .table.devices td.col-sensors > div {
-    max-height: 190px; overflow-y: auto;
+    max-height: 260px; overflow-y: auto;
 }
 
 .badge.badge-warning   { background: var(--warning); color: white; }
@@ -2499,9 +2528,10 @@ def index():
   <span class="font-size-label" id="font-size-label">A</span>
   <input id="font-size-slider" type="range" min="10" max="20" step="1"
          title="Table font size" oninput="setFontSize(this.value)">
-  <button class="btn btn-sm" onclick="expandAll()" title="Expand every sensor panel">&#9662; Expand sensors</button>
-  <button class="btn btn-sm" onclick="collapseAll()" title="Collapse all sensor panels and fault details">&#9656; Collapse all</button>
-  <span style="margin-left:auto"><a class="btn btn-primary" href="{{{{ url_for('print_report') }}}}">🖨 Print Report</a></span>
+  <button class="btn btn-sm" onclick="expandAll()" title="Open every device's sensor panel">&#9662; Expand sensors</button>
+  <button class="btn btn-sm" onclick="expandEverything()" title="Open every sensor panel and every device row">&#9662; Expand all</button>
+  <button class="btn btn-sm" onclick="collapseAll()" title="Close every sensor panel, fault detail and device row">&#9656; Collapse all</button>
+  <span style="margin-left:auto"><a class="btn btn-primary" href="{url_for('print_report')}">🖨 Print Report</a></span>
 </div>
 <div id="fleet-summary" class="fleet-summary"></div>
 <div class="card">

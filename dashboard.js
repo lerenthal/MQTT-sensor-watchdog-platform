@@ -114,59 +114,6 @@ function statusBadge(s) {
     return '<span class="badge badge-offline">OFFLINE</span>';
 }
 
-function sensorCell(d) {
-    if (!d.sensor_count) {
-        return '<span class="muted">no readings</span>';
-    }
-    const h = d.sensor_health || {healthy: 0, suspected: 0, silent: 0};
-    const sorted = (d.sensors || []).slice().sort((a, b) => {
-        if (a.sensor_name !== b.sensor_name) return a.sensor_name.localeCompare(b.sensor_name);
-        return a.sensor_type.localeCompare(b.sensor_type);
-    });
-    const lines = sorted.map(s => {
-        const v = (typeof s.value === 'number') ? s.value.toFixed(2) : '--';
-        let flag = '';
-        if (s.silent_seconds > FLATLINE_LIMIT) {
-            flag = '<span class="badge badge-silent">silent '
-                 + Math.round(s.silent_seconds / 60) + 'm</span>';
-        } else if (s.flat_seconds > FLATLINE_LIMIT) {
-            flag = '<span class="badge badge-suspect">frozen '
-                 + Math.round(s.flat_seconds / 60) + 'm</span>';
-        } else if (s.in_range === false) {
-            const t = s.threshold || {};
-            const lim = (t.min != null ? t.min : '') + ' - ' + t.max;
-            flag = '<span class="badge badge-' + (t.severity === 'CRITICAL' ? 'offline' : 'stalled')
-                 + '">out of range (' + lim + ')</span>';
-        } else if (s.in_range === true) {
-            flag = '<span class="muted" style="font-size:.75rem">in range</span>';
-        }
-        return '<div class="sensor-line"><span class="ts">'
-             + escapeHtml(s.sensor_name) + '</span> &middot; '
-             + escapeHtml(s.sensor_type) + ': <strong>' + escapeHtml(v) + '</strong> '
-             + flag + '</div>';
-    }).join('');
-    const id = encodeURIComponent(d.device_id);
-    const isOpen = EXPANDED.has(d.device_id);
-    // Every sensor is named in the collapsed cell, grouped by metric. A count
-    // alone hid the fact that one device can publish several channels of the
-    // same type (maxim4 carries four temperature sensors).
-    let tally = '<span class="muted">' + d.sensor_count + ' sensor'
-        + (d.sensor_count !== 1 ? 's' : '') + '</span>';
-    if (h.silent)    tally += ' <span class="badge badge-silent">' + h.silent + ' silent</span>';
-    if (h.suspected) tally += ' <span class="badge badge-suspect">' + h.suspected + ' frozen</span>';
-    const kd = (d.known_degraded || []).length;
-    if (kd) tally += ' <span class="badge badge-muted">' + kd + ' suppressed</span>';
-    return tally
-        + ' <button class="btn btn-sm" onclick="toggleSensors(\''
-        + escapeHtml(d.device_id) + '\', this)">'
-        + (isOpen ? '&#9662;' : '&#9656;') + '</button>'
-        + '<div id="sensors-' + id + '" '
-        + 'style="display:' + (isOpen ? 'block' : 'none')
-        + ';margin-top:.5rem;padding:.5rem;'
-        + 'background:var(--bg);border-radius:6px;font-size:.85rem;">'
-        + lines + '</div>';
-}
-
 window.toggleSensors = function (deviceId, btn) {
     if (EXPANDED.has(deviceId)) {
         EXPANDED.delete(deviceId);
@@ -179,7 +126,15 @@ window.toggleSensors = function (deviceId, btn) {
     if (el) {
         const open = EXPANDED.has(deviceId);
         el.style.display = open ? 'block' : 'none';
-        if (btn) btn.innerHTML = open ? '&#9662;' : '&#9656;';
+        // The caret lives in the toggle button next to the summary line.
+        const caret = el.parentElement
+            ? el.parentElement.querySelector('.svtoggle') : null;
+        if (caret) {
+            caret.innerHTML = open ? '&#9662;' : '&#9656;';
+            caret.title = (open ? 'Hide' : 'Show')
+                        + ' every sensor on this device';
+        }
+        if (btn && btn !== caret) btn.innerHTML = open ? '&#9662;' : '&#9656;';
     }
 };
 
@@ -207,19 +162,59 @@ window.collapseReasons = function () {
     refresh();
 };
 
+// "Collapse all" closes everything: the per-device sensor panels, the
+// fault/reason details, AND the expanded device rows.
+//
+// Both sets of state have to be cleared. Clearing only one of them is what
+// made these buttons look broken: the device rows stayed expanded, so
+// nothing appeared to happen.
+//
+// The re-render is done directly rather than through refresh(), because
+// refresh() re-fetches from the server and the buttons must feel
+// instantaneous. refresh() runs a moment later and re-applies the same
+// state, so the two agree.
 window.collapseAll = function () {
     EXPANDED.clear();
     REASON_OPEN.clear();
+    EXPANDED_ROWS.clear();
     localStorage.setItem('watchdog-expanded', '[]');
     localStorage.setItem('watchdog-reason-open', '[]');
+    localStorage.setItem('watchdog-expanded-rows', '[]');
+    rerenderRows();
     refresh();
 };
 
+// "Expand sensors" opens every device's sensor panel without expanding
+// the device rows. The device row carries the headline metrics already,
+// so the operator can see the whole fleet's sensor detail at once.
 window.expandAll = function () {
     ALL_DEVICES.forEach(d => EXPANDED.add(d.device_id));
     localStorage.setItem('watchdog-expanded', JSON.stringify([...EXPANDED]));
+    rerenderRows();
     refresh();
 };
+
+// "Expand all" - sensors AND the device detail rows.
+window.expandEverything = function () {
+    ALL_DEVICES.forEach(d => {
+        EXPANDED.add(d.device_id);
+        EXPANDED_ROWS.add(d.device_id);
+    });
+    localStorage.setItem('watchdog-expanded', JSON.stringify([...EXPANDED]));
+    localStorage.setItem('watchdog-expanded-rows', JSON.stringify([...EXPANDED_ROWS]));
+    rerenderRows();
+    refresh();
+};
+
+// Re-render the table body from the current state, without a server
+// round-trip. Used by the toolbar buttons so they respond immediately.
+function rerenderRows() {
+    const tbody = document.getElementById('devices-tbody');
+    if (!tbody || !ALL_DEVICES.length) return;
+    tbody.innerHTML = ALL_DEVICES.map(renderRow).join('');
+    applyFilter();
+    applySort();
+}
 
 // The snooze control. Present in the compact row (always visible) and again
 // in the expanded detail. It is a dropdown of the configured presets plus an
@@ -687,6 +682,19 @@ window.setFontSize = function (px) {
 // The count alone hid the fact that a device can publish several sensors of
 // the same type (maxim4 has four temperature channels). The collapsed cell
 // now names them, so nothing is invisible until you expand.
+// The Sensors cell.
+//
+// ONE LINE by default. The operator asked for exactly this: a compact row
+// per device, with the full sensor data behind a click rather than
+// spilling sideways and making the table scroll.
+//
+// The collapsed line shows, per metric type, the FRESHEST channel's value
+// plus a count badge when a metric has more than one channel (maxim4 has
+// four temperature sensors). Clicking the cell opens a panel with EVERY
+// channel, its value and its health.
+//
+// The expanded state lives in EXPANDED, which is persisted - the same set
+// the toolbar's "Expand sensors" / "Collapse all" buttons drive.
 function sensorSummary(d) {
     const list = (d.sensors || [])
         .filter(s => s.sensor_type !== 'heartbeat' && s.sensor_type !== 'diagnostic')
@@ -702,26 +710,76 @@ function sensorSummary(d) {
         (groups[s.sensor_type] = groups[s.sensor_type] || []).push(s);
     });
 
-    const parts = Object.keys(groups).sort().map(t => {
-        const g = groups[t];
-        const names = g.map(s => {
-            const short = s.sensor_name
-                .replace(new RegExp('^' + escapeRegExp(d.device_id) + '_?'), '')
-                .replace(new RegExp('^' + escapeRegExp(d.device_id.replace(/_/g, '-')) + '_?'), '')
-                || s.sensor_name;
-            const v = (typeof s.value === 'number') ? s.value.toFixed(1) : '--';
-            let cls = 'sv';
-            if (s.known_degraded) cls += ' suppressed';
-            else if (s.in_range === false) cls += ' bad';
-            else if (s.silent_seconds > FLATLINE_LIMIT) cls += ' silent';
-            else if (s.flat_seconds > FLATLINE_LIMIT) cls += ' flat';
-            return '<span class="' + cls + '" title="' + escapeHtml(s.sensor_name) + '">'
-                 + escapeHtml(short) + ' ' + escapeHtml(v) + '</span>';
-        });
+    const shortName = (s) => s.sensor_name
+        .replace(new RegExp('^' + escapeRegExp(d.device_id) + '_?'), '')
+        .replace(new RegExp('^' + escapeRegExp(d.device_id.replace(/_/g, '-')) + '_?'), '')
+        || s.sensor_name;
+
+    const healthCls = (s) => {
+        if (s.known_degraded) return ' suppressed';
+        if (s.in_range === false) return ' bad';
+        if (s.silent_seconds > FLATLINE_LIMIT) return ' silent';
+        if (s.flat_seconds > FLATLINE_LIMIT) return ' flat';
+        return '';
+    };
+
+    // --- The full detail, rendered once and shown/hidden.
+    const detail = Object.keys(groups).sort().map(t => {
+        const names = groups[t].map(s => {
+            const v = (typeof s.value === 'number') ? s.value.toFixed(2) : '--';
+            let extra = '';
+            if (s.silent_seconds > FLATLINE_LIMIT) {
+                extra = ' <span class="badge badge-silent">silent '
+                      + Math.round(s.silent_seconds / 60) + 'm</span>';
+            } else if (s.flat_seconds > FLATLINE_LIMIT) {
+                extra = ' <span class="badge badge-suspect">frozen '
+                      + Math.round(s.flat_seconds / 60) + 'm</span>';
+            } else if (s.in_range === false) {
+                const th = s.threshold || {};
+                const lim = (th.min != null ? th.min : '') + ' - ' + th.max;
+                extra = ' <span class="badge badge-'
+                      + (th.severity === 'CRITICAL' ? 'offline' : 'stalled')
+                      + '">out of range (' + lim + ')</span>';
+            } else if (s.known_degraded) {
+                extra = ' <span class="badge badge-muted">suppressed</span>';
+            }
+            return '<div class="sensor-line"><span class="ts">'
+                 + escapeHtml(s.sensor_name) + '</span> &middot; '
+                 + escapeHtml(s.sensor_type) + ': <strong>'
+                 + escapeHtml(v) + '</strong>' + extra + '</div>';
+        }).join('');
         return '<div class="svrow"><span class="svtype">' + escapeHtml(t) + '</span>'
-             + names.join(' ') + '</div>';
-    });
-    return '<div class="svwrap">' + parts.join('') + '</div>';
+             + names + '</div>';
+    }).join('');
+
+    // --- The collapsed line: freshest channel per metric, + a count.
+    const line = Object.keys(groups).sort().map(t => {
+        const g = groups[t].slice().sort((a, b) =>
+            (a.silent_seconds ?? 1e9) - (b.silent_seconds ?? 1e9));
+        const best = g[0];
+        const v = (typeof best.value === 'number') ? best.value.toFixed(1) : '--';
+        const extra = g.length > 1
+            ? ' <span class="svcount" title="' + g.length + ' channels of '
+              + escapeHtml(t) + '">\u00d7' + g.length + '</span>'
+            : '';
+        return '<span class="sv svhead' + healthCls(best) + '" title="'
+             + escapeHtml(best.sensor_name) + '">'
+             + escapeHtml(shortName(best)) + ' ' + escapeHtml(v) + '</span>' + extra;
+    }).join('');
+
+    const id = encodeURIComponent(d.device_id);
+    const isOpen = EXPANDED.has(d.device_id);
+    return '<div class="svwrap">'
+         + '<div class="svline">'
+         + line
+         + '<button class="btn btn-xs svtoggle" onclick="toggleSensors(\''
+         + escapeHtml(d.device_id) + '\')" title="'
+         + (isOpen ? 'Hide' : 'Show') + ' every sensor on this device">'
+         + (isOpen ? '&#9662;' : '&#9656;') + '</button>'
+         + '</div>'
+         + '<div id="sensors-' + id + '" class="svpanel" style="display:'
+         + (isOpen ? 'block' : 'none') + '">' + detail + '</div>'
+         + '</div>';
 }
 
 function escapeRegExp(s) {

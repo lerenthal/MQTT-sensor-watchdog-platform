@@ -383,3 +383,43 @@ closed the gaps it left open.
 - `tests/test_followup_security.py` - 14 checks covering the placeholder
   refusal, the timezone pinning and agreement, the compose TZ default and
   the headline age reporting.
+
+## 2026-10-26 - Compact one-line rows, and three broken controls fixed
+
+### Fixed
+- **The Expand / Collapse / Print Report buttons did nothing.** Two
+  separate causes. The "Expand sensors" and "Collapse all" buttons
+  operated on an expansion Set that no rendering path read: the function
+  that used it (`sensorCell`) had been superseded by `sensorSummary` and
+  nothing called it any more, so the state it maintained was invisible.
+  "Collapse all" also only cleared the sensor panels, not the expanded
+  device rows, so the table still looked expanded. The Print Report link
+  was written as `{{{{ url_for('print_report') }}}}` inside an f-string,
+  where `{{` is an escaped literal brace — it rendered as the literal
+  text `{{ url_for('print_report') }}` and pointed at nothing.
+- The dead `sensorCell()` and `collapseReasons()` functions were removed
+  rather than left in place to mislead the next reader.
+
+### Changed
+- **The Sensors cell is one line.** It listed every channel of every
+  metric inline, so a device with eight sensors produced a tall,
+  multi-line cell and the table grew wide enough to need a sideways
+  scroll. The collapsed cell now shows one line — the freshest channel
+  per metric, with an `xN` badge when a metric has several channels —
+  and the full per-channel list, with its health flags, lives in a panel
+  that opens on click.
+- **Column widths rebalanced** so the table fits a 16:9 screen at 100%
+  zoom without horizontal scrolling. The sensors column gained the room
+  it needs for the summary line; Reason gave some back.
+- The toolbar gained an **Expand all** button (sensors *and* device rows)
+  alongside **Expand sensors** and **Collapse all**. The buttons
+  re-render immediately rather than waiting for the next poll.
+
+### Added
+- `tools/test_expansion_controls.js` - 24 checks: every expansion Set is
+  read by something that renders, "collapse all" clears all of them, the
+  Print Report link is a real URL and not an unrendered f-string
+  expression, and the Sensors cell is one line with a panel behind it.
+- `tools/test_expansion_behaviour.js` - 27 checks that run the real
+  dashboard.js against a stubbed DOM and prove the buttons change the
+  rendered output, which is what was actually broken.

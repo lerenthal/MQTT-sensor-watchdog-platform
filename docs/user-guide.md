@@ -531,3 +531,33 @@ The timezone is pinned at startup from `facility.timezone` in the config
 and the app verifies that its database and its own clock agree, logging a
 `TIMEZONE MISMATCH` error if they ever do not.
 
+## The device table
+
+**One line per device, by default.** Each row shows the headline metrics —
+temperature, humidity, CO₂, status, heartbeat, last seen, snooze — and
+nothing else. The **Sensors** cell shows one line too: for each metric
+type, the freshest channel's value, with an `×N` badge when that metric
+has more than one channel (maxim4 carries four temperature sensors).
+
+Click the `▸` next to the sensor summary to open that device's **sensor
+panel**, which lists every channel with its value and its health —
+silent, frozen, out of range, or suppressed. Click again to close it.
+
+Click anywhere else on a device row to expand the **detail panel** below
+it: location, role, status, last seen, heartbeat, the full fault list with
+timestamps, snooze state, the action buttons and every sensor.
+
+The table fits a 16:9 screen at 100% zoom without scrolling sideways.
+
+### The toolbar controls
+
+| Button | What it does |
+|---|---|
+| **Expand sensors** | Opens every device's sensor panel, leaving the rows themselves compact |
+| **Expand all** | Opens every sensor panel *and* every device detail row |
+| **Collapse all** | Closes everything — sensor panels, fault details and device rows |
+| **Print Report** | Opens the printable status report |
+
+The expansion state is remembered per browser, so your view survives the
+10-second refresh and a page reload.
+

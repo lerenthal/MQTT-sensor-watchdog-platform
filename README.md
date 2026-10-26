@@ -149,6 +149,8 @@ live broker. They are runnable, not just documentation:
 | `tools/test_wallboard.js` | Headless test of the alarm toggle, mute and style selector - no browser needed. |
 | `tools/test_table_structure.js` | Asserts the table header and the row renderer agree on the columns. |
 | `tools/test_row_handling.js` | Asserts no code path treats an expanded detail row as a device. |
+| `tools/test_expansion_controls.js` | Asserts the expand/collapse controls drive state something renders. |
+| `tools/test_expansion_behaviour.js` | Runs the real dashboard.js against a stubbed DOM and proves the buttons change the output. |
 | `tools/verify_restart_e2e.py` | Drives the real restart API and proves the device reboots. |
 | `tools/probe_restart.py` | Discovers a device's real restart topic and tests it directly. |
 
