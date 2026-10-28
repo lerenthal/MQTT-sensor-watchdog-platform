@@ -144,6 +144,8 @@ live broker. They are runnable, not just documentation:
 |---|---|
 | `tools/verify_features.py <url>` | The dashboard features: ignore list, snooze control, persistent highlighting, TEST ALARM button, honest restart reporting. Exits non-zero on failure. |
 | `tests/test_false_alarm_fixes.py` | Retired channels are removed and not resurrected by the broker's retained replay. |
+| `tests/test_admin_routes.py` | Every admin route points at the right view; no stacked decorators. |
+| `tests/test_snooze_semantics.py` | A snooze silences the wall board and an unsnooze restores it immediately. |
 | `tools/verify_restart.sh <service> <device>` | The restart path: command published, broker acknowledgement, heartbeat reset. |
 | `tools/verify_restart_probe.py <device>` | The restart path, run inside the container, watching for the LWT status cycle that proves a reboot. |
 | `tools/find_restart_topic.py <device>` | Probes candidate restart topics to find the one a device actually listens on. |

@@ -554,3 +554,55 @@ SENSOR_SILENT alert. It has one. Two separate defects were involved.
 - The pilot config was missing the adaptive-staleness keys that were
   added to the live config - it now has them, so the two deployments
   behave the same.
+
+## 2026-10-28 - Editable target ranges, and a snooze that actually silences
+
+### Added
+- **Target ranges are now editable by an admin** at
+  **Admin Config > Ignore List > Target ranges** (`/admin/ranges`), as a
+  second tab on the ignore list page.
+
+  The channel dropdown is built from the channels the fleet actually
+  publishes - 60 of them - so the operator picks a real channel rather
+  than guessing a sensor name. Each range has a minimum (blank for a
+  one-sided band such as CO2), a maximum and a severity. The table
+  shows every configured range with the channel's current value and age,
+  and a range can be removed.
+
+  Previously the ONLY way to set a range was a CSV upload, which is not
+  an editing interface. Ranges can still be set in bulk by CSV.
+
+  Every change is audited as `RANGE_SAVED` / `RANGE_REMOVED`, and
+  changing a range clears the open alert for that channel so the new
+  limit is evaluated from scratch.
+
+### Fixed
+- **A snoozed device's fault still appeared on the wall board.** The
+  wallboard's query had no snooze filter, so the snooze silenced the
+  Telegram paging and the dashboard badge but not the wall display -
+  the opposite of what an operator expects from a snooze. The wall board
+  now excludes snoozed devices.
+- **A snoozed device's fault could reappear within 30 seconds.** The
+  open `out_of_range` row is the dwell clock for the target range, so
+  the range pass re-raised the alert the operator had just silenced. A
+  snooze now clears that dwell record, so the fault stays silenced. The
+  dwell restarts from zero when the snooze ends, so a range that is
+  still breached is re-alerted with a fresh dwell rather than paging
+  instantly.
+- **An unsnooze left the wall board quiet for up to 30 seconds.** The
+  device loop skips snoozed devices, so the resolved alert was only
+  recreated on the next pass. The unsnooze now re-opens the device's
+  alert of its current fault type immediately, so a fault is back on the
+  wall board within a second.
+
+### Tests
+- `tests/test_admin_routes.py` - 69 checks. A helper inserted between a
+  route decorator and its function silently re-routes the endpoint, and a
+  stacked duplicate decorator stops the app booting at all; both
+  happened here and neither was caught by the existing suites. The test
+  asserts every route points at a view (not a helper), that no route
+  carries two functions, and that no decorator is stacked.
+- `tests/test_snooze_semantics.py` - 23 checks covering the snooze
+  contract: the wall board respects a snooze, a snooze suppresses the
+  fault rather than hiding it, and an unsnooze brings a live fault back
+  immediately.

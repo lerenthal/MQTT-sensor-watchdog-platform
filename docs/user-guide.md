@@ -576,3 +576,55 @@ that really is broken is caught long before that and is still reported as
 
 Retirements are recorded in the audit trail as `SENSOR_RETIRED`.
 
+## Target ranges (editable by an admin)
+
+**Admin Config > Ignore List > Target ranges** (`/admin/ranges`).
+
+A target range makes the watchdog raise an **OUT_OF_RANGE** alert when a
+channel sits outside the band, so an odd reading becomes a tracked fault
+instead of something an operator has to notice on a wall display.
+
+The **Channel** dropdown lists every channel the fleet actually publishes
+- 60 of them - so you pick a real channel rather than guessing a sensor
+name. For each one you set:
+
+| Field | Meaning |
+|---|---|
+| **Minimum** | The lower limit. Leave it **blank** for a one-sided band (CO2 has no useful lower limit). |
+| **Maximum** | The upper limit. |
+| **Severity** | Warning or Critical. Critical sorts to the top of the wall board. |
+
+The table below shows every configured range with the channel's **current
+value** and how old it is, so you can see at a glance which range is
+actually biting.
+
+**Removing** a range stops the channel being alerted on. It does not hide
+the reading - the device table still shows it.
+
+Changing a range clears any open alert for that channel, so a new limit is
+evaluated from scratch rather than against the old one. Every change is
+audited as `RANGE_SAVED` or `RANGE_REMOVED`.
+
+**The deadband.** A reading parked exactly on a limit (24.02 against a
+24.0 ceiling) would otherwise resolve and re-raise on alternating
+cycles, so the alert only clears once the value comes back inside by
+`out_of_range_clear_margin_pct` (2% of the band by default). For an
+18-24 °C band that is 0.12 °C.
+
+Ranges can also be set in bulk by uploading a CSV at **Admin Config**.
+
+## What a snooze does
+
+A snooze silences a device completely:
+
+- Its faults do not appear on the **wall board**.
+- Telegram does not keep repeating them.
+- The dashboard still shows the device, its status and the snooze badge
+  with a **Resume** button - you need to see what you silenced.
+
+The snooze **suppresses** the fault rather than merely hiding it: the
+range pass does not re-raise an alert you just silenced, so the fault
+cannot reappear on the wall board behind your back. When you resume the
+device, a live fault reappears **immediately** - not on the next
+30-second watchdog pass.
+

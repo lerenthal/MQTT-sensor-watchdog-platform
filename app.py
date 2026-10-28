@@ -2577,6 +2577,23 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
 .badge.badge-mqtt-down { background: var(--danger); }
 .badge.badge-muted { background: var(--muted); }
 .badge.badge-warning { background: var(--warning); color: white; }
+/* Sub-tabs within an admin page. The ignore list and the target ranges
+   are two views of the same "what is this fleet" question, so they sit
+   side by side rather than as separate top-level pages. */
+.admin-subtabs {
+    display: flex; gap: .3rem; margin-bottom: 1rem;
+    border-bottom: 1px solid var(--border); padding-bottom: .4rem;
+}
+.admin-subtab {
+    padding: .4rem .8rem; border-radius: 6px; text-decoration: none;
+    color: var(--muted-foreground); font-weight: 600; font-size: .9rem;
+    border: 1px solid transparent;
+}
+.admin-subtab:hover { background: var(--bg); color: var(--text); }
+.admin-subtab.active {
+    background: var(--accent); color: white; border-color: var(--accent);
+}
+
 .btn-muted, .btn:disabled {
     background: transparent; color: var(--muted-foreground);
     border: 1px solid var(--border); cursor: not-allowed; opacity: .6;
@@ -2904,6 +2921,12 @@ def api_devices():
             "message": r["message"],
             "triggered_at": r["triggered_at"],
         })
+    # A snoozed device's faults are still listed here - the operator needs
+    # to see what they silenced - but the wall board does not show them and
+    # Telegram does not repeat them. The device row already carries the
+    # snooze state and the Snooze column shows a Resume button, so the
+    # operator can see at a glance that this is silenced rather than
+    # unhandled.
     conn.close()
 
     sensors_by_device = {}
@@ -3124,6 +3147,49 @@ def api_device_sensors(device_id):
     conn.close()
     return jsonify({"device_id": device_id, "sensors": [dict(r) for r in rows]})
 
+def _reevaluate_device(device_id):
+    """Re-open a snoozed device's fault immediately after an unsnooze.
+
+    Snoozing RESOLVES the device's alerts, and the device loop skips
+    snoozed devices, so a fault only reappeared on the next 30-second
+    pass. That left the wall board quiet for up to half a minute after
+    the operator unsnoozed a device they are standing in front of.
+
+    This re-opens the device's most recent alert of its current fault
+    type, so the fault reappears at once. The next watchdog pass then
+    confirms or corrects it - this removes the delay, it does not replace
+    the evaluation.
+    """
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status FROM devices WHERE device_id = ?", (device_id,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        return
+    status = (row["status"] or "").upper()
+    if status not in _DEVICE_ALERT_TYPES:
+        conn.close()
+        return
+    # The most recent alert of the device's current fault type.
+    alert = conn.execute(
+        "SELECT id, message, alert_type FROM alerts "
+        "WHERE device_id = ? AND alert_type = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (device_id, status),
+    ).fetchone()
+    if not alert:
+        conn.close()
+        return
+    conn.execute(
+        "UPDATE alerts SET resolved = 0, acknowledged = 0 "
+        "WHERE id = ?", (alert["id"],))
+    conn.commit()
+    conn.close()
+    log.info("Unsnooze: re-opened the %s alert for %s immediately",
+             status, device_id)
+
 @app.route("/snooze/<device_id>/<int:hours>", methods=["POST"])
 @login_required
 def set_snooze(device_id, hours):
@@ -3132,6 +3198,15 @@ def set_snooze(device_id, hours):
     cursor = conn.cursor()
     cursor.execute("UPDATE devices SET snooze_until = ? WHERE device_id = ?", (snooze_until, device_id))
     cursor.execute("UPDATE alerts SET resolved = 1 WHERE device_id = ? AND resolved = 0", (device_id,))
+    # The open out_of_range record is the DWELL CLOCK for the target
+    # range. Leaving it open means the range pass re-raises the alert on
+    # its next cycle - resurrecting the fault the operator just silenced,
+    # and putting it back on the wall board within 30 seconds.
+    #
+    # The record is deleted, not resolved: the dwell restarts from zero
+    # when the snooze ends, so a range that is still breached is re-alerted
+    # (with a fresh dwell) rather than paging instantly.
+    cursor.execute("DELETE FROM out_of_range WHERE device_id = ?", (device_id,))
     conn.commit(); conn.close()
     audit("SNOOZE", device_id=device_id, details=f"Web snooze for {hours}h")
     return redirect(url_for("index"))
@@ -3143,6 +3218,15 @@ def unsnooze(device_id):
     conn.execute("UPDATE devices SET snooze_until = NULL WHERE device_id = ?", (device_id,))
     conn.commit(); conn.close()
     audit("UNSNOOZE", device_id=device_id, details="Unsnoozed via web")
+    # Re-evaluate the device NOW. Snoozing resolves its alerts, and the
+    # device loop skips snoozed devices, so without this the fault only
+    # reappeared on the next 30-second pass - leaving the wall board
+    # quiet for up to half a minute after the operator unsnoozed a device
+    # they are standing in front of.
+    try:
+        _reevaluate_device(device_id)
+    except Exception:
+        log.exception("Could not re-evaluate %s after unsnooze", device_id)
     return redirect(url_for("index"))
 
 
@@ -3435,6 +3519,299 @@ def admin_sensors_csv():
     return redirect(url_for("admin_config", saved=1))
 
 
+@app.route("/admin/ranges", methods=["GET", "POST"])
+@login_required
+def admin_ranges():
+    """Target ranges per sensor channel.
+
+    A range makes the watchdog raise an OUT_OF_RANGE alert when the
+    channel sits outside the band, so a reading that is merely "odd"
+    becomes a real, tracked fault instead of something an operator has to
+    notice on a wall display.
+
+    The channel list is built from what the fleet actually publishes, so
+    the operator picks a real channel rather than guessing a sensor name.
+    """
+    if session.get("role") != "admin":
+        abort(403)
+
+    who = session.get("username", "?")
+
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        # The channel picker uses one select whose value is
+        # "device_id|sensor_name", so it can offer every channel in the
+        # fleet in a single list.
+        _picked = (request.form.get("device_id|sensor_name") or "").strip()
+        if _picked and "|" in _picked:
+            device_id, sensor_name = [x.strip() for x in _picked.split("|", 1)]
+        else:
+            device_id = (request.form.get("device_id") or "").strip()
+            sensor_name = (request.form.get("sensor_name") or "").strip()
+
+        if action == "delete" and device_id and sensor_name:
+            conn = get_db()
+            conn.execute(
+                "DELETE FROM sensor_thresholds WHERE device_id = ? "
+                "AND sensor_name = ?",
+                (device_id, sensor_name),
+            )
+            # Drop any open alert for it, so removing a range does not
+            # leave the fault on the wall board forever.
+            conn.execute(
+                "DELETE FROM out_of_range WHERE device_id = ? AND sensor_name = ?",
+                (device_id, sensor_name),
+            )
+            # The alerts table has no sensor_name column - the channel is
+            # named in the message - so the open OUT_OF_RANGE alert for it
+            # is matched on that.
+            conn.execute(
+                "UPDATE alerts SET resolved = 1 "
+                "WHERE device_id = ? AND alert_type = 'OUT_OF_RANGE' "
+                "AND resolved = 0 AND message LIKE ?",
+                (device_id, f"%{sensor_name}%"),
+            )
+            conn.commit()
+            conn.close()
+            audit("RANGE_REMOVED", device_id=device_id,
+                  details=f"target range removed for {sensor_name}",
+                  username=who)
+            return redirect(url_for("admin_ranges"))
+
+        if action == "save" and device_id and sensor_name:
+            raw_min = (request.form.get("min_value") or "").strip()
+            raw_max = (request.form.get("max_value") or "").strip()
+            severity = (request.form.get("severity") or "WARNING").strip().upper()
+            if severity not in ("WARNING", "CRITICAL"):
+                severity = "WARNING"
+            try:
+                min_value = float(raw_min) if raw_min else None
+            except ValueError:
+                min_value = None
+            try:
+                max_value = float(raw_max) if raw_max else None
+            except ValueError:
+                max_value = None
+            if max_value is None and min_value is None:
+                # Both blank is a delete, not a bad value.
+                conn = get_db()
+                conn.execute(
+                    "DELETE FROM sensor_thresholds WHERE device_id = ? "
+                    "AND sensor_name = ?", (device_id, sensor_name))
+                conn.commit()
+                conn.close()
+                audit("RANGE_REMOVED", device_id=device_id,
+                      details=f"target range cleared for {sensor_name}",
+                      username=who)
+                return redirect(url_for("admin_ranges"))
+            if max_value is not None and min_value is not None \
+                    and min_value > max_value:
+                return _render_layout(
+                    "Target ranges",
+                    f'<div class="card"><div class="flash error">'
+                    f'The minimum ({min_value}) is above the maximum '
+                    f'({max_value}).</div>'
+                    f'<a class="btn" href="/admin/ranges">&#8592; Back</a></div>',
+                    current_tab="admin",
+                )
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO sensor_thresholds"
+                "(device_id, sensor_name, min_value, max_value, severity) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(device_id, sensor_name) DO UPDATE SET "
+                "min_value = excluded.min_value, "
+                "max_value = excluded.max_value, "
+                "severity = excluded.severity",
+                (device_id, sensor_name, min_value, max_value, severity),
+            )
+            # A changed range must be re-evaluated: the open alert may
+            # have been raised against the old limits.
+            conn.execute(
+                "DELETE FROM out_of_range WHERE device_id = ? AND sensor_name = ?",
+                (device_id, sensor_name),
+            )
+            # The alert is matched on the channel name in its message:
+            # the alerts table has no sensor_name column.
+            conn.execute(
+                "UPDATE alerts SET resolved = 1 "
+                "WHERE device_id = ? AND alert_type = 'OUT_OF_RANGE' "
+                "AND resolved = 0 AND message LIKE ?",
+                (device_id, f"%{sensor_name}%"),
+            )
+            conn.commit()
+            conn.close()
+            audit("RANGE_SAVED", device_id=device_id,
+                  details=f"{sensor_name}: "
+                          f"{min_value if min_value is not None else '-'} to "
+                          f"{max_value if max_value is not None else '-'} "
+                          f"({severity})",
+                  username=who)
+            return redirect(url_for("admin_ranges"))
+
+        return redirect(url_for("admin_ranges"))
+
+    thresholds = _thresholds_by_device()
+    channels = _sensor_channels()
+    ignored = _ignored_devices()
+
+    # The rows: every configured range, with the channel's current value.
+    rows = []
+    for device_id, entries in sorted(thresholds.items()):
+        cur = {c["sensor_name"]: c for c in channels.get(device_id, [])}
+        for e in entries:
+            c = cur.get(e["sensor_name"], {})
+            age = c.get("age_seconds")
+            age_txt = (f"{age}s" if age is not None and age < 3600
+                       else (f"{age // 3600}h" if age is not None else "?"))
+            rows.append(
+                f'<tr><td><strong>{html_lib.escape(device_id)}</strong></td>'
+                f'<td>{html_lib.escape(e["sensor_name"])}</td>'
+                f'<td class="num">{html_lib.escape(str(c.get("value", "-")))}</td>'
+                f'<td class="muted">{age_txt}</td>'
+                f'<td class="num">{html_lib.escape("" if e["min_value"] is None else str(e["min_value"]))}</td>'
+                f'<td class="num">{html_lib.escape(str(e["max_value"]))}</td>'
+                f'<td><span class="badge badge-'
+                f'{"offline" if e["severity"] == "CRITICAL" else "stalled"}">'
+                f'{html_lib.escape(e["severity"])}</span></td>'
+                f'<td><form method="post" action="/admin/ranges" style="display:inline">'
+                f'{_csrf_input()}'
+                f'<input type="hidden" name="action" value="delete">'
+                f'<input type="hidden" name="device_id" value="{html_lib.escape(device_id)}">'
+                f'<input type="hidden" name="sensor_name" value="{html_lib.escape(e["sensor_name"])}">'
+                f'<button class="btn btn-sm btn-danger" type="submit">Remove</button>'
+                f'</form></td></tr>'
+            )
+    rows_html = "".join(rows) or (
+        '<tr><td colspan="8" class="muted">No target ranges defined. '
+        'The device table shows every reading, but nothing is alerted on '
+        'until a range is set.</td></tr>')
+
+    # The channel picker: the channels that exist and have no range yet.
+    picker = []
+    for device_id, chans in sorted(channels.items()):
+        if device_id in ignored:
+            continue
+        have = {e["sensor_name"] for e in thresholds.get(device_id, [])}
+        for c in chans:
+            if c["sensor_name"] in have:
+                continue
+            label = f"{device_id} / {c['sensor_name']} ({c['sensor_type']})"
+            picker.append(
+                f'<option value="{html_lib.escape(device_id)}|'
+                f'{html_lib.escape(c["sensor_name"])}">'
+                f'{html_lib.escape(label)}</option>')
+    picker_html = "".join(picker) or (
+        '<option value="">— every channel already has a range —</option>')
+
+    body = f"""<div class="admin-subtabs">
+  <a class="admin-subtab" href="/admin/ignored">Ignore list</a>
+  <a class="admin-subtab active" href="/admin/ranges">Target ranges</a>
+</div>
+<div class="card">
+  <h3>Target ranges</h3>
+  <p class="muted" style="margin-top:0">
+    A target range makes the watchdog raise an <strong>OUT_OF_RANGE</strong>
+    alert when a channel sits outside the band, so an odd reading becomes a
+    tracked fault instead of something an operator has to notice.
+    <br>
+    Leave the minimum empty for a one-sided band (e.g. CO2 has no lower
+    limit). A channel with no range is never alerted on.
+    <br><span class="muted">Ranges can also be set in bulk by uploading a
+    CSV at <code>/admin/config</code>.</span>
+  </p>
+  <form method="post" action="/admin/ranges">
+    {_csrf_input()}
+    <input type="hidden" name="action" value="save">
+    <div class="field">
+      <label>Channel</label>
+      <select name="device_id|sensor_name" id="range-channel">{picker_html}</select>
+    </div>
+    <div class="field" style="display:flex;gap:1rem;align-items:flex-end">
+      <div>
+        <label>Minimum (blank = no limit)</label>
+        <input type="text" name="min_value" placeholder="18" style="width:9rem">
+      </div>
+      <div>
+        <label>Maximum</label>
+        <input type="text" name="max_value" placeholder="24" style="width:9rem">
+      </div>
+      <div>
+        <label>Severity</label>
+        <select name="severity">
+          <option value="WARNING">Warning</option>
+          <option value="CRITICAL">Critical</option>
+        </select>
+      </div>
+      <button class="btn btn-primary" type="submit">Save range</button>
+    </div>
+  </form>
+</div>
+<div class="card">
+  <h3>Configured ranges</h3>
+  <div style="overflow-x:auto">
+    <table class="table table-sm">
+      <thead><tr><th>Device</th><th>Channel</th><th>Now</th><th>Age</th>
+        <th>Min</th><th>Max</th><th>Severity</th><th></th></tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+  </div>
+  <a class="btn" href="/admin/ignored">&#8592; Back to ignore list</a>
+</div>"""
+    return _render_layout("Target ranges", body, current_tab="admin")
+
+
+def _thresholds_by_device():
+    """The configured target ranges, keyed by device id."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT device_id, sensor_name, min_value, max_value, severity "
+        "FROM sensor_thresholds ORDER BY device_id, sensor_name"
+    ).fetchall()
+    conn.close()
+    out = {}
+    for r in rows:
+        out.setdefault(r["device_id"], []).append({
+            "sensor_name": r["sensor_name"],
+            "min_value": r["min_value"],
+            "max_value": r["max_value"],
+            "severity": r["severity"],
+        })
+    return out
+
+
+def _sensor_channels():
+    """Every channel the fleet publishes, with its current value.
+
+    This is what the range editor's channel picker is built from, so the
+    operator picks from the channels that actually exist rather than
+    guessing a sensor name.
+    """
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT device_id, sensor_name, sensor_type, value, ts "
+        "FROM sensor_readings "
+        "WHERE sensor_type NOT IN ('heartbeat', 'diagnostic') "
+        "ORDER BY device_id, sensor_type, sensor_name"
+    ).fetchall()
+    conn.close()
+    out = {}
+    now = datetime.now()
+    for r in rows:
+        age = None
+        try:
+            age = int((now - datetime.fromisoformat(r["ts"])).total_seconds())
+        except Exception:
+            pass
+        out.setdefault(r["device_id"], []).append({
+            "sensor_name": r["sensor_name"],
+            "sensor_type": r["sensor_type"],
+            "value": r["value"],
+            "age_seconds": age,
+        })
+    return out
+
+
 @app.route("/admin/ignored", methods=["GET", "POST"])
 @login_required
 def admin_ignored():
@@ -3495,7 +3872,11 @@ def admin_ignored():
         for d in known
     ) or '<option value="">— no monitored devices —</option>'
 
-    body = f"""<div class="card">
+    body = f"""<div class="admin-subtabs">
+  <a class="admin-subtab active" href="/admin/ignored">Ignore list</a>
+  <a class="admin-subtab" href="/admin/ranges">Target ranges</a>
+</div>
+<div class="card">
   <h3>Ignore list</h3>
   <p class="muted" style="margin-top:0">
     Devices that are physically installed but currently not in use. An ignored
@@ -3523,6 +3904,7 @@ def admin_ignored():
       <tbody>{ignored_rows}</tbody>
     </table>
   </div>
+  <a class="btn" href="/admin/ranges">Target ranges →</a>
   <a class="btn" href="/admin/config">← Back to admin config</a>
 </div>"""
     return _render_layout("Ignore list", body, current_tab="admin")
@@ -4527,10 +4909,20 @@ def api_restart_topics():
 def api_wallboard():
     """Compact fault feed for the wall display."""
     conn = get_db()
+    # A snoozed device is silenced: its faults do not appear on the wall
+    # display either. The snooze used to suppress the Telegram paging and
+    # the dashboard badge but still leave the fault on the wall board,
+    # which is the opposite of what the operator expects from a snooze.
+    #
+    # The comparison has to be in the same clock as the stored snooze
+    # deadline, which is local wall-clock throughout.
+    _now_s = datetime.now().isoformat(sep=" ")
     rows = conn.execute("""
-        SELECT device_id, alert_type, message, triggered_at
-        FROM alerts
-        WHERE resolved = 0
+        SELECT a.device_id, a.alert_type, a.message, a.triggered_at
+        FROM alerts a
+        LEFT JOIN devices d ON d.device_id = a.device_id
+        WHERE a.resolved = 0
+          AND (d.snooze_until IS NULL OR d.snooze_until <= ?)
         ORDER BY
             CASE alert_type
                 WHEN 'SYSTEMIC'    THEN 0
@@ -4540,8 +4932,8 @@ def api_wallboard():
                 WHEN 'SENSOR_SILENT' THEN 4
                 ELSE 5
             END,
-            triggered_at ASC
-    """).fetchall()
+            a.triggered_at ASC
+    """, (_now_s,)).fetchall()
     total = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
     last = conn.execute("SELECT MAX(ts) FROM sensor_readings").fetchone()[0]
     # A true systemic flag: an actual same-metric/same-window cluster, NOT the
