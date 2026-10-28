@@ -657,3 +657,72 @@ fixed, all with a test. The full write-up is in
 The production stack was built and run end to end on this host as a
 test - a separate stack with its own volumes - and came up healthy,
 receiving packets and producing alerts within a minute.
+
+## 2026-10-28 - Deployed to production, and the deploy bugs it found
+
+The watchdog is now live on `10.10.17.11`, in its own Docker stack
+alongside the mosquitto/influxdb/telegraf/grafana stack. Verifying the
+deploy against the real host found four things that only appear in a
+real deployment.
+
+### Fixed
+- **The container could not reach the broker at all.** The host's firewall
+  denies inbound traffic by default and allows the broker's 1883 only
+  from a subnet that is not on this host, so a container on its own
+  bridge could not reach the host's LAN address - the MQTT connect
+  timed out. The watchdog now joins the broker stack's network and
+  reaches `mosquitto` BY NAME, the same way telegraf does. The stack is
+  still separate: its own project, volumes and lifecycle.
+- **The app crashed on a read-only config.** It upgrades a plaintext
+  password to a hash by rewriting the config, which a read-only mount
+  forbids - so the container crash-looped with a bare OSError. The app
+  now logs a warning and carries on, and `tools/set_password.py` hashes
+  the password BEFORE the deploy so the upgrade is never needed.
+- **The backup wrote to a path that does not exist in the container.**
+  The backups are a named volume mounted at `/app/backups`, not at the
+  host's `deploy/backups`, so `VACUUM INTO` could not open its target.
+  The backup now writes inside the container.
+- **deploy.sh assumed docker without sudo.** The operator is in the
+  sudo group but not the docker group, so every docker command failed.
+  The script now detects this and uses `sudo -n docker`.
+
+### Added
+- `tools/set_password.py` - sets a password as the salted hash the app
+  expects, so the config can be mounted read-only.
+- `tools/verify_features.py` takes its credentials from the
+  environment, so it can verify any instance - the development one, the
+  pilot, or production, where the password is not the default.
+
+### Verified on production
+```
+live 34/34 passed   pilot 34/34 passed
+health: {"last_packet_age_seconds":0,"mqtt_connected":true,"ok":true}
+32 devices, the restart finds all 32 restart buttons, the backup is a
+valid database with every device in it
+```
+
+## 2026-10-28 - A print report you can shape
+
+### Changed
+- **The print report contains only the monitored devices.** The ignored
+  devices are excluded, because an ignored device is one the operator
+  has deliberately taken out of monitoring and including it in the report
+  would contradict that. The header states how many were left out, and
+  an alert for an ignored device is excluded too. A tick box puts them
+  back when a report needs the whole fleet.
+- **The report can be filtered and sorted**, from a control bar above
+  the table: by status, by location, and by free text; sorted by
+  device, by location, by status (worst first) or by last seen. The
+  filters live in the URL, so a specific report can be linked to or
+  reproduced. The bar is hidden on paper, so the printed document holds
+  the report and not the controls.
+- A note under the table says what was excluded and why, so "there were
+  no faults" is never confused with "the faults were filtered out".
+- Devices with no location sort last under "Sort by Location", rather
+  than crowding the top of the report.
+
+### Added
+- `tests/test_print_report.py` - 20 checks: the ignored devices are
+  excluded and counted, the alerts for them are excluded, every filter
+  and sort is wired, the controls are hidden on paper, and the excluded
+  counts cannot go negative.

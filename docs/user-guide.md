@@ -628,3 +628,36 @@ cannot reappear on the wall board behind your back. When you resume the
 device, a live fault reappears **immediately** - not on the next
 30-second watchdog pass.
 
+## The print report
+
+**Print Report** opens a printable status report that you can shape
+before you print it.
+
+**Ignored devices are excluded.** A device on the ignore list is one you
+have deliberately taken out of monitoring, so putting it in the report
+would contradict that. The header says how many were left out, so the
+report is honest about it. Tick **include ignored devices** if you do
+want them.
+
+**The report can be filtered and sorted** from the bar above the table:
+
+| Control | What it does |
+|---|---|
+| **Status** | Only one status (ONLINE, OFFLINE, STALLED, DEGRADED) |
+| **Location** | Only the devices in one room or area. The list is built from the devices in the report, so it never offers a room that is filtered out of existence. |
+| **Search** | Free text over the device id, location, role and status |
+| **Sort by** | Device, Location, Status, or Last Seen |
+| **include ignored devices** | Puts the ignored devices back |
+
+**Sort by Location** groups the report by room, with the devices that
+have no location at the end. **Sort by Status** leads with the worst
+offline, then stalled, then degraded - the report starts with what is
+wrong.
+
+The filters live in the URL, so a specific report can be bookmarked or
+linked to. The filter bar is hidden on paper: the printed document
+contains the report, not the controls.
+
+A note under the table says what was left out and why - so "there were no
+faults" is never confused with "the faults were filtered out".
+

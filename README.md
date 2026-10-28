@@ -157,6 +157,7 @@ live broker. They are runnable, not just documentation:
 | `tools/verify_features.py <url>` | The dashboard features: ignore list, snooze control, persistent highlighting, TEST ALARM button, honest restart reporting. Exits non-zero on failure. |
 | `tests/test_false_alarm_fixes.py` | Retired channels are removed and not resurrected by the broker's retained replay. |
 | `tests/test_production_readiness.py` | The WAL is checkpointed, the history is pruned and audited, a corrupt config says why, and no raw datetime is bound to SQL. |
+| `tests/test_print_report.py` | The report excludes the ignored devices and can be filtered and sorted. |
 | `tests/test_admin_routes.py` | Every admin route points at the right view; no stacked decorators. |
 | `tests/test_snooze_semantics.py` | A snooze silences the wall board and an unsnooze restores it immediately. |
 | `tools/verify_restart.sh <service> <device>` | The restart path: command published, broker acknowledgement, heartbeat reset. |
