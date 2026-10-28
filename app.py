@@ -16,6 +16,7 @@ import sqlite3
 import secrets
 import socket
 import threading
+import urllib.parse
 import hashlib
 import difflib
 import html as html_lib
@@ -97,16 +98,76 @@ def _persist_config():
         with open(CONFIG_FILE, "w") as f:
             yaml.safe_dump(config, f, sort_keys=False, default_flow_style=False)
         return True
-    except OSError:
-        log.exception("could not persist config to %s", CONFIG_FILE)
+    except OSError as e:
+        # A read-only config is EXPECTED in production: the config is
+        # mounted read-only so a compromised process cannot rewrite the MQTT
+        # password or the session key. Anything that can be persisted
+        # elsewhere is persisted there first, so this is a note, not a
+        # failure - and it must not fill the log with tracebacks.
+        log.warning("Could not persist the config to %s: %s. The config is "
+                    "read-only, which is the production arrangement.",
+                    CONFIG_FILE, e)
         return False
 
 
 def _ignored_devices():
-    raw = config.get("watchdog", {}).get("ignored_devices", []) or []
-    if isinstance(raw, str):
-        raw = [raw]
-    return {str(d).strip() for d in raw if str(d).strip()}
+    """The devices on the ignore list.
+
+    Stored in the DATABASE, not the config file. The config is mounted
+    read-only in production - a compromised process must not be able to
+    rewrite the MQTT password or the session key - so a list kept in the
+    config could not be saved at all, and silently reverted on the next
+    restart.
+
+    The config's `watchdog.ignored_devices` is still honoured as the
+    SEED, so a fresh install or a template with a list keeps working. The
+    database is the live list.
+    """
+    conn = None
+    try:
+        conn = get_db()
+        rows = conn.execute("SELECT device_id FROM ignored_devices").fetchall()
+        return {r["device_id"] for r in rows}
+    except Exception:
+        # Before the table exists (a very early boot), fall back to the
+        # config so the list is never empty by accident.
+        raw = config.get("watchdog", {}).get("ignored_devices", []) or []
+        if isinstance(raw, str):
+            raw = [raw]
+        return {str(d).strip() for d in raw if str(d).strip()}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _set_ignored_devices(devices):
+    """Replace the ignore list, in the database and in the config.
+
+    The database is authoritative. The config is updated too so the two
+    agree, but a read-only config is not an error - the database has the
+    list either way.
+    """
+    devices = {str(d).strip() for d in devices if str(d).strip()}
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM ignored_devices")
+        conn.executemany(
+            "INSERT OR IGNORE INTO ignored_devices (device_id, added_at) VALUES (?, ?)",
+            [(d, datetime.now().isoformat(sep=" ")) for d in sorted(devices)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # Keep the config in step, best effort.
+    config.setdefault("watchdog", {})["ignored_devices"] = sorted(devices)
+    try:
+        _persist_config()
+    except Exception:
+        pass
+    return devices
 
 
 for env, path in [
@@ -351,6 +412,28 @@ def _apply_migrations(conn):
         CREATE INDEX IF NOT EXISTS idx_status_history_device
             ON device_status_history(device_id, changed_at DESC);
     """)
+    # v10 -> v11: the ignore list.
+    #
+    # The list lives in the DATABASE rather than the config file, because
+    # the config is mounted read-only in production: a list kept there
+    # could not be saved at all, and silently reverted on the next
+    # restart. The config's list is the seed.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS ignored_devices (
+            device_id TEXT PRIMARY KEY,
+            added_at  TIMESTAMP DEFAULT (datetime('now','localtime')),
+            added_by  TEXT
+        );
+    """)
+    # Seed from the config on the first run, so a template that ships a
+    # list keeps working.
+    _seed = config.get("watchdog", {}).get("ignored_devices", []) or []
+    if isinstance(_seed, str):
+        _seed = [_seed]
+    for _d in {str(x).strip() for x in _seed if str(x).strip()}:
+        conn.execute(
+            "INSERT OR IGNORE INTO ignored_devices (device_id) VALUES (?)", (_d,))
+
     # v9 -> v10: retired channels.
     #
     # A channel the device no longer publishes at all - a misnamed sensor
@@ -480,7 +563,7 @@ def _apply_migrations(conn):
         log.info("Migration: renamed sensor_readings.sensor_id -> sensor_name")
 
     conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','10')"
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','11')"
     )
 
 def init_db():
@@ -568,9 +651,21 @@ def _ensure_password_hashes():
             del u["password"]
             changed = True
     if changed:
-        with open(CONFIG_FILE, "w") as f:
-            yaml.safe_dump(config, f, sort_keys=False, default_flow_style=False)
-        log.info("Upgraded plaintext passwords to salted sha256 hashes in config.yaml")
+        # The config may be mounted READ-ONLY, which is the production
+        # arrangement: a compromised process must not be able to rewrite
+        # the MQTT password or the session key. Failing to persist the
+        # upgrade is therefore not fatal - the plaintext password still
+        # works for this run, and the deploy pre-hashes it so this does
+        # not happen in practice.
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                yaml.safe_dump(config, f, sort_keys=False, default_flow_style=False)
+            log.info("Upgraded plaintext passwords to salted sha256 hashes in config.yaml")
+        except OSError as e:
+            log.warning("Could not persist the password upgrade to %s: %s. "
+                        "The password still works for this run. Mount the "
+                        "config read-write, or pre-hash the password.",
+                        CONFIG_FILE, e)
 
 def _ensure_secret_key():
     """Never serve with the committed placeholder Flask secret.
@@ -594,8 +689,15 @@ def _ensure_secret_key():
         log.warning("Generated a new random web.secret_key (placeholder/weak key "
                     "replaced). Existing browser sessions are invalidated.")
     except OSError:
-        # Could not persist (read-only config mount). Still use the strong
-        # in-memory key for this run rather than the placeholder.
+        # A read-only config mount cannot persist the new key, so the
+        # session key would change on every restart, invalidating every
+        # session each time. That is a real problem, so it is logged
+        # loudly - the deploy sets a strong key in the config, so this
+        # only happens if someone edits it by hand.
+        log.warning("web.secret_key was weak and the config is READ-ONLY, so "
+                    "the new key CANNOT be persisted. The session key will "
+                    "change on every restart and every session will be "
+                    "invalidated. Set a strong web.secret_key in the config.")
         log.warning("web.secret_key was weak; using a generated key for this "
                     "run but could not persist it to %s", CONFIG_FILE)
 
@@ -3965,8 +4067,7 @@ def admin_ignored():
         if action == "remove" and device_id:
             _ignored = _ignored_devices()
             _ignored.discard(device_id)
-            config.setdefault("watchdog", {})["ignored_devices"] = sorted(_ignored)
-            _persist_config()
+            _set_ignored_devices(_ignored)
             audit("IGNORE_REMOVED", device_id=device_id,
                   details="Device returned to monitoring", username=who)
             return redirect(url_for("admin_ignored"))
@@ -3974,8 +4075,7 @@ def admin_ignored():
         if action == "add" and device_id:
             _ignored = _ignored_devices()
             _ignored.add(device_id)
-            config.setdefault("watchdog", {})["ignored_devices"] = sorted(_ignored)
-            _persist_config()
+            _set_ignored_devices(_ignored)
             audit("IGNORE_ADDED", device_id=device_id,
                   details="Device hidden from dashboard and alerting", username=who)
             return redirect(url_for("admin_ignored"))
@@ -4526,6 +4626,29 @@ th { background: #f3f4f6; }
   display: inline-block; width: 45%; margin-right: 4%;
   border-top: 1px solid #333; padding-top: .5rem; font-size: .85rem; color: #555;
 }
+/* The filter bar. It sits above the report and is hidden on paper by the
+   .no-print rule, so the printed document contains only the report. */
+.report-filters {
+  display: flex; flex-wrap: wrap; gap: .75rem; align-items: flex-end;
+  padding: .75rem .9rem; margin: 0 0 1rem;
+  background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 8px;
+}
+.rf-field { display: flex; flex-direction: column; gap: .2rem; }
+.rf-field label { font-size: .72rem; text-transform: uppercase;
+  letter-spacing: .04em; color: #555; font-weight: 700; }
+.rf-field select, .rf-field input[type=text] {
+  padding: .3rem .4rem; border: 1px solid #bbb; border-radius: 5px;
+  font: inherit; font-size: .85rem; background: #fff; min-width: 9rem;
+}
+.rf-check { flex-direction: row; align-items: center; gap: .3rem; }
+.rf-check label { text-transform: none; font-size: .85rem; letter-spacing: 0;
+  font-weight: 400; color: #111; }
+.rf-actions { display: flex; gap: .4rem; margin-left: auto; }
+.rf-actions .btn { padding: .3rem .8rem; font-size: .85rem;
+  background: #fff; border: 1px solid #bbb; border-radius: 5px;
+  text-decoration: none; color: #111; cursor: pointer; }
+.rf-actions .btn-primary { background: #1f2937; color: #fff;
+  border-color: #1f2937; }
 @media print { .no-print { display: none; } }
 """
 
@@ -4534,13 +4657,74 @@ th { background: #f3f4f6; }
 def print_report():
     facility = config.get("facility", {})
     conn = get_db()
-    devices = [dict(r) for r in conn.execute(
+    all_devices = [dict(r) for r in conn.execute(
         "SELECT * FROM devices ORDER BY device_id ASC"
     ).fetchall()]
+
+    # The ignore list decides what is REPORTED, not just what is shown on
+    # the dashboard. An ignored device is one the operator has taken out
+    # of monitoring, so including it in the report would contradict that.
+    # The count is still shown, so the report is honest about what was
+    # left out.
+    ignored = _ignored_devices()
+    devices = [d for d in all_devices if d["device_id"] not in ignored]
+    ignored_count = len(all_devices) - len(devices)
+
+    # ---- The filters. They live in the URL so a specific report can be
+    #      linked to, bookmarked, or produced again later.
+    f_status = (request.args.get("status") or "").strip().upper()
+    f_location = (request.args.get("location") or "").strip()
+    f_search = (request.args.get("q") or "").strip().lower()
+    f_sort = (request.args.get("sort") or "device").strip()
+    f_include_ignored = request.args.get("ignored") == "1"
+
+    if f_include_ignored:
+        devices = list(all_devices)
+
+    if f_status and f_status != "ALL":
+        devices = [d for d in devices if (d.get("status") or "").upper() == f_status]
+    if f_location:
+        devices = [d for d in devices
+                   if f_location.lower() in ((d.get("location") or "").lower()
+                                             + " " + (d.get("role") or "").lower())]
+    if f_search:
+        def _matches(d):
+            hay = " ".join(str(d.get(k) or "") for k in
+                           ("device_id", "location", "role", "status")).lower()
+            return f_search in hay
+        devices = [d for d in devices if _matches(d)]
+
+    # ---- The sort. Location sorts by location then device, because that
+    #      is how the facility is organised and a report grouped by room
+    #      is what an operator reading a facility needs.
+    def _loc_key(d):
+        # A device with no location sorts LAST: the report should lead with
+        # the rooms it can group by, and the unlabelled devices go where
+        # they are visible rather than crowding the top.
+        _loc = (d.get("location") or "").strip().lower()
+        return ((1, "") if not _loc else (0, _loc), (d.get("device_id") or "").lower())
+    def _status_key(d):
+        # Worst first: the report should lead with what is wrong.
+        order = {"OFFLINE": 0, "STALLED": 1, "DEGRADED": 2, "SUSPECTED_STALL": 3, "ONLINE": 4}
+        return (order.get((d.get("status") or "").upper(), 9),
+                (d.get("device_id") or "").lower())
+    sorters = {
+        "device": lambda d: ((d.get("device_id") or "").lower(),),
+        "location": _loc_key,
+        "status": _status_key,
+        "lastseen": lambda d: (_parse_ts(d.get("last_seen")) or datetime.min,),
+    }
+    devices.sort(key=sorters.get(f_sort, sorters["device"]))
+    if f_sort == "lastseen":
+        # The oldest first is the useful end for a liveness report.
+        devices.reverse()
+
     alerts = conn.execute(
         "SELECT device_id, alert_type, message, triggered_at FROM alerts "
         "WHERE resolved = 0 ORDER BY triggered_at DESC LIMIT 50"
     ).fetchall()
+    # An alert for an ignored device is not part of the report either.
+    alerts = [a for a in alerts if a["device_id"] not in ignored]
     conn.close()
 
     def fmt(v): return "—" if not v else v[:19]
@@ -4597,6 +4781,85 @@ def print_report():
 
     with mqtt_health_lock:
         mqtt_status = "Connected" if mqtt_health["connected"] else "DISCONNECTED"
+
+    # ---- The filter controls.
+    # The locations come from the devices that are IN the report, so the
+    # list never offers a room that is filtered out of existence.
+    _locations = sorted({(d.get("location") or "").strip()
+                          for d in devices if (d.get("location") or "").strip()})
+    _statuses = sorted({(d.get("status") or "").strip().upper()
+                         for d in devices if (d.get("status") or "").strip()})
+
+    def _sel(name, current, options, empty_label):
+        opts = [f'<option value="">{empty_label}</option>']
+        for o in options:
+            mark = " selected" if str(o).lower() == str(current).lower() else ""
+            opts.append(f'<option value="{html_lib.escape(str(o))}"{mark}>'
+                        f'{html_lib.escape(str(o))}</option>')
+        return f'<select name="{name}">' + "".join(opts) + "</select>"
+
+    def _qs(**over):
+        """The current filters with some overridden, as a query string."""
+        args = {"status": f_status, "location": f_location, "q": request.args.get("q") or "",
+                "sort": f_sort, "ignored": "1" if f_include_ignored else ""}
+        args.update({k: v for k, v in over.items() if v is not None})
+        parts = [(k, str(v)) for k, v in args.items() if str(v)]
+        return ("?" + "&".join(f"{k}={urllib.parse.quote(str(v))}"
+                                for k, v in parts)) if parts else ""
+
+    # A note about what the filters removed, so the report is honest
+    # about the difference between "there were no faults" and "the faults
+    # were filtered out".
+    # How many devices the filters removed, and how many of those are the
+    # ignored ones. They are different things: an ignored device is
+    # deliberately out of monitoring, while a filtered-out device is one
+    # the operator narrowed this report to.
+    _excluded = len(all_devices) - len(devices)
+    _excluded_ignored = len([d for d in all_devices
+                             if d["device_id"] in ignored
+                             and d["device_id"] not in {x["device_id"] for x in devices}])
+    _excluded_by_filter = _excluded - _excluded_ignored
+    _bits = []
+    if _excluded_ignored:
+        _bits.append(f"{_excluded_ignored} ignored device(s) excluded")
+    if _excluded_by_filter:
+        _bits.append(f"{_excluded_by_filter} device(s) filtered out by the filters above")
+    if _bits:
+        _filter_note = (
+            '<p class="report-note" style="font-size:.85rem;color:#666;'
+            'margin:.4rem 0 0">Note: ' + html_lib.escape("; ".join(_bits))
+            + '. Tick "include ignored devices" to include them.</p>')
+    else:
+        _filter_note = ""
+
+    filter_controls = f"""<form method="get" action="/print" class="report-filters">
+  <div class="rf-field">
+    <label>Status</label>
+    {_sel("status", f_status, _statuses, "All statuses")}
+  </div>
+  <div class="rf-field">
+    <label>Location</label>
+    {_sel("location", f_location, _locations, "All locations")}
+  </div>
+  <div class="rf-field">
+    <label>Search</label>
+    <input type="text" name="q" value="{html_lib.escape(request.args.get('q') or '')}"
+           placeholder="device, role&hellip;">
+  </div>
+  <div class="rf-field">
+    <label>Sort by</label>
+    {_sel("sort", f_sort, ["device", "location", "status", "lastseen"], "Device")}
+  </div>
+  <div class="rf-field rf-check">
+    <label><input type="checkbox" name="ignored" value="1"
+       {"checked" if f_include_ignored else ""}> include ignored devices</label>
+  </div>
+  <div class="rf-actions">
+    <button class="btn btn-primary" type="submit">Apply</button>
+    <a class="btn" href="/print">Reset</a>
+  </div>
+</form>"""
+
     return f"""<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
@@ -4611,16 +4874,19 @@ def print_report():
     <dt>Generated by:</dt><dd>{html_lib.escape(session.get('username','?'))} ({html_lib.escape(session.get('role','operator'))})</dd>
     <dt>Generated at:</dt><dd>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</dd>
     <dt>MQTT broker:</dt><dd>{config['mqtt']['broker']}:{config['mqtt']['port']} ({mqtt_status})</dd>
-    <dt>Devices monitored:</dt><dd>{len(devices)}</dd>
+    <dt>Devices in this report:</dt><dd>{len(devices)}</dd>
+    <dt>Ignored devices excluded:</dt><dd>{ignored_count}</dd>
     <dt>Active alerts:</dt><dd>{len(alerts)}</dd>
   </dl>
 </div>
+<div class="no-print" style="margin:0 0 1rem">{filter_controls}</div>
 <h2 style="font-size:1.05rem;margin:1.5rem 0 .5rem">Device Status</h2>
 <table>
   <thead><tr><th>Device / Location</th><th>Status</th><th>Last Seen</th><th>Heartbeat</th>
     <th>Temp °C</th><th>Humidity %</th><th>CO2 ppm</th><th>Sensors</th><th>Snoozed Until</th></tr></thead>
   <tbody>{device_rows}</tbody>
 </table>
+{_filter_note}
 <h2 style="font-size:1.05rem;margin:1.5rem 0 .5rem">Active Alerts</h2>
 <table>
   <thead><tr><th>Triggered</th><th>Device</th><th>Type</th><th>Message</th></tr></thead>

@@ -39,8 +39,14 @@ def post(path, data):
         return e.code, e.read().decode("utf-8", "ignore")
 
 
+# The credentials come from the environment, so the same tool can verify
+# any instance: the development one, the pilot, or production (where the
+# password is NOT "mushroom").
+VERIFY_USER = os.environ.get("WATCHDOG_USER", "yaniv")
+VERIFY_PASS = os.environ.get("WATCHDOG_PASS", "mushroom")
 op.open(BASE + "/login",
-        urllib.parse.urlencode({"username": "yaniv", "password": "mushroom"}).encode())
+        urllib.parse.urlencode({"username": VERIFY_USER,
+                                 "password": VERIFY_PASS}).encode())
 
 results = []
 

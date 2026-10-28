@@ -63,14 +63,30 @@ services:
       # a .env cannot silently write UTC.
       TZ: ${TZ:-Asia/Jerusalem}
       # Secrets. Set in deploy/.env, never in this file.
+      WATCHDOG_MQTT_BROKER: ${WATCHDOG_MQTT_BROKER:-mosquitto}
+      WATCHDOG_MQTT_PORT: ${WATCHDOG_MQTT_PORT:-1883}
+      WATCHDOG_MQTT_USERNAME: ${WATCHDOG_MQTT_USERNAME:-yaniv}
       WATCHDOG_MQTT_PASSWORD: ${WATCHDOG_MQTT_PASSWORD:-}
       WATCHDOG_TG_TOKEN: ${WATCHDOG_TG_TOKEN:-}
       WATCHDOG_TG_CHAT_ID: ${WATCHDOG_TG_CHAT_ID:-}
       WATCHDOG_SECRET_KEY: ${WATCHDOG_SECRET_KEY:-}
+    networks:
+      # The broker's network, so the watchdog can reach mosquitto BY NAME
+      # - the same way telegraf does.
+      #
+      # This is necessary, not cosmetic: the host's firewall denies
+      # inbound traffic except on the published ports, and the broker's
+      # 1883 is allowed only from a subnet that is not on this host. A
+      # container on its own bridge cannot reach the host's LAN address.
+      #
+      # The stack is still SEPARATE - its own project, its own volumes,
+      # its own lifecycle - it just shares the broker's network.
+      - gmp_logger_default
     volumes:
       # The config is bind-mounted, not baked into the image, so it can
-      # be edited on the server and rolled back.
-      - ./config:/app/config:ro
+      # be edited on the server and rolled back. It lives under deploy/
+      # next to the .env that holds its secrets.
+      - ./deploy/config:/app/config:ro
       # The database and the WAL live here. The named volume means a
       # `docker compose down` does not take the audit trail with it.
       - watchdog-data:/app/data
@@ -91,6 +107,13 @@ services:
       timeout: 5s
       start_period: 30s
       retries: 3
+
+networks:
+  gmp_logger_default:
+    # The broker stack's network. Declared external because that project
+    # owns it - this stack joins it, it does not create it.
+    external: true
+    name: gmp_logger_default
 
 volumes:
   watchdog-data:

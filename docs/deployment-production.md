@@ -101,7 +101,12 @@ At minimum set `WATCHDOG_MQTT_PASSWORD`. Set the Telegram variables to
 enable paging.
 
 ```bash
-# 3. Deploy.
+# 3. Hash the passwords, so the config can stay READ-ONLY in the container.
+#    (The app cannot rewrite a read-only config.)
+./tools/set_password.py deploy/config/config.yaml yaniv '<the admin password>'
+./tools/set_password.py deploy/config/config.yaml operator '<the operator password>'
+
+# 4. Deploy.
 ./deploy.sh
 ```
 
@@ -139,6 +144,98 @@ http://10.10.17.11:5050/wallboard   the wall display
 Log in with the admin account. **Check that the device list is
 populated** — an empty table means the watchdog is not receiving, and
 `./deploy.sh logs` will show why.
+
+---
+
+## The network — why the watchdog joins the broker's
+
+The watchdog joins the broker stack's Docker network
+(`gmp_logger_default`) and reaches the broker **by name**:
+
+```yaml
+networks:
+  gmp_logger_default:
+    external: true
+    name: gmp_logger_default
+```
+
+This is **necessary**, not a convenience. The host's firewall (`ufw`) has
+`deny (incoming)` as its default, and the broker's port 1883 is allowed
+only from a subnet that is not on this host. A container on its own
+bridge therefore **cannot** reach the host's LAN address — the connection
+times out, exactly as it did on the first deploy attempt.
+
+Joining the broker's network lets the container resolve `mosquitto` and
+reach it directly, the same way `telegraf` does. The stack is still
+separate: its own project, its own volumes, its own lifecycle, and
+`./deploy.sh` only ever touches the watchdog.
+
+If the broker stack's network is ever renamed, the watchdog's compose
+file must be updated to match — it is declared `external`, so Docker will
+not create it.
+
+---
+
+## The config is mounted READ-ONLY
+
+```yaml
+volumes:
+  - ./deploy/config:/app/config:ro
+```
+
+A compromised process must not be able to rewrite the MQTT password or
+the session key, so the config cannot be written at runtime.
+
+The app normally upgrades a plaintext password to a salted hash by
+rewriting the config. With a read-only mount that is impossible, so the
+password is **pre-hashed before the deploy**:
+
+```bash
+./tools/set_password.py deploy/config/config.yaml yaniv <password>
+```
+
+The tool writes the hash and removes the plaintext. The app also no
+longer fails to start if it cannot persist an upgrade — it logs a warning
+and carries on.
+
+**The session key must be strong and set in the config.** If it is
+missing or weak the app generates a new one, but it cannot save it to a
+read-only config, so the key would change on every restart and
+invalidate every session. The deploy sets a 64-character key.
+
+---
+
+## The backups are a named volume
+
+The database and the backups are named Docker volumes, so a
+`docker compose down` cannot take the audit trail with it.
+
+`./deploy.sh backup` writes **inside the container**, to `/app/backups` in
+the backups volume. The host path `deploy/backups` does not exist — the
+volume is mounted at `/app/backups` in the container, and the two paths
+are not the same thing.
+
+To copy a backup off the host:
+
+```bash
+sudo -n docker cp psygabio-watchdog:/app/backups/sensor_watchdog-<stamp>.db .
+```
+
+**Backups on the same disk are not backups.** Copy them somewhere else.
+
+---
+
+## The operator is not in the docker group
+
+On this host the operator is in the `sudo` group but not the `docker`
+group, so `docker` needs `sudo`. `deploy.sh` detects this and uses
+`sudo -n docker` automatically. For that to work the operator needs a
+passwordless sudo rule for docker:
+
+```
+yaniv ALL=(ALL) NOPASSWD: /usr/bin/docker, /usr/bin/docker compose
+```
+
 
 ---
 

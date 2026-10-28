@@ -123,3 +123,14 @@ CREATE TABLE IF NOT EXISTS retired_sensors (
     reason      TEXT,
     PRIMARY KEY (device_id, sensor_name, sensor_type)
 );
+
+-- The ignore list: devices installed but not currently in use. Stored here
+-- rather than in the config file, because the config is mounted
+-- READ-ONLY in production: a list kept there could not be saved, and
+-- silently reverted on the next restart. This is operational state, not
+-- configuration.
+CREATE TABLE IF NOT EXISTS ignored_devices (
+    device_id TEXT PRIMARY KEY,
+    added_at  TIMESTAMP DEFAULT (datetime('now','localtime')),
+    added_by  TEXT
+);

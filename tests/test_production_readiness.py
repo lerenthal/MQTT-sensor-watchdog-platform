@@ -167,6 +167,38 @@ for m in re.finditer(r"^\s*val,\s*now,\s*tol\)", src, re.M):
     raw.append(ln)
 check("no SQL parameter binds a bare datetime", not raw, str(raw))
 
+# ---------------------------------------------------------------------------
+# 7. A read-only config must not break anything.
+#
+#    In production the config is mounted READ-ONLY, so a compromised
+#    process cannot rewrite the MQTT password or the session key. Three
+#    things must therefore work anyway: the app must start, the ignore
+#    list must be savable, and the failure must be a note rather than a
+#    traceback filling the log.
+# ---------------------------------------------------------------------------
+print()
+print("-- a read-only config --")
+check("the ignore list lives in the DATABASE, not the config file",
+      "CREATE TABLE IF NOT EXISTS ignored_devices" in src
+      and "FROM ignored_devices" in src)
+check("the ignore list is seeded from the config on first run",
+      re.search(r'_seed\s*=\s*config\.get\("watchdog"', src) is not None)
+check("saving the ignore list does not depend on writing the config",
+      "_set_ignored_devices(" in src
+      and re.search(r'if action == "add"[\s\S]{0,400}?'
+                   r'_set_ignored_devices\(_ignored\)[\s\S]{0,120}?'
+                   r'_persist_config\(\)', src) is None,
+      "the add path still calls _persist_config directly")
+check("a config write failure is a warning, not a traceback",
+      re.search(r'except OSError as e:\s*\n\s*# A read-only config is EXPECTED', src)
+      is not None)
+check("the password upgrade survives a read-only config",
+      "The config may be mounted READ-ONLY" in src
+      and re.search(r'except OSError as e:\s*\n\s*log\.warning\(\s*"Could not persist the password upgrade', src)
+      is not None)
+check("there is a tool to pre-hash a password",
+      os.path.exists(os.path.join(REPO, "tools/set_password.py")))
+
 print()
 print(f"{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

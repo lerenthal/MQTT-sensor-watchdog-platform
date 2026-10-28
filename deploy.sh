@@ -25,7 +25,21 @@ BACKUP_DIR="${HERE}/deploy/backups"
 
 # --env-file points at deploy/.env: that is where the secrets live, and
 # the project root's .env belongs to the development instance.
-COMPOSE=(docker compose -f "$COMPOSE_FILE" --project-directory "$HERE" \
+# Docker may need sudo. On the production host the operator is in the
+# sudo group but NOT the docker group, so the plain command is not
+# permitted. Detect it once and use sudo for the whole script.
+if docker info >/dev/null 2>&1; then
+    DOCKER=(docker)
+    DOCKER_SUDO=""
+elif sudo -n docker info >/dev/null 2>&1; then
+    DOCKER=(sudo -n docker)
+    DOCKER_SUDO="(via sudo)"
+else
+    DOCKER=(docker)
+    DOCKER_SUDO=""
+fi
+
+COMPOSE=("${DOCKER[@]}" compose -f "$COMPOSE_FILE" --project-directory "$HERE" \
          --env-file "$ENV_FILE")
 
 log()  { printf '\033[1;34m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -43,8 +57,12 @@ cmd_preflight() {
     printf '\n  Docker\n'
     if docker version >/dev/null 2>&1; then
         ok "docker is present and working"
+    elif sudo -n docker version >/dev/null 2>&1; then
+        ok "docker works via sudo ${DOCKER_SUDO}"
     else
         warn "docker is NOT working - the watchdog cannot run"
+        warn "  the operator needs to be in the docker group, or have a"
+        warn "  NOPASSWD sudo rule for docker"
         problems=$((problems+1))
     fi
     if docker compose version >/dev/null 2>&1; then
@@ -57,8 +75,11 @@ cmd_preflight() {
         ok "running as root - no sudo needed"
     elif docker info >/dev/null 2>&1; then
         ok "the user is in the docker group"
+    elif sudo -n docker info >/dev/null 2>&1; then
+        ok "not in the docker group, but sudo works for docker"
     else
-        warn "not root and not in the docker group - sudo will be needed"
+        warn "not root, not in the docker group, and no passwordless sudo"
+        problems=$((problems+1))
     fi
 
     printf '\n  The MQTT broker (the existing stack on this host)\n'
@@ -71,12 +92,18 @@ cmd_preflight() {
     fi
 
     printf '\n  The port the watchdog will use\n'
-    local port="5050"
-    if timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}" 2>/dev/null; then
-        warn "port ${port} is already in use on this host"
+    local port="${WATCHDOG_PORT:-5050}"
+    # The port may already be held BY THIS STACK - a redeploy replaces its
+    # own container. Only a port held by something ELSE is a problem.
+    local holder
+    holder=$("${DOCKER[@]}" ps --format '{{.Names}} {{.Ports}}' 2>/dev/null \
+             | grep -E "[:.]${port}->" | grep -v '^psygabio-watchdog ' | head -1)
+    if [ -n "$holder" ]; then
+        warn "port ${port} is already in use by another container:"
+        warn "  ${holder}"
         problems=$((problems+1))
     else
-        ok "port ${port} is free"
+        ok "port ${port} is free (or held by this stack)"
     fi
 
     printf '\n  The files this deploy needs\n'
@@ -121,6 +148,10 @@ cmd_preflight() {
 # -----------------------------------------------------------------------------
 cmd_deploy() {
     cmd_preflight || die "preflight failed - fix the problems above first"
+
+    # A redeploy replaces this stack's own container, so stop it first
+    # rather than leaving it to fight the new one for the port.
+    "${COMPOSE[@]}" down 2>/dev/null || true
 
     log "Building the watchdog image"
     "${COMPOSE[@]}" build
@@ -176,23 +207,28 @@ cmd_rebuild() {
 # backup - the audit trail is the record; back it up
 # -----------------------------------------------------------------------------
 cmd_backup() {
-    mkdir -p "$BACKUP_DIR"
-    local stamp dest
+    # The backup is written INSIDE the container, into the backups volume.
+    # The path inside the container is /app/backups - the host's
+    # deploy/backups path does not exist there, because the backups are a
+    # named Docker volume.
+    local stamp
     stamp=$(date +%Y%m%d-%H%M%S)
-    dest="${BACKUP_DIR}/sensor_watchdog-${stamp}.db"
-    log "Backing up the database to ${dest}"
+    log "Backing up the database"
     # A consistent copy: VACUUM INTO takes a transactionally consistent
     # snapshot of a live database without stopping the service.
     "${COMPOSE[@]}" exec -T watchdog python3 -c "
 import sqlite3
 c = sqlite3.connect('/app/data/sensor_watchdog.db')
-c.execute(\"VACUUM INTO '${dest}'\")
+c.execute(\"VACUUM INTO '/app/backups/sensor_watchdog-${stamp}.db'\")
 c.close()
 print('  snapshot written')
 " || die "the backup failed"
-    ok "$(du -h "$dest" | cut -f1) at ${dest}"
-    # Keep 30 days.
-    find "$BACKUP_DIR" -name 'sensor_watchdog-*.db' -mtime +30 -delete
+    # Prune anything older than 30 days, inside the volume.
+    "${COMPOSE[@]}" exec -T watchdog sh -c \
+        "find /app/backups -name 'sensor_watchdog-*.db' -mtime +30 -delete" || true
+    "${COMPOSE[@]}" exec -T watchdog sh -c \
+        "ls -la /app/backups/ | tail -3"
+    ok "the backup is in the backups volume"
 }
 
 # -----------------------------------------------------------------------------
@@ -200,7 +236,7 @@ print('  snapshot written')
 # -----------------------------------------------------------------------------
 cmd_rollback() {
     log "Available images"
-    docker images psygabio-watchdog --format '  {{.Tag}}  {{.ID}}  {{.CreatedSince}}'
+    "${DOCKER[@]}" images psygabio-watchdog --format '  {{.Tag}}  {{.ID}}  {{.CreatedSince}}'
     warn "To roll back, tag the image you want and re-deploy:"
     warn "  docker tag psygabio-watchdog:<tag> psygabio-watchdog:latest"
     warn "  ./deploy.sh restart"
