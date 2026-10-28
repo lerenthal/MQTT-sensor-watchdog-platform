@@ -14,6 +14,7 @@ import csv
 import io
 import sqlite3
 import secrets
+import socket
 import threading
 import hashlib
 import difflib
@@ -204,6 +205,63 @@ def get_db():
     conn.execute("PRAGMA busy_timeout=15000")   # tolerate the watchdog loop's write burst
     return conn
 
+
+# ---------------------------------------------------------------------------
+# The MQTT ingest connection.
+#
+# The MQTT thread receives ~35 messages a second across the fleet. Each
+# one used to open a FRESH SQLite connection, run three PRAGMAs, write and
+# commit. paho runs its network loop and the message handler in ONE
+# thread, so every millisecond spent in the database is a millisecond the
+# socket is not being read. Once the kernel's receive buffer fills, packets
+# are simply dropped.
+#
+# The symptom was devices flapping OFFLINE and DEGRADED while publishing
+# every ten seconds - the watchdog was missing most of the traffic. A
+# device with a 120s offline timeout was marked offline because
+# last_seen only advanced once per ~120s, not because it went quiet.
+#
+# So the ingest path reuses ONE connection, configured once, instead of
+# opening a connection per message.
+# ---------------------------------------------------------------------------
+_mqtt_conn = None
+_mqtt_conn_lock = threading.Lock()
+
+
+def _get_mqtt_conn():
+    """The shared connection for MQTT ingest, opened once and reused."""
+    global _mqtt_conn
+    if _mqtt_conn is not None:
+        return _mqtt_conn
+    with _mqtt_conn_lock:
+        if _mqtt_conn is None:
+            conn = sqlite3.connect(DB_FILE, timeout=10, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            # NORMAL is the right trade-off in WAL: a commit does not fsync
+            # the WAL on every transaction, which is what makes a write
+            # burst affordable. A power loss can lose the last few
+            # transactions; the device timeline is recoverable from the
+            # broker, and a sensor reading is not a financial record.
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=15000")
+            conn.execute("PRAGMA wal_autocheckpoint=2000")
+            _mqtt_conn = conn
+            log.info("MQTT ingest: reusing a single SQLite connection")
+    return _mqtt_conn
+
+
+def _reset_mqtt_conn():
+    """Drop the shared ingest connection (after a fatal DB error)."""
+    global _mqtt_conn
+    with _mqtt_conn_lock:
+        if _mqtt_conn is not None:
+            try:
+                _mqtt_conn.close()
+            except Exception:
+                pass
+            _mqtt_conn = None
+
 def _column_exists(conn, table, column):
     return any(r[1] == column
                for r in conn.execute(f"PRAGMA table_info({table})").fetchall())
@@ -238,6 +296,25 @@ def _apply_migrations(conn):
         CREATE INDEX IF NOT EXISTS idx_status_history_device
             ON device_status_history(device_id, changed_at DESC);
     """)
+    # v9 -> v10: retired channels.
+    #
+    # A channel the device no longer publishes at all - a misnamed sensor
+    # from a shared config, flashed once - is not a broken sensor. The
+    # broker keeps the last value and re-delivers it as a retained message
+    # on every reconnect, so deleting the row was not enough: the phantom
+    # channel was UPSERTed straight back. Recording the retirement is what
+    # makes it stick.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS retired_sensors (
+            device_id   TEXT NOT NULL,
+            sensor_name TEXT NOT NULL,
+            sensor_type TEXT NOT NULL,
+            retired_at  TIMESTAMP DEFAULT (datetime('now','localtime')),
+            reason      TEXT,
+            PRIMARY KEY (device_id, sensor_name, sensor_type)
+        );
+    """)
+
     # v8 -> v9: per-channel observed publish interval. A fixed staleness
     # window cannot serve a fleet whose channels publish on very different
     # cadences: with sensor_flatline_seconds=900 a channel that genuinely
@@ -348,7 +425,7 @@ def _apply_migrations(conn):
         log.info("Migration: renamed sensor_readings.sensor_id -> sensor_name")
 
     conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','9')"
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','10')"
     )
 
 def init_db():
@@ -818,6 +895,23 @@ def _retry_mqtt_write(device_id, sensor_name, sensor_type, val, now, tol):
 
 def on_mqtt_message(client, userdata, msg):
     topic = msg.topic
+    # RETAINED MESSAGES ARE NOT EVIDENCE OF LIFE.
+    #
+    # ESPHome publishes with retain: true, so Mosquitto holds every device's
+    # last state indefinitely and replays all of it on each (re)subscribe. This
+    # client reconnects regularly, so treating a replay as a fresh observation
+    # resurrects dead devices on every reconnect: air_quality and scd30-5 were
+    # both silent for over three days while this watchdog reported them ONLINE,
+    # refreshing last_seen every two minutes from the retained copy.
+    #
+    # That is the §7.2 failure this system exists to catch ("HA and InfluxDB
+    # both showed plausible values — because ESPHome publishes with
+    # retain: true"), reproduced inside the watchdog itself.
+    #
+    # So a retained message may SEED a value we do not have yet, but it must
+    # never advance last_seen / ts / last_change_ts / last_heartbeat_time.
+    # Only a live publish (retain=False) proves the device is alive.
+    retained = bool(getattr(msg, "retain", False))
     try:
         payload_str = msg.payload.decode("utf-8", errors="ignore").strip()
     except Exception:
@@ -907,21 +1001,73 @@ def on_mqtt_message(client, userdata, msg):
     tol = float(config.get("watchdog", {}).get("sensor_flatline_min_change", 0.0))
     conn = None
     try:
-        conn = get_db()
+        # The shared ingest connection, reused across messages. Opening a
+        # fresh connection per message cost enough time to drop packets.
+        conn = _get_mqtt_conn()
         cursor = conn.cursor()
+
+        # A retired channel is not re-created, even when the broker
+        # re-delivers its retained value on reconnect. This is the check
+        # that makes a retirement stick. Only named sensor channels can
+        # be retired, so the lookup is skipped for status/heartbeat.
+        if sensor_name:
+            _retired = cursor.execute(
+                "SELECT 1 FROM retired_sensors WHERE device_id = ? "
+                "AND sensor_name = ? LIMIT 1",
+                (device_id, sensor_name),
+            ).fetchone()
+            if _retired:
+                return
+        # A device first seen only through a retained replay has never been
+        # observed alive, so it is created with last_seen = NULL rather than
+        # now(). The OFFLINE rule treats NULL as "never observed publishing".
         cursor.execute(
             "INSERT OR IGNORE INTO devices (device_id, last_seen) VALUES (?, ?)",
-            (device_id, now),
+            (device_id, None if retained else now),
         )
-        cursor.execute("UPDATE devices SET last_seen = ? WHERE device_id = ?", (now, device_id))
+        if not retained:
+            # A live packet is proof of life, so it also lifts a stale OFFLINE
+            # verdict. Without this, OFFLINE is an absorbing state: the LWT (or
+            # a silence window) sets it, and nothing clears it, because ESPHome
+            # only republishes status=online when it reconnects to the broker.
+            # Recovery used to happen only as a side effect of the retained
+            # status=online replay — i.e. by accident. The eval loop re-derives
+            # the real status within one cycle; this just stops a live device
+            # being pinned OFFLINE forever.
+            cursor.execute(
+                "UPDATE devices SET last_seen = ?, "
+                "status = CASE WHEN status = 'OFFLINE' THEN 'ONLINE' ELSE status END "
+                "WHERE device_id = ?",
+                (now, device_id),
+            )
+            # Commit the liveness fact on its own, immediately.
+            #
+            # The branches below `return` early for a great many packets —
+            # unclassifiable names, diagnostics we do not keep, ESPHome's
+            # placeholder values — and those returns leave the transaction
+            # uncommitted, so this UPDATE was silently rolled back. A device
+            # whose live traffic is ENTIRELY diagnostics (scd30_2 publishes
+            # only uptime / wifi_signal / firmware_version) therefore never
+            # refreshed last_seen and sat at OFFLINE while plainly alive.
+            # "This device published something just now" is worth recording
+            # regardless of whether we keep the payload.
+            conn.commit()
 
         if metric_path == "status":
             value = payload_str.lower()
             if value == "offline":
+                # A retained 'offline' IS meaningful: it is the last will,
+                # already fired. Trust it either way.
                 cursor.execute("UPDATE devices SET status = 'OFFLINE' WHERE device_id = ?", (device_id,))
-            elif value == "online":
+            elif value == "online" and not retained:
+                # A retained 'online' is just the broker's memory of a device
+                # that may have died since. Never promote on a replay.
                 cursor.execute("UPDATE devices SET status = 'ONLINE' WHERE device_id = ?", (device_id,))
         elif "heartbeat_counter" in metric_path and not metric_path.endswith("/config"):
+            if retained:
+                # A replayed counter is not a tick.
+                conn.commit()
+                return
             try:
                 val = int(float(payload_str))
                 row = cursor.execute(
@@ -941,7 +1087,6 @@ def on_mqtt_message(client, userdata, msg):
             # it has an MQTT button component. A /cmd topic is just an
             # echo of a command somebody published.
             if not is_button_state:
-                conn.close()
                 return
             try:
                 conn.execute("""
@@ -951,10 +1096,8 @@ def on_mqtt_message(client, userdata, msg):
                         value = excluded.value, ts = excluded.ts
                 """, (device_id, sensor_name, now, now))
                 conn.commit()
-                conn.close()
                 return
             except Exception:
-                conn.close()
                 return
         elif is_binary:
             # Firmware binary sensor ('Value Stall' / 'Sensor Fault'). Payload
@@ -972,6 +1115,17 @@ def on_mqtt_message(client, userdata, msg):
             else:
                 return
             sensor_type = "diagnostic"
+            if retained:
+                # Same rule as for readings: seed the firmware's verdict but do
+                # not date it, because we do not know when it was published.
+                cursor.execute("""
+                    INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
+                    VALUES (?, ?, ?, ?, NULL, NULL)
+                    ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
+                        value = excluded.value
+                """, (device_id, sensor_name, sensor_type, val))
+                conn.commit()
+                return
             cursor.execute("""
                 INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -984,7 +1138,6 @@ def on_mqtt_message(client, userdata, msg):
                     END
             """, (device_id, sensor_name, sensor_type, val, now, now))
             conn.commit()
-            conn.close()
             return
         else:
             # Sensor reading. Match metric type against sensor_name (the ESPHome
@@ -1026,6 +1179,22 @@ def on_mqtt_message(client, userdata, msg):
                 return
             if sensor_type == "battery" and val == 0.0:
                 return
+            if retained:
+                # Seed the value so the UI is not blank after a restart, but
+                # leave ts / last_change_ts alone: we do NOT know when this was
+                # actually published, and claiming "now" is what made dead
+                # devices look alive. A NULL ts reads as "age unknown"
+                # downstream, and last_seen is untouched, so the device falls
+                # to OFFLINE on its own if nothing live ever arrives.
+                cursor.execute("""
+                    INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
+                    VALUES (?, ?, ?, ?, NULL, NULL)
+                    ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
+                        value = excluded.value
+                """, (device_id, sensor_name, sensor_type, val))
+                conn.commit()
+                return
+
             # Record that we saw this channel alive. Used to distinguish a
             # genuine simultaneous failure (we watched it happen) from the
             # "watchdog was down, everything looks stale" artefact.
@@ -1098,7 +1267,6 @@ def on_mqtt_message(client, userdata, msg):
             # heartbeat/light/pressure intentionally not denormalised — dashboard only shows
             # the headline metrics; per-sensor view shows the rest.
         conn.commit()
-        conn.close()
     except sqlite3.OperationalError as e:
         # Contention with the watchdog's write transaction. The MQTT thread
         # must not drop the packet: the next publish of the same value
@@ -1122,14 +1290,14 @@ def on_mqtt_message(client, userdata, msg):
     except Exception as e:
         log.exception(f"on_mqtt_message failed for topic={topic}: {e}")
     finally:
-        # Every exit path must release the connection. Leaked SQLite
-        # connections hold read locks and starve the writer, which is how
-        # 47 open descriptors on one file turns into a wedged database.
-        try:
-            if conn is not None:
-                conn.close()
-        except Exception:
-            pass
+        # The connection is SHARED and long-lived, so it is not closed here.
+        # If the connection itself is broken, drop it so the next message
+        # opens a fresh one.
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+            except Exception:
+                _reset_mqtt_conn()
 
 def start_mqtt():
     # A unique client_id per instance. Mosquitto enforces "one connection
@@ -1140,9 +1308,17 @@ def start_mqtt():
     # that dies a second later).
     _suffix = os.environ.get("WATCHDOG_INSTANCE_ID", "").strip()
     if not _suffix:
-        # Fall back to the web port, which differs between instances.
-        _suffix = str(config.get("web", {}).get("port", "5050"))
+        # The web PORT is not a discriminator: in Docker every instance listens
+        # on 5050 internally and is only mapped to a different port on the
+        # host, so production and the pilot both resolved to
+        # "sensor-watchdog-5050" and evicted each other from the broker every
+        # ~2 minutes (216 x rc=16). Each eviction triggers a re-subscribe and a
+        # full retained replay, which is what kept dead devices looking alive.
+        # The hostname is the container id: unique per instance, and stable
+        # across restarts of the same container so the session is reused.
+        _suffix = f"{socket.gethostname()}-{config.get('web', {}).get('port', '5050')}"
     client = mqtt.Client(client_id=f"sensor-watchdog-{_suffix}")
+    log.info("MQTT client_id=sensor-watchdog-%s", _suffix)
     if config["mqtt"].get("username"):
         client.username_pw_set(config["mqtt"]["username"], config["mqtt"]["password"])
     client.reconnect_delay_set(
@@ -1416,12 +1592,25 @@ def watchdog_eval_loop():
             fault_msg  = ""
 
             # 1. OFFLINE check (highest precedence)
-            is_offline_topic = prev_status == "OFFLINE"
+            # last_seen is NULL when the device has only ever been seen through
+            # a retained replay — the broker remembers it, but we have never
+            # watched it publish. That is offline, not healthy.
+            never_observed = last_seen is None
             is_silent = last_seen and (now - last_seen).total_seconds() > offline_limit
-            if is_offline_topic or is_silent:
+            # An earlier OFFLINE verdict (LWT or silence) only stands while the
+            # device is STILL silent. Gating on freshness stops OFFLINE being
+            # absorbing — a device publishing live traffic is, by definition,
+            # not offline, whatever we concluded a minute ago.
+            is_offline_topic = prev_status == "OFFLINE" and not (
+                last_seen and (now - last_seen).total_seconds() <= offline_limit)
+            if is_offline_topic or is_silent or never_observed:
                 fault_type = "OFFLINE"
-                silent_for = int((now - last_seen).total_seconds()) if last_seen else 0
-                fault_msg = f"Device silent for {silent_for}s."
+                if never_observed:
+                    fault_msg = ("No live publish ever observed "
+                                 "(only the broker's retained copy).")
+                else:
+                    silent_for = int((now - last_seen).total_seconds()) if last_seen else 0
+                    fault_msg = f"Device silent for {silent_for}s."
 
             # 2. STALLED (heartbeat) check — only if device isn't already offline
             elif last_hb_time and (now - last_hb_time).total_seconds() > heartbeat_lim:
@@ -1444,6 +1633,31 @@ def watchdog_eval_loop():
             # `stale_limit` is this channel's OWN adaptive threshold, carried
             # out of SQL so the Python split below and the dashboard agree with
             # it instead of each re-deriving a fixed window.
+            # A channel that the device no longer publishes at all.
+            #
+            # Some devices briefly published an entity that is not in their
+            # firmware - a misnamed sensor from a shared config, flashed
+            # once and then never again (dalas-1 published
+            # "dalas-2_temperature" once, on 27 Oct, and has published only
+            # "dalas-1_temperature" since). The watchdog kept the row and
+            # raised SENSOR_SILENT on it forever: a permanent false alarm
+            # about a sensor that does not exist on the device.
+            #
+            # The distinction from a genuinely broken sensor:
+            #   - a broken sensor belongs to a device that IS publishing,
+            #     and the channel went dark recently -> SENSOR_SILENT. Real.
+            #   - an entity the device never had goes dark while the device
+            #     keeps publishing everything else -> it is simply not on the
+            #     device any more. Retired, not alerted.
+            #
+            # The threshold is deliberately generous. A channel that has
+            # been dark for this long is not going to come back by itself,
+            # and the operator has long since been told about it.
+            _retired_after_s = float(
+                config.get("watchdog", {}).get("retired_sensor_after_seconds", 21600))
+            _retired_channels = []
+            _device_heartbeat_fresh = bool(
+                last_hb_time and (now - last_hb_time).total_seconds() <= heartbeat_lim)
             sensor_fault = cursor.execute(f"""
                 SELECT sensor_name, sensor_type, value, ts, last_change_ts,
                        publish_interval_s,
@@ -1467,6 +1681,62 @@ def watchdog_eval_loop():
             if _suppressed:
                 sensor_fault = [r for r in sensor_fault
                                 if r["sensor_name"] not in _suppressed]
+
+            # Retire channels the device no longer publishes.
+            #
+            # The retirement is RECORDED, not just deleted. The broker
+            # keeps the last value of every published topic and re-delivers
+            # it as a retained message on every reconnect, so a deleted row
+            # would simply be UPSERTed back - which is what happened to
+            # dalas-1/dalas-2_temperature. The record is what makes the
+            # retirement stick.
+            #
+            # A channel that has been dark for a very long time, while the
+            # device's heartbeat is alive and it is publishing its other
+            # channels normally, is an entity that is not on the device any
+            # more - not a broken sensor. dalas-1 published
+            # "dalas-2_temperature" once, on 27 Oct, and has published only
+            # "dalas-1_temperature" since; the watchdog kept the row and
+            # raised SENSOR_SILENT on it forever, and the dashboard showed
+            # a second temperature channel that does not exist.
+            #
+            # The row is DELETED, not just excluded from the alert list:
+            # sensor_readings is a current-state table (one row per
+            # device+sensor+type), so removing the row takes the channel
+            # out of the dashboard too. A channel that really is broken is
+            # caught long before this threshold and is reported as
+            # SENSOR_SILENT.
+            if _device_heartbeat_fresh:
+                _retire = cursor.execute(f"""
+                    SELECT sensor_name, sensor_type,
+                           (julianday(?) - julianday(ts)) * 86400.0 AS silent_s
+                    FROM sensor_readings
+                    WHERE device_id = ?
+                      AND sensor_type NOT IN ('heartbeat', 'diagnostic')
+                      AND (julianday(?) - julianday(ts)) * 86400.0 > ?
+                """, (now.isoformat(sep=" "), device_id,
+                      now.isoformat(sep=" "), _retired_after_s)).fetchall()
+                for _r in _retire:
+                    log.info(
+                        "Retiring channel %s/%s: no packet for %.0fs while the "
+                        "device keeps publishing its other channels. It is not "
+                        "on the device any more.",
+                        device_id, _r["sensor_name"], _r["silent_s"] or 0.0)
+                    cursor.execute(
+                        "DELETE FROM sensor_readings WHERE device_id = ? "
+                        "AND sensor_name = ? AND sensor_type = ?",
+                        (device_id, _r["sensor_name"], _r["sensor_type"]))
+                    # Record it so the retained replay cannot bring it back.
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO retired_sensors"
+                        "(device_id, sensor_name, sensor_type, retired_at, reason) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (device_id, _r["sensor_name"], _r["sensor_type"],
+                         now.isoformat(sep=" "),
+                         f"no packet for {int(_r['silent_s'] or 0)}s while the "
+                         f"device kept publishing"))
+                    _retired_channels.append(
+                        f"{device_id}/{_r['sensor_name']}")
 
             # The firmware publishes its own 'Value Stall' binary sensor,
             # computed on the device against its previous reading with a
@@ -1588,6 +1858,15 @@ def watchdog_eval_loop():
                     "VALUES (?, ?, datetime('now','localtime'))",
                     (device_id, new_status),
                 )
+
+            if _retired_channels:
+                # username is explicit: the watchdog loop runs outside any
+                # request context, so audit() cannot read the session.
+                audit("SENSOR_RETIRED", device_id=device_id,
+                      details="channels not published by the device for over "
+                              f"{int(_retired_after_s)}s while the device kept "
+                              f"publishing: {', '.join(_retired_channels)}",
+                      username="watchdog", cursor=cursor)
 
             # Resolve alerts that no longer apply. This must be PER ALERT
             # TYPE, not "resolve everything when the device is healthy": a

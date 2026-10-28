@@ -246,6 +246,152 @@ def main():
           not any(x["device_id"] == "own" and x["alert_type"] == "STALLED"
                   for x in open_alerts()))
 
+    # ---- C7: retained MQTT messages must not prove liveness --------------
+    # ESPHome publishes with retain: true, so the broker replays every device's
+    # last state on each re-subscribe. Treating a replay as a fresh observation
+    # resurrected dead devices on every reconnect: air_quality and scd30-5 were
+    # silent for 3+ days while the watchdog reported them ONLINE.
+    #
+    # MQTT semantics make the fix exact: a live publish is delivered to an
+    # already-subscribed client with retain=False; only a replay to a NEW
+    # subscriber carries retain=True.
+    class M:
+        def __init__(self, topic, payload, retain=False):
+            self.topic = topic
+            self.payload = payload.encode()
+            self.retain = retain
+
+    reset()
+    T = "facility/ghost/env_sensor/sensor/ghost_co2/state"
+    # A live publish establishes the device.
+    app.on_mqtt_message(None, None, M(T, "500", retain=False))
+    c = app.get_db()
+    d = c.execute("SELECT last_seen FROM devices WHERE device_id='ghost'").fetchone()
+    r = c.execute("SELECT ts, value FROM sensor_readings WHERE device_id='ghost'").fetchone()
+    c.close()
+    live_seen, live_ts = d["last_seen"], r["ts"]
+    check("C7 a LIVE publish sets last_seen and ts",
+          live_seen is not None and live_ts is not None and r["value"] == 500)
+
+    # Age it, then replay the retained copy — nothing may be refreshed.
+    c = app.get_db()
+    c.execute("UPDATE devices SET last_seen=? WHERE device_id='ghost'", (ts(9999),))
+    c.execute("UPDATE sensor_readings SET ts=?, last_change_ts=? WHERE device_id='ghost'",
+              (ts(9999), ts(9999)))
+    c.commit(); c.close()
+    app.on_mqtt_message(None, None, M(T, "500", retain=True))
+    c = app.get_db()
+    d2 = c.execute("SELECT last_seen FROM devices WHERE device_id='ghost'").fetchone()
+    r2 = c.execute("SELECT ts FROM sensor_readings WHERE device_id='ghost'").fetchone()
+    c.close()
+    age_seen = (datetime.now() - app._parse_ts(str(d2["last_seen"]))).total_seconds()
+    age_ts = (datetime.now() - app._parse_ts(str(r2["ts"]))).total_seconds()
+    check("C7 a RETAINED replay does NOT refresh last_seen", age_seen > 9000)
+    check("C7 a RETAINED replay does NOT refresh ts", age_ts > 9000)
+
+    # ...and the device is therefore correctly reported OFFLINE.
+    app.watchdog_eval_loop()
+    check("C7 device dead-but-replaying is OFFLINE",
+          any(x["device_id"] == "ghost" and x["alert_type"] == "OFFLINE"
+              for x in open_alerts()))
+
+    # A retained 'online' status must not resurrect it; a live one must.
+    app.on_mqtt_message(None, None,
+                        M("facility/ghost/env_sensor/status", "online", retain=True))
+    c = app.get_db()
+    st = c.execute("SELECT status FROM devices WHERE device_id='ghost'").fetchone()["status"]
+    c.close()
+    check("C7 retained 'online' does not resurrect a dead device", st == "OFFLINE")
+
+    # A device seen ONLY via retained replay is never credited as alive.
+    reset()
+    app.on_mqtt_message(None, None, M(
+        "facility/phantom/env_sensor/sensor/phantom_co2/state", "420", retain=True))
+    c = app.get_db()
+    d3 = c.execute("SELECT last_seen FROM devices WHERE device_id='phantom'").fetchone()
+    r3 = c.execute("SELECT ts, value FROM sensor_readings WHERE device_id='phantom'").fetchone()
+    c.close()
+    check("C7 retained-only device has NULL last_seen but keeps the seeded value",
+          d3 is not None and d3["last_seen"] is None
+          and r3 is not None and r3["value"] == 420 and r3["ts"] is None)
+    app.watchdog_eval_loop()
+    check("C7 retained-only device is OFFLINE, not ONLINE",
+          any(x["device_id"] == "phantom" and x["alert_type"] == "OFFLINE"
+              for x in open_alerts()))
+
+    # ---- C8: OFFLINE must not be an absorbing state ----------------------
+    # Once a device was marked OFFLINE, prev_status == "OFFLINE" kept it there
+    # forever. The only escape was the retained status=online replay on
+    # reconnect — recovery by accident. Fixing the retained handling exposed
+    # this: 9 actively-publishing devices sat pinned at OFFLINE.
+    reset()
+    add_device("recov")
+    c = app.get_db()
+    c.execute("UPDATE devices SET status='OFFLINE', last_seen=? WHERE device_id='recov'",
+              (ts(9999),))
+    c.commit(); c.close()
+    app.watchdog_eval_loop()
+    check("C8 silent device is OFFLINE",
+          any(x["device_id"] == "recov" and x["alert_type"] == "OFFLINE"
+              for x in open_alerts()))
+
+    # A single LIVE packet must lift it.
+    app.on_mqtt_message(None, None, M(
+        "facility/recov/env_sensor/sensor/recov_co2/state", "430", retain=False))
+    app.watchdog_eval_loop()
+    c = app.get_db()
+    st = c.execute("SELECT status FROM devices WHERE device_id='recov'").fetchone()["status"]
+    c.close()
+    check("C8 a live packet recovers a device from OFFLINE", st != "OFFLINE")
+    check("C8 the OFFLINE alert is resolved on recovery",
+          not any(x["device_id"] == "recov" and x["alert_type"] == "OFFLINE"
+                  for x in open_alerts()))
+
+    # ...but a RETAINED packet must NOT lift it (that was the original bug).
+    reset()
+    add_device("norecov")
+    c = app.get_db()
+    c.execute("UPDATE devices SET status='OFFLINE', last_seen=? WHERE device_id='norecov'",
+              (ts(9999),))
+    c.commit(); c.close()
+    app.watchdog_eval_loop()
+    app.on_mqtt_message(None, None, M(
+        "facility/norecov/env_sensor/sensor/norecov_co2/state", "430", retain=True))
+    app.watchdog_eval_loop()
+    check("C8 a retained replay does NOT recover a dead device",
+          any(x["device_id"] == "norecov" and x["alert_type"] == "OFFLINE"
+              for x in open_alerts()))
+
+    # ---- C9: liveness must survive the early returns ---------------------
+    # Most packets exit the ingest function early (unclassifiable name,
+    # unwanted diagnostic, ESPHome placeholder value) and those returns left
+    # the transaction uncommitted, discarding the last_seen update with it.
+    # scd30_2 publishes ONLY diagnostics live (uptime, wifi_signal,
+    # firmware_version) and so never refreshed last_seen — it sat OFFLINE
+    # while publishing every few seconds.
+    reset()
+    app.on_mqtt_message(None, None, M(
+        "facility/diagonly/env_sensor/sensor/diagonly_co2/state", "500", retain=False))
+    c = app.get_db()
+    c.execute("UPDATE devices SET last_seen=? WHERE device_id='diagonly'", (ts(9999),))
+    c.commit(); c.close()
+
+    # A live DIAGNOSTIC-only packet: its payload is discarded, but it still
+    # proves the device is alive.
+    app.on_mqtt_message(None, None, M(
+        "facility/diagonly/env_sensor/sensor/diagonly_wifi_signal/state",
+        "-70", retain=False))
+    c = app.get_db()
+    ls = c.execute("SELECT last_seen FROM devices WHERE device_id='diagonly'").fetchone()["last_seen"]
+    c.close()
+    age = (datetime.now() - app._parse_ts(str(ls))).total_seconds()
+    check("C9 a live diagnostic-only packet still refreshes last_seen", age < 60)
+
+    app.watchdog_eval_loop()
+    check("C9 diagnostic-only publisher is NOT falsely OFFLINE",
+          not any(x["device_id"] == "diagonly" and x["alert_type"] == "OFFLINE"
+                  for x in open_alerts()))
+
     # ---- C5: /api/devices must not leak connections ----------------------
     app.app.secret_key = "x" * 40
     app.app.testing = True

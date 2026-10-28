@@ -110,3 +110,16 @@ CREATE INDEX IF NOT EXISTS idx_audit_recent
 
 CREATE INDEX IF NOT EXISTS idx_config_history_recent
     ON config_history(saved_at DESC);
+
+-- Channels the device no longer publishes. The broker re-delivers the
+-- last value of every published topic as a retained message on each
+-- reconnect, so a retired channel has to be remembered, not merely
+-- deleted from sensor_readings - otherwise it comes straight back.
+CREATE TABLE IF NOT EXISTS retired_sensors (
+    device_id   TEXT NOT NULL,
+    sensor_name TEXT NOT NULL,
+    sensor_type TEXT NOT NULL,
+    retired_at  TIMESTAMP DEFAULT (datetime('now','localtime')),
+    reason      TEXT,
+    PRIMARY KEY (device_id, sensor_name, sensor_type)
+);

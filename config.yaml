@@ -31,6 +31,13 @@ watchdog:
   # in and out of DEGRADED/SYSTEMIC on every cycle. 0 restores the old
   # fixed-window behaviour.
   sensor_stale_interval_multiplier: 3.0
+  # A channel the device stops publishing entirely, while the device keeps
+  # publishing its other channels normally, is an entity that is not on the
+  # device any more (a misnamed sensor from a shared config, flashed once).
+  # After this long with no packet at all it is retired: removed from the
+  # dashboard and no longer alerted on. A channel that really is broken is
+  # caught long before this and reported as SENSOR_SILENT.
+  retired_sensor_after_seconds: 21600
   # Clear-side deadband for OUT_OF_RANGE, as a percentage of the configured
   # band (max-min). A value must come back inside the limits by this margin
   # before the breach resolves, so a reading parked on the limit cannot

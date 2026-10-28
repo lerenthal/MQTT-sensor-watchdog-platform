@@ -561,3 +561,18 @@ The table fits a 16:9 screen at 100% zoom without scrolling sideways.
 The expansion state is remembered per browser, so your view survives the
 10-second refresh and a page reload.
 
+## Sensors a device no longer publishes
+
+Some devices briefly publish an entity that is not in their firmware - a
+misnamed sensor from a shared config, flashed once and never again.
+`dalas-1` did exactly this: it published a `dalas-2_temperature` channel
+once, on 27 October, and has published only `dalas-1_temperature` since.
+
+The watchdog retires such a channel after six hours of complete silence
+**while the device keeps publishing its other channels normally** - so it
+disappears from the sensor list and stops being alerted on. A channel
+that really is broken is caught long before that and is still reported as
+**SENSOR_SILENT**, with the device shown as DEGRADED.
+
+Retirements are recorded in the audit trail as `SENSOR_RETIRED`.
+

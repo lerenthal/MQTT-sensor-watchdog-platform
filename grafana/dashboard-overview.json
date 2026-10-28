@@ -1,0 +1,777 @@
+{
+  "uid": "psygabio-overview",
+  "title": "PsygaBio \u2014 Fleet Overview",
+  "tags": [
+    "psygabio",
+    "watchdog"
+  ],
+  "timezone": "Asia/Jerusalem",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "editable": true,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Channels reporting (< 15 min)",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "aflneas0umnswd"
+      },
+      "id": 1,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "aflneas0umnswd"
+          },
+          "query": "import \"strings\"\nfrom(bucket: \"GMP_sensor_data\")\n  |> range(start: -30d)\n  |> filter(fn: (r) => r._measurement == \"sensor_measurements\" and r._field == \"value\")\n  |> last()\n  |> map(fn: (r) => ({ r with\n       device: strings.split(v: r.topic, t: \"/\")[1],\n       channel: strings.split(v: r.topic, t: \"/\")[4] }))\n  |> filter(fn: (r) => not strings.containsStr(v: r.channel, substr: \"uptime\") and not strings.containsStr(v: r.channel, substr: \"wifi_signal\") and not strings.containsStr(v: r.channel, substr: \"boot_count\") and not strings.containsStr(v: r.channel, substr: \"calibration\") and not strings.containsStr(v: r.channel, substr: \"mac_address\") and not strings.containsStr(v: r.channel, substr: \"ip_address\") and not strings.containsStr(v: r.channel, substr: \"ssid\") and not strings.containsStr(v: r.channel, substr: \"version\") and not strings.containsStr(v: r.channel, substr: \"last_calibrated\") and not strings.containsStr(v: r.channel, substr: \"compliance_note\") and not strings.containsStr(v: r.channel, substr: \"heartbeat_counter\"))\n  |> map(fn: (r) => ({ r with age_s: (int(v: now()) - int(v: r._time)) / 1000000000 }))\n  |> filter(fn: (r) => r.age_s <= 900)\n  |> group()\n  |> count(column: \"device\")"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Channels stale (> 15 min)",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "aflneas0umnswd"
+      },
+      "id": 2,
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "aflneas0umnswd"
+          },
+          "query": "import \"strings\"\nfrom(bucket: \"GMP_sensor_data\")\n  |> range(start: -30d)\n  |> filter(fn: (r) => r._measurement == \"sensor_measurements\" and r._field == \"value\")\n  |> last()\n  |> map(fn: (r) => ({ r with\n       device: strings.split(v: r.topic, t: \"/\")[1],\n       channel: strings.split(v: r.topic, t: \"/\")[4] }))\n  |> filter(fn: (r) => not strings.containsStr(v: r.channel, substr: \"uptime\") and not strings.containsStr(v: r.channel, substr: \"wifi_signal\") and not strings.containsStr(v: r.channel, substr: \"boot_count\") and not strings.containsStr(v: r.channel, substr: \"calibration\") and not strings.containsStr(v: r.channel, substr: \"mac_address\") and not strings.containsStr(v: r.channel, substr: \"ip_address\") and not strings.containsStr(v: r.channel, substr: \"ssid\") and not strings.containsStr(v: r.channel, substr: \"version\") and not strings.containsStr(v: r.channel, substr: \"last_calibrated\") and not strings.containsStr(v: r.channel, substr: \"compliance_note\") and not strings.containsStr(v: r.channel, substr: \"heartbeat_counter\"))\n  |> map(fn: (r) => ({ r with age_s: (int(v: now()) - int(v: r._time)) / 1000000000 }))\n  |> filter(fn: (r) => r.age_s > 900 and r.age_s <= 3600)\n  |> group()\n  |> count(column: \"device\")"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "#EAB839",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Channels silent (> 1 h)",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "aflneas0umnswd"
+      },
+      "id": 3,
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "aflneas0umnswd"
+          },
+          "query": "import \"strings\"\nfrom(bucket: \"GMP_sensor_data\")\n  |> range(start: -30d)\n  |> filter(fn: (r) => r._measurement == \"sensor_measurements\" and r._field == \"value\")\n  |> last()\n  |> map(fn: (r) => ({ r with\n       device: strings.split(v: r.topic, t: \"/\")[1],\n       channel: strings.split(v: r.topic, t: \"/\")[4] }))\n  |> filter(fn: (r) => not strings.containsStr(v: r.channel, substr: \"uptime\") and not strings.containsStr(v: r.channel, substr: \"wifi_signal\") and not strings.containsStr(v: r.channel, substr: \"boot_count\") and not strings.containsStr(v: r.channel, substr: \"calibration\") and not strings.containsStr(v: r.channel, substr: \"mac_address\") and not strings.containsStr(v: r.channel, substr: \"ip_address\") and not strings.containsStr(v: r.channel, substr: \"ssid\") and not strings.containsStr(v: r.channel, substr: \"version\") and not strings.containsStr(v: r.channel, substr: \"last_calibrated\") and not strings.containsStr(v: r.channel, substr: \"compliance_note\") and not strings.containsStr(v: r.channel, substr: \"heartbeat_counter\"))\n  |> map(fn: (r) => ({ r with age_s: (int(v: now()) - int(v: r._time)) / 1000000000 }))\n  |> filter(fn: (r) => r.age_s > 3600)\n  |> group()\n  |> count(column: \"device\")"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Channels dead (> 24 h)",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "aflneas0umnswd"
+      },
+      "id": 4,
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "aflneas0umnswd"
+          },
+          "query": "import \"strings\"\nfrom(bucket: \"GMP_sensor_data\")\n  |> range(start: -30d)\n  |> filter(fn: (r) => r._measurement == \"sensor_measurements\" and r._field == \"value\")\n  |> last()\n  |> map(fn: (r) => ({ r with\n       device: strings.split(v: r.topic, t: \"/\")[1],\n       channel: strings.split(v: r.topic, t: \"/\")[4] }))\n  |> filter(fn: (r) => not strings.containsStr(v: r.channel, substr: \"uptime\") and not strings.containsStr(v: r.channel, substr: \"wifi_signal\") and not strings.containsStr(v: r.channel, substr: \"boot_count\") and not strings.containsStr(v: r.channel, substr: \"calibration\") and not strings.containsStr(v: r.channel, substr: \"mac_address\") and not strings.containsStr(v: r.channel, substr: \"ip_address\") and not strings.containsStr(v: r.channel, substr: \"ssid\") and not strings.containsStr(v: r.channel, substr: \"version\") and not strings.containsStr(v: r.channel, substr: \"last_calibrated\") and not strings.containsStr(v: r.channel, substr: \"compliance_note\") and not strings.containsStr(v: r.channel, substr: \"heartbeat_counter\"))\n  |> map(fn: (r) => ({ r with age_s: (int(v: now()) - int(v: r._time)) / 1000000000 }))\n  |> filter(fn: (r) => r.age_s > 86400)\n  |> group()\n  |> count(column: \"device\")"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "dark-red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "table",
+      "title": "Device liveness \u2014 seconds since the device's last packet",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "aflneas0umnswd"
+      },
+      "id": 5,
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 10,
+        "h": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "aflneas0umnswd"
+          },
+          "query": "import \"strings\"\nfrom(bucket: \"GMP_sensor_data\")\n  |> range(start: -30d)\n  |> filter(fn: (r) => r._measurement == \"sensor_measurements\" and r._field == \"value\")\n  |> last()\n  |> map(fn: (r) => ({ r with\n       device: strings.split(v: r.topic, t: \"/\")[1],\n       channel: strings.split(v: r.topic, t: \"/\")[4] }))\n  |> group(columns: [\"device\"])\n  |> max(column: \"_time\")\n  |> map(fn: (r) => ({ r with age_s: (int(v: now()) - int(v: r._time)) / 1000000000 }))\n  |> group()\n  |> keep(columns: [\"device\", \"age_s\"])\n  |> sort(columns: [\"age_s\"], desc: true)"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "age_s",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "age_s"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Age"
+              },
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "#EAB839",
+                      "value": 900
+                    },
+                    {
+                      "color": "orange",
+                      "value": 3600
+                    },
+                    {
+                      "color": "red",
+                      "value": 86400
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "_value"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Last value"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 130
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "device"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Device"
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "channel"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Channel"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "table",
+      "title": "Channel freshness \u2014 every environmental channel, stalest first",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "aflneas0umnswd"
+      },
+      "id": 6,
+      "gridPos": {
+        "x": 10,
+        "y": 4,
+        "w": 14,
+        "h": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "aflneas0umnswd"
+          },
+          "query": "import \"strings\"\nfrom(bucket: \"GMP_sensor_data\")\n  |> range(start: -30d)\n  |> filter(fn: (r) => r._measurement == \"sensor_measurements\" and r._field == \"value\")\n  |> last()\n  |> map(fn: (r) => ({ r with\n       device: strings.split(v: r.topic, t: \"/\")[1],\n       channel: strings.split(v: r.topic, t: \"/\")[4] }))\n  |> filter(fn: (r) => not strings.containsStr(v: r.channel, substr: \"uptime\") and not strings.containsStr(v: r.channel, substr: \"wifi_signal\") and not strings.containsStr(v: r.channel, substr: \"boot_count\") and not strings.containsStr(v: r.channel, substr: \"calibration\") and not strings.containsStr(v: r.channel, substr: \"mac_address\") and not strings.containsStr(v: r.channel, substr: \"ip_address\") and not strings.containsStr(v: r.channel, substr: \"ssid\") and not strings.containsStr(v: r.channel, substr: \"version\") and not strings.containsStr(v: r.channel, substr: \"last_calibrated\") and not strings.containsStr(v: r.channel, substr: \"compliance_note\") and not strings.containsStr(v: r.channel, substr: \"heartbeat_counter\"))\n  |> map(fn: (r) => ({ r with age_s: (int(v: now()) - int(v: r._time)) / 1000000000 }))\n  |> group()\n  |> keep(columns: [\"device\", \"channel\", \"_value\", \"age_s\"])\n  |> sort(columns: [\"age_s\"], desc: true)"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "age_s",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "age_s"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Age"
+              },
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "#EAB839",
+                      "value": 900
+                    },
+                    {
+                      "color": "orange",
+                      "value": 3600
+                    },
+                    {
+                      "color": "red",
+                      "value": 86400
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "_value"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Last value"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 130
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "device"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Device"
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "channel"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Channel"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "CO2 (ppm)",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "aflneas0umnswd"
+      },
+      "id": 7,
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 24,
+        "h": 9
+      },
+      "maxDataPoints": 1000,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "aflneas0umnswd"
+          },
+          "query": "import \"strings\"\nfrom(bucket: \"GMP_sensor_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> map(fn: (r) => ({ r with\n       device: strings.split(v: r.topic, t: \"/\")[1],\n       channel: strings.split(v: r.topic, t: \"/\")[4] }))\n  |> filter(fn: (r) => r._measurement == \"sensor_measurements\" and r._field == \"value\")\n  |> filter(fn: (r) => strings.containsStr(v: r.channel, substr: \"co2\") or strings.containsStr(v: r.channel, substr: \"carbon_dioxide\") or strings.containsStr(v: r.channel, substr: \"eco2\"))\n  |> filter(fn: (r) => not strings.containsStr(v: r.channel, substr: \"uptime\") and not strings.containsStr(v: r.channel, substr: \"wifi_signal\") and not strings.containsStr(v: r.channel, substr: \"boot_count\") and not strings.containsStr(v: r.channel, substr: \"calibration\") and not strings.containsStr(v: r.channel, substr: \"mac_address\") and not strings.containsStr(v: r.channel, substr: \"ip_address\") and not strings.containsStr(v: r.channel, substr: \"ssid\") and not strings.containsStr(v: r.channel, substr: \"version\") and not strings.containsStr(v: r.channel, substr: \"last_calibrated\") and not strings.containsStr(v: r.channel, substr: \"compliance_note\") and not strings.containsStr(v: r.channel, substr: \"heartbeat_counter\"))\n  |> aggregateWindow(every: duration(v: int(v: v.windowPeriod) * 8),\n                     fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({ r with _field: r.device + \" / \" + r.channel }))\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ppm",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 4,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "pointSize": 4
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Temperature (\u00b0C)",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "aflneas0umnswd"
+      },
+      "id": 8,
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 12,
+        "h": 9
+      },
+      "maxDataPoints": 1000,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "aflneas0umnswd"
+          },
+          "query": "import \"strings\"\nfrom(bucket: \"GMP_sensor_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> map(fn: (r) => ({ r with\n       device: strings.split(v: r.topic, t: \"/\")[1],\n       channel: strings.split(v: r.topic, t: \"/\")[4] }))\n  |> filter(fn: (r) => r._measurement == \"sensor_measurements\" and r._field == \"value\")\n  |> filter(fn: (r) => strings.containsStr(v: r.channel, substr: \"temperature\"))\n  |> filter(fn: (r) => not strings.containsStr(v: r.channel, substr: \"uptime\") and not strings.containsStr(v: r.channel, substr: \"wifi_signal\") and not strings.containsStr(v: r.channel, substr: \"boot_count\") and not strings.containsStr(v: r.channel, substr: \"calibration\") and not strings.containsStr(v: r.channel, substr: \"mac_address\") and not strings.containsStr(v: r.channel, substr: \"ip_address\") and not strings.containsStr(v: r.channel, substr: \"ssid\") and not strings.containsStr(v: r.channel, substr: \"version\") and not strings.containsStr(v: r.channel, substr: \"last_calibrated\") and not strings.containsStr(v: r.channel, substr: \"compliance_note\") and not strings.containsStr(v: r.channel, substr: \"heartbeat_counter\"))\n  |> aggregateWindow(every: duration(v: int(v: v.windowPeriod) * 8),\n                     fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({ r with _field: r.device + \" / \" + r.channel }))\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 4,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "pointSize": 4
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Humidity (%)",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "aflneas0umnswd"
+      },
+      "id": 9,
+      "gridPos": {
+        "x": 12,
+        "y": 27,
+        "w": 12,
+        "h": 9
+      },
+      "maxDataPoints": 1000,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "aflneas0umnswd"
+          },
+          "query": "import \"strings\"\nfrom(bucket: \"GMP_sensor_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> map(fn: (r) => ({ r with\n       device: strings.split(v: r.topic, t: \"/\")[1],\n       channel: strings.split(v: r.topic, t: \"/\")[4] }))\n  |> filter(fn: (r) => r._measurement == \"sensor_measurements\" and r._field == \"value\")\n  |> filter(fn: (r) => strings.containsStr(v: r.channel, substr: \"humidity\"))\n  |> filter(fn: (r) => not strings.containsStr(v: r.channel, substr: \"uptime\") and not strings.containsStr(v: r.channel, substr: \"wifi_signal\") and not strings.containsStr(v: r.channel, substr: \"boot_count\") and not strings.containsStr(v: r.channel, substr: \"calibration\") and not strings.containsStr(v: r.channel, substr: \"mac_address\") and not strings.containsStr(v: r.channel, substr: \"ip_address\") and not strings.containsStr(v: r.channel, substr: \"ssid\") and not strings.containsStr(v: r.channel, substr: \"version\") and not strings.containsStr(v: r.channel, substr: \"last_calibrated\") and not strings.containsStr(v: r.channel, substr: \"compliance_note\") and not strings.containsStr(v: r.channel, substr: \"heartbeat_counter\"))\n  |> aggregateWindow(every: duration(v: int(v: v.windowPeriod) * 8),\n                     fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({ r with _field: r.device + \" / \" + r.channel }))\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "humidity",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 4,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "pointSize": 4
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

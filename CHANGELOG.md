@@ -8,6 +8,74 @@ is no SemVer for this project.
 
 ## Unreleased
 
+### Fixed (third review, 2026-10-27) — retained-message blindness
+
+- **Dead devices were reported ONLINE indefinitely.** ESPHome publishes with
+  `retain: true`, so Mosquitto replays every device's last state on each
+  re-subscribe. `on_mqtt_message` stamped those replays with `now()`, so each
+  reconnect resurrected every dead device. `air_quality` and `scd30-5` had
+  been silent for **3.1 days** while the watchdog showed them ONLINE and
+  refreshed `last_seen` every two minutes from the broker's memory. Verified
+  by subscribing directly: `air_quality` sent 14 messages in 60 s, all
+  retained, zero live. InfluxDB — whose Telegraf stays connected and so never
+  receives replays — correctly showed both flatlined 3.1 days earlier.
+
+  A retained message may now SEED a value we do not have, but never advances
+  `last_seen` / `ts` / `last_change_ts` / `last_heartbeat_time`. Only a live
+  publish proves liveness. (MQTT makes this exact: a live publish reaches an
+  already-subscribed client with `retain=False`; only replays to a *new*
+  subscriber carry `retain=True`.) A retained `offline` is still honoured —
+  the last will has already fired — but a retained `online` is not.
+- **Duplicate MQTT client id.** The id fell back to `web.port`, which is 5050
+  *inside* every container, so production and the pilot were both
+  `sensor-watchdog-5050` and evicted each other from the broker every ~2
+  minutes (216 × `rc=16`). Each eviction forced a re-subscribe and a full
+  retained replay, driving the bug above. The fallback now includes the
+  hostname.
+- **OFFLINE was an absorbing state.** `prev_status == "OFFLINE"` kept a device
+  OFFLINE forever; the only escape was the retained `status=online` replay —
+  recovery by accident. Fixing the retained handling exposed this and pinned 9
+  actively-publishing devices at OFFLINE. A live packet now lifts a stale
+  OFFLINE verdict, and the previous verdict only stands while the device is
+  still silent.
+- **Liveness was discarded by early returns.** Most packets exit the ingest
+  function early (unclassifiable name, unwanted diagnostic, ESPHome
+  placeholder) and those `return`s left the transaction uncommitted, rolling
+  back the `last_seen` update with it. A device whose live traffic is entirely
+  diagnostics (`scd30_2` publishes only uptime / wifi_signal /
+  firmware_version) therefore never refreshed `last_seen`. The liveness fact
+  is now committed on its own, before any branch can bail out.
+
+### Known issue found but NOT fixed (third review)
+
+- **The MQTT client drops its connection every ~121 s with `rc=16`**, which is
+  paho's `MQTT_ERR_KEEPALIVE`: the network loop is blocked long enough to miss
+  its own keepalive ping. The cause is architectural — `on_mqtt_message` does
+  synchronous SQLite writes (and commits) *on the paho network thread*, so DB
+  lock contention with the 30-second eval loop stalls the socket. Every drop
+  loses the QoS-0 messages published during it.
+
+  Observed consequence: `scd30_2` publishes a single short diagnostic burst
+  once a minute and the watchdog receives **none** of it (confirmed by
+  subscribing alongside: 16 live messages seen by a probe, zero recorded),
+  while chatty devices sending hundreds of messages lose only a fraction and
+  look fine. Replaying `scd30_2`'s real payloads through `on_mqtt_message`
+  directly updates `last_seen` correctly, so this is delivery, not parsing.
+
+  Fix: decouple ingest from the network thread — `on_mqtt_message` should push
+  onto a `queue.Queue` and a worker thread should do the SQLite work. That is
+  a change to the hottest path and wants its own testing pass, so it is
+  deliberately not bundled with this round.
+
+### Added (third review)
+
+- `grafana/` — version-controlled Grafana dashboards (Fleet Overview, Wall
+  Board, Device Drilldown) built from code, with a push script that reads the
+  service-account token from outside the repo and never prints it. The
+  drilldown answers *"was it moving before it froze?"*, which the SQLite
+  schema structurally cannot.
+- `tests/test_followup_fixes.py` gains C7–C9 covering all of the above.
+
 ### Fixed (second review, 2026-10-26)
 - **Timestamps were two hours wrong.** Every SQL write used SQLite's
   `CURRENT_TIMESTAMP`, which is **UTC**, while all Python comparisons use
@@ -423,3 +491,66 @@ closed the gaps it left open.
 - `tools/test_expansion_behaviour.js` - 27 checks that run the real
   dashboard.js against a stubbed DOM and prove the buttons change the
   rendered output, which is what was actually broken.
+
+## 2026-10-28 - False alarms from a phantom sensor, and the packet loss behind them
+
+`dalas-1` was showing two temperature channels and raising a permanent
+SENSOR_SILENT alert. It has one. Two separate defects were involved.
+
+### Fixed
+- **A channel the device does not publish was alerted on forever.**
+  `dalas-1` published an entity called `dalas-2_temperature` once, on
+  27 Oct, and has published only `dalas-1_temperature` since - a leftover
+  from a shared config. The watchdog kept the row and raised SENSOR_SILENT
+  on it every cycle: a permanent false alarm about a sensor that does not
+  exist. Its firmware declares exactly one temperature sensor, same as
+  Home Assistant and InfluxDB show.
+
+  A channel that has published nothing for 6 hours while the device keeps
+  publishing its other channels is now **retired**: the row is removed and
+  the retirement is recorded in a new `retired_sensors` table. A channel
+  that really is broken is caught long before that threshold and is still
+  reported as SENSOR_SILENT.
+
+  The record matters. The broker keeps the last value of every published
+  topic and re-delivers it as a retained message on every reconnect, so
+  deleting the row was not enough - the phantom channel was UPSERTed
+  straight back, which is exactly what happened on the first attempt. The
+  ingest path now refuses a retired channel outright.
+
+  Five channels were retired across the fleet, all verified against the
+  broker: `dalas-1/dalas-2_temperature`, and on maxim4 the
+  `maxim4_scd30_co2`, `maxim4_scd30_humidity`,
+  `maxim4_dallas_temperature` and `maxim4_upper_temperature` - none of
+  which the device publishes.
+
+- **The MQTT ingest path was dropping packets.** It opened a fresh
+  SQLite connection for every message - three PRAGMAs, a write, a commit,
+  a close. The fleet publishes ~35 messages a second, and paho runs its
+  network loop and the message handler in ONE thread, so every
+  millisecond in the database is a millisecond the socket is not being
+  read. Once the receive buffer filled, packets were dropped.
+
+  The effect was devices flapping OFFLINE while publishing every ten
+  seconds: `dalas-1`'s `last_seen` advanced in 120-second steps because
+  the watchdog was missing most of the traffic, and 120 seconds is
+  exactly the offline timeout - so it was marked offline just before the
+  next packet arrived. It flapped 214 times in two days.
+
+  The ingest path now reuses ONE connection, configured once. `dalas-1`'s
+  `last_seen` now advances every 9-10 seconds, its true cadence, and the
+  flapping has stopped: 1 status change in the 5 minutes after the fix
+  against 94 in the equivalent window before it.
+
+### Added
+- `tests/test_false_alarm_fixes.py` - 21 checks: a retired channel is
+  removed, a live one is not, a channel that died 20 minutes ago is NOT
+  retired (it is a real fault), and a retired channel is not resurrected
+  by the broker's retained replay.
+- `retired_sensors` table (schema v10) and the
+  `watchdog.retired_sensor_after_seconds` setting (default 21600).
+
+### Changed
+- The pilot config was missing the adaptive-staleness keys that were
+  added to the live config - it now has them, so the two deployments
+  behave the same.
