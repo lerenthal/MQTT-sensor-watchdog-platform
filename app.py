@@ -60,8 +60,20 @@ if not os.path.exists(CONFIG_FILE):
     log.error(f"Configuration file {CONFIG_FILE} not found!")
     sys.exit(1)
 
-with open(CONFIG_FILE, "r") as f:
-    config = yaml.safe_load(f)
+try:
+    with open(CONFIG_FILE, "r") as f:
+        config = yaml.safe_load(f)
+    if not isinstance(config, dict):
+        raise ValueError("the top level of the config must be a mapping")
+except Exception as e:
+    # A corrupt config must say WHY. A bare traceback in a crash-looping
+    # container is the worst possible failure mode on a production
+    # server: the operator sees a restarting container and no reason.
+    log.error("Cannot read the configuration file %s: %s", CONFIG_FILE, e)
+    log.error("The config must be valid YAML with a mapping at the top "
+              "level. Restore the last good version from the Admin Config "
+              "history, or copy config/config.example.yaml and edit it.")
+    sys.exit(1)
 
 # Env-var overrides for the items you don't want in a checked-in config file.
 # WATCHDOG_MQTT_PASSWORD, WATCHDOG_TG_TOKEN, WATCHDOG_TG_CHAT_ID, WATCHDOG_SECRET_KEY.
@@ -193,6 +205,20 @@ def _configure_timezone():
 
 _configure_timezone()
 
+def _ts(dt=None):
+    """Format a timestamp the way every other write formats it.
+
+    SQLite's default datetime adapter is deprecated in Python 3.12 and is
+    slated for removal. It also formats differently from the explicit
+    strings used everywhere else, so the same column can end up holding
+    two different formats - and the mixed formats then compare wrongly.
+
+    One helper, one format: local wall-clock, "YYYY-MM-DD HH:MM:SS.ffffff",
+    which is what the explicit `datetime('now','localtime')` defaults
+    produce and what _parse_ts() expects.
+    """
+    return (dt or datetime.now()).isoformat(sep=" ")
+
 def get_db():
     conn = sqlite3.connect(DB_FILE, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -245,10 +271,39 @@ def _get_mqtt_conn():
             # broker, and a sensor reading is not a financial record.
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=15000")
-            conn.execute("PRAGMA wal_autocheckpoint=2000")
+            # SQLite's default is 1000 pages. A LARGER threshold means a
+            # bigger WAL before a checkpoint is even attempted, and the
+            # long-lived ingest connection holds a read snapshot that stops
+            # the auto-checkpoint from resetting the WAL - so it simply
+            # grows to the high-water mark and stays there. The default
+            # keeps it small; the explicit TRUNCATE checkpoint in
+            # _checkpoint_wal() resets it completely.
+            conn.execute("PRAGMA wal_autocheckpoint=1000")
             _mqtt_conn = conn
             log.info("MQTT ingest: reusing a single SQLite connection")
     return _mqtt_conn
+
+
+def _checkpoint_wal():
+    """Checkpoint the write-ahead log.
+
+    SQLite checkpoints the WAL when the LAST connection to the database
+    closes. The MQTT ingest connection is deliberately long-lived, so that
+    never happens and the WAL grew to four times the size of the
+    database. A checkpoint on a timer keeps it bounded.
+    """
+    global _mqtt_conn
+    try:
+        # A checkpoint needs no exclusive lock, so it is safe alongside
+        # the ingest writes. TRUNCATE resets the WAL to zero length
+        # rather than just recycling it.
+        c = sqlite3.connect(DB_FILE, timeout=5)
+        try:
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            c.close()
+    except Exception as e:
+        log.warning("WAL checkpoint failed: %s", e)
 
 
 def _reset_mqtt_conn():
@@ -864,7 +919,7 @@ def _retry_mqtt_write(device_id, sensor_name, sensor_type, val, now, tol):
                     value = excluded.value, ts = excluded.ts,
                     last_change_ts = CASE WHEN excluded.value = value
                                          THEN last_change_ts ELSE excluded.ts END
-            """, (device_id, sensor_name, sensor_type, val, now, now))
+            """, (device_id, sensor_name, sensor_type, val, _ts(now), _ts(now)))
         else:
             cursor.execute(f"""
                 INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
@@ -874,7 +929,7 @@ def _retry_mqtt_write(device_id, sensor_name, sensor_type, val, now, tol):
                     last_change_ts = CASE
                         WHEN ABS(excluded.value - value) <= ? THEN last_change_ts
                         ELSE excluded.ts END
-            """, (device_id, sensor_name, sensor_type, val, now, now, tol))
+            """, (device_id, sensor_name, sensor_type, val, _ts(now), _ts(now), tol))
         if sensor_type == "temperature":
             cursor.execute("UPDATE devices SET last_temp=? WHERE device_id=?", (val, device_id))
         elif sensor_type == "humidity":
@@ -887,7 +942,7 @@ def _retry_mqtt_write(device_id, sensor_name, sensor_type, val, now, tol):
                                  (device_id,)).fetchone()
             if prev is None or prev["last_heartbeat_value"] != hb_val:
                 cursor.execute("UPDATE devices SET last_heartbeat_time=?, last_heartbeat_value=? WHERE device_id=?",
-                               (now, hb_val, device_id))
+                               (_ts(now), hb_val, device_id))
         conn.commit()
     finally:
         conn.close()
@@ -1023,7 +1078,7 @@ def on_mqtt_message(client, userdata, msg):
         # now(). The OFFLINE rule treats NULL as "never observed publishing".
         cursor.execute(
             "INSERT OR IGNORE INTO devices (device_id, last_seen) VALUES (?, ?)",
-            (device_id, None if retained else now),
+            (device_id, None if retained else _ts(now)),
         )
         if not retained:
             # A live packet is proof of life, so it also lifts a stale OFFLINE
@@ -1038,7 +1093,7 @@ def on_mqtt_message(client, userdata, msg):
                 "UPDATE devices SET last_seen = ?, "
                 "status = CASE WHEN status = 'OFFLINE' THEN 'ONLINE' ELSE status END "
                 "WHERE device_id = ?",
-                (now, device_id),
+                (_ts(now), device_id),
             )
             # Commit the liveness fact on its own, immediately.
             #
@@ -1078,7 +1133,7 @@ def on_mqtt_message(client, userdata, msg):
                     cursor.execute(
                         "UPDATE devices SET last_heartbeat_time = ?, "
                         "last_heartbeat_value = ? WHERE device_id = ?",
-                        (now, val, device_id),
+                        (_ts(now), val, device_id),
                     )
             except (ValueError, TypeError):
                 pass
@@ -1094,7 +1149,7 @@ def on_mqtt_message(client, userdata, msg):
                     VALUES (?, ?, 'button', 1.0, ?, ?)
                     ON CONFLICT(device_id, sensor_name, sensor_type) DO UPDATE SET
                         value = excluded.value, ts = excluded.ts
-                """, (device_id, sensor_name, now, now))
+                """, (device_id, sensor_name, _ts(now), _ts(now)))
                 conn.commit()
                 return
             except Exception:
@@ -1136,7 +1191,7 @@ def on_mqtt_message(client, userdata, msg):
                         WHEN excluded.value = value THEN last_change_ts
                         ELSE excluded.ts
                     END
-            """, (device_id, sensor_name, sensor_type, val, now, now))
+            """, (device_id, sensor_name, sensor_type, val, _ts(now), _ts(now)))
             conn.commit()
             return
         else:
@@ -1219,7 +1274,7 @@ def on_mqtt_message(client, userdata, msg):
                             WHEN excluded.value = value THEN last_change_ts
                             ELSE excluded.ts
                         END,""" + _INTERVAL_EWMA_SQL + """
-                """, (device_id, sensor_name, sensor_type, val, now, now))
+                """, (device_id, sensor_name, sensor_type, val, _ts(now), _ts(now)))
             else:
                 cursor.execute("""
                     INSERT INTO sensor_readings(device_id, sensor_name, sensor_type, value, ts, last_change_ts)
@@ -1231,7 +1286,7 @@ def on_mqtt_message(client, userdata, msg):
                             WHEN ABS(excluded.value - value) <= ? THEN last_change_ts
                             ELSE excluded.ts
                         END,""" + _INTERVAL_EWMA_SQL + """
-                """, (device_id, sensor_name, sensor_type, val, now, now, tol))
+                """, (device_id, sensor_name, sensor_type, val, _ts(now), _ts(now), tol))
             # Roll up to devices for fast dashboard reads (last value wins per device, any sensor).
             if sensor_type == "temperature":
                 cursor.execute(
@@ -1262,7 +1317,7 @@ def on_mqtt_message(client, userdata, msg):
                     cursor.execute(
                         "UPDATE devices SET last_heartbeat_time = ?, "
                         "last_heartbeat_value = ? WHERE device_id = ?",
-                        (now, hb_val, device_id),
+                        (_ts(now), hb_val, device_id),
                     )
             # heartbeat/light/pressure intentionally not denormalised — dashboard only shows
             # the headline metrics; per-sensor view shows the rest.
@@ -1277,7 +1332,7 @@ def on_mqtt_message(client, userdata, msg):
                 time.sleep(0.4 * (attempt + 1))
                 try:
                     _retry_mqtt_write(device_id, sensor_name, sensor_type,
-                                      val, now, tol)
+                                      val, _ts(now), _ts(now), tol)
                     return
                 except sqlite3.OperationalError:
                     continue
@@ -1360,7 +1415,7 @@ def _raise_or_nag(cursor, device_id, fault_type, fault_msg, nag_interval_s, now)
             # so every alert was stamped hours in the past.
             "INSERT INTO alerts (device_id, alert_type, message, last_nagged_at, triggered_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (device_id, fault_type, fault_msg, now, now),
+            (device_id, fault_type, fault_msg, _ts(now), _ts(now)),
         )
         telegram_engine.send_nag_alert(device_id, fault_type, fault_msg)
         return
@@ -1370,7 +1425,7 @@ def _raise_or_nag(cursor, device_id, fault_type, fault_msg, nag_interval_s, now)
         and (last_nagged is None or (now - last_nagged).total_seconds() > nag_interval_s)
     ):
         telegram_engine.send_nag_alert(device_id, fault_type, fault_msg)
-        cursor.execute("UPDATE alerts SET last_nagged_at = ? WHERE id = ?", (now, active["id"]))
+        cursor.execute("UPDATE alerts SET last_nagged_at = ? WHERE id = ?", (_ts(now), active["id"]))
 
 # Alert types owned by the per-device loop in watchdog_eval_loop. OUT_OF_RANGE
 # is owned by the target-range pass and SYSTEMIC by the cluster pass; the
@@ -1378,6 +1433,85 @@ def _raise_or_nag(cursor, device_id, fault_type, fault_msg, nag_interval_s, now)
 _DEVICE_ALERT_TYPES = ("OFFLINE", "STALLED", "SENSOR_SILENT", "SUSPECTED_STALL")
 _DEVICE_ALERT_TYPES_SQL = ",".join("?" * len(_DEVICE_ALERT_TYPES))
 
+
+def _prune_history_job():
+    """Scheduled wrapper around _prune_history.
+
+    Runs in its own connection so the DELETE does not contend with the
+    ingest writes, and audits what it removed - a silently truncated
+    audit log is not an audit log.
+    """
+    conn = None
+    try:
+        conn = get_db()
+        removed = _prune_history(conn)
+        if any(removed.values()):
+            conn.commit()
+            # Audited on a SEPARATE connection: the pruning transaction
+            # is committed, and a second write on the same connection
+            # would contend for the lock.
+            try:
+                audit("HISTORY_PRUNED",
+                      details=", ".join(f"{k}={v}" for k, v in removed.items() if v),
+                      username="watchdog")
+            except Exception:
+                log.exception("Could not audit the history pruning")
+    except Exception:
+        log.exception("History pruning failed")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+def _prune_history(conn, now=None):
+    """Trim the history tables to their retention window.
+
+    alerts and device_status_history grow with every fault - roughly 75
+    rows an hour on a flapping fleet - so without a retention window
+    they grow without bound. That is a disk problem, but more importantly
+    it makes the audit trail unreadable and slows every query that scans
+    it.
+
+    The pruning is itself audited: a silently truncated audit log is not
+    an audit log. The count of removed rows goes into the audit trail so
+    the deletion is visible.
+
+    Resolved alerts are kept longer than open ones - an open alert is a
+    live fault, a resolved one is history.
+    """
+    now = now or datetime.now()
+    now_s = now.isoformat(sep=" ")
+    alert_days = float(config.get("watchdog", {}).get("alert_retention_days", 90))
+    history_days = float(config.get("watchdog", {}).get(
+        "status_history_retention_days", 30))
+    audit_days = float(config.get("watchdog", {}).get("audit_retention_days", 365))
+
+    removed = {}
+    # Resolved alerts: kept for alert_days.
+    if alert_days > 0:
+        cutoff = (now - timedelta(days=alert_days)).isoformat(sep=" ")
+        cur = conn.execute(
+            "DELETE FROM alerts WHERE resolved = 1 AND triggered_at < ?", (cutoff,))
+        removed["alerts"] = cur.rowcount
+    # The status history: the flap detector's record.
+    if history_days > 0:
+        cutoff = (now - timedelta(days=history_days)).isoformat(sep=" ")
+        cur = conn.execute(
+            "DELETE FROM device_status_history WHERE changed_at < ?", (cutoff,))
+        removed["device_status_history"] = cur.rowcount
+    # The audit trail: kept the longest, because it is the record.
+    if audit_days > 0:
+        cutoff = (now - timedelta(days=audit_days)).isoformat(sep=" ")
+        cur = conn.execute(
+            "DELETE FROM audit_logs WHERE timestamp < ?", (cutoff,))
+        removed["audit_logs"] = cur.rowcount
+
+    if any(removed.values()):
+        log.info("Pruned history: %s", ", ".join(
+            f"{k}={v}" for k, v in removed.items() if v))
+    return removed
 
 def _detect_systemic_faults(conn, now, flatline_limit, stale_mult=3.0):
     """Find faults that share a metric AND a time window across many devices.
@@ -4689,6 +4823,36 @@ CONFIG_HELP = [
         "notes": "Only used when flatline detection is enabled.",
     },
     {
+        "path": "watchdog.alert_retention_days",
+        "title": "Resolved-alert retention",
+        "what": "How long a RESOLVED alert is kept before it is pruned.",
+        "default": "90",
+        "unit": "days",
+        "notes": "Alerts grow with every fault - roughly 75 rows an hour on a "
+                 "flapping fleet - so without a window they grow without "
+                 "bound. Open alerts are never pruned. 0 disables the pruning.",
+    },
+    {
+        "path": "watchdog.status_history_retention_days",
+        "title": "Status-history retention",
+        "what": "How long the device status-change history is kept.",
+        "default": "30",
+        "unit": "days",
+        "notes": "This is the flap detector's record, so it is shorter than "
+                 "the alert retention. 0 disables the pruning.",
+    },
+    {
+        "path": "watchdog.audit_retention_days",
+        "title": "Audit-trail retention",
+        "what": "How long the audit trail is kept.",
+        "default": "365",
+        "unit": "days",
+        "notes": "The audit trail is kept the longest, because it is the "
+                 "record. What the pruning removes is itself audited as "
+                 "HISTORY_PRUNED - a silently truncated audit log is not an "
+                 "audit log. 0 disables the pruning.",
+    },
+    {
         "path": "watchdog.out_of_range_hysteresis_seconds",
         "title": "Out-of-range hysteresis",
         "what": "How long a reading must stay outside its target range "
@@ -5148,6 +5312,19 @@ def main():
     scheduler.add_job(
         _watchdog_check_health, "interval",
         seconds=15, max_instances=1, coalesce=True,
+    )
+    # The ingest connection is long-lived, so SQLite never checkpoints the
+    # WAL on its own. Do it on a timer.
+    scheduler.add_job(
+        _checkpoint_wal, "interval",
+        seconds=60, max_instances=1, coalesce=True,
+    )
+    # Trim the history tables. Daily is enough: the growth is slow and a
+    # big DELETE holds the write lock, so it must not run in the 30-second
+    # evaluation loop.
+    scheduler.add_job(
+        _prune_history_job, "interval",
+        hours=24, max_instances=1, coalesce=True,
     )
     scheduler.start()
     threading.Thread(target=telegram_polling_thread, daemon=True).start()

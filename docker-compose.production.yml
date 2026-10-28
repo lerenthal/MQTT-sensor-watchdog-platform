@@ -1,0 +1,97 @@
+# =============================================================================
+# Production deployment: the PsygaBio Device Watchdog
+#
+# This is a SEPARATE Docker stack from the one that runs mosquitto,
+# influxdb, telegraf and grafana on the same host. It shares nothing but
+# the host itself and the MQTT broker.
+#
+#   The broker stack:  mosquitto  influxdb  telegraf  grafana
+#   This stack:        watchdog
+#
+# Why separate:
+#   * The broker stack is the RECORD - the MQTT history, the time-series
+#     data and the dashboards. It must not be restarted to deploy a
+#     change to the watchdog, and a watchdog crash must not take the
+#     record down with it.
+#   * The watchdog is the ALARM. It is the thing most likely to need a
+#     quick fix, and it must be deployable on its own.
+#   * Separate stacks have separate networks. The watchdog reaches
+#     mosquitto over the host's own address (10.10.17.11:1883), exactly
+#     as it does today, so the broker ACL does not change.
+#
+# DEPLOY
+#   git clone <this repo> /opt/psygabio-watchdog
+#   cd /opt/psygabio-watchdog
+#   cp -r config deploy/config
+#   cp .env.example deploy/.env      # then edit it
+#   chmod 600 deploy/.env
+#   ./deploy.sh
+#
+# OPERATE
+#   ./deploy.sh status | logs | restart | rebuild | backup
+#
+# The watchdog serves on port 5050 by default. The wall board is at
+# http://10.10.17.11:5050/wallboard
+# =============================================================================
+
+name: psygabio-watchdog
+
+services:
+  watchdog:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: psygabio-watchdog:latest
+    container_name: psygabio-watchdog
+    restart: unless-stopped
+    ports:
+      # The wall board lives on a TV. Bind on the host's LAN address so
+      # the TV and the phones can reach it. Change 0.0.0.0 to the
+      # specific address if the host has more than one.
+      - "${WATCHDOG_BIND:-0.0.0.0}:${WATCHDOG_PORT:-5050}:5050"
+    environment:
+      WATCHDOG_CONFIG: /app/config/config.yaml
+      WATCHDOG_DB: /app/data/sensor_watchdog.db
+      # MUST be unique per instance on the host. Mosquitto allows one
+      # connection per client id and kicks the older session, so two
+      # instances sharing an id push each other off the broker in a
+      # reconnect loop. The broker stack's telegraf uses its own id;
+      # this is the watchdog's.
+      WATCHDOG_INSTANCE_ID: ${WATCHDOG_INSTANCE_ID:-psygabio-prod}
+      # Every timestamp is local wall-clock. The app pins this itself,
+      # and the compose default matches, so a container started without
+      # a .env cannot silently write UTC.
+      TZ: ${TZ:-Asia/Jerusalem}
+      # Secrets. Set in deploy/.env, never in this file.
+      WATCHDOG_MQTT_PASSWORD: ${WATCHDOG_MQTT_PASSWORD:-}
+      WATCHDOG_TG_TOKEN: ${WATCHDOG_TG_TOKEN:-}
+      WATCHDOG_TG_CHAT_ID: ${WATCHDOG_TG_CHAT_ID:-}
+      WATCHDOG_SECRET_KEY: ${WATCHDOG_SECRET_KEY:-}
+    volumes:
+      # The config is bind-mounted, not baked into the image, so it can
+      # be edited on the server and rolled back.
+      - ./config:/app/config:ro
+      # The database and the WAL live here. The named volume means a
+      # `docker compose down` does not take the audit trail with it.
+      - watchdog-data:/app/data
+      - watchdog-backups:/app/backups
+    # The watchdog writes to its own database. It needs no other access.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5050/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  watchdog-data:
+  watchdog-backups:

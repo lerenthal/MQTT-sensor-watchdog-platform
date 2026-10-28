@@ -606,3 +606,54 @@ SENSOR_SILENT alert. It has one. Two separate defects were involved.
   contract: the wall board respects a snooze, a snooze suppresses the
   fault rather than hiding it, and an unsnooze brings a live fault back
   immediately.
+
+## 2026-10-28 - Production readiness review, and the production stack
+
+A full review before deploying to `10.10.17.11`. Five findings, all
+fixed, all with a test. The full write-up is in
+`docs/REVIEW_2026-10-28.md`.
+
+### Fixed
+- **The write-ahead log was never checkpointed.** SQLite checkpoints the
+  WAL when the LAST connection closes, and the MQTT ingest connection is
+  deliberately long-lived - so it never happened. The WAL grew to 8.2 MB
+  against a 1.9 MB database and stayed there. A checkpoint job now runs
+  every 60 seconds, and `wal_autocheckpoint` is back to SQLite's default
+  of 1000 pages: the long-lived connection holds a read snapshot that
+  stops the auto-checkpoint from RESETTING the WAL, so a higher threshold
+  just means a bigger WAL that never shrinks. The WAL now stays between
+  3.7 MB and 4.1 MB.
+- **The history tables grew without limit.** `alerts` reached 8,782 rows
+  in a week - about 75 an hour - and `device_status_history` and
+  `audit_logs` grew with it. A daily pruning job now trims them to
+  configurable windows (90 days for resolved alerts, 30 for the status
+  history, 365 for the audit trail). Open alerts are never pruned, and
+  the pruning is audited as `HISTORY_PRUNED` - a silently truncated
+  audit log is not an audit log.
+- **Six SQL writes bound a raw `datetime`.** SQLite's default datetime
+  adapter is deprecated in Python 3.12 and is slated for removal. It
+  also formats differently from the explicit strings used everywhere
+  else, so one column could hold two formats - and mixed formats compare
+  wrongly. One `_ts()` helper now formats every timestamp, verified
+  with the deprecation promoted to an error.
+- **A corrupt config file at startup produced a bare traceback** and a
+  crash loop with no explanation. The failure now says what is wrong
+  and what to do about it.
+
+### Added
+- **`docker-compose.production.yml` and `deploy.sh`** - the watchdog in
+  its own Docker stack, separate from the mosquitto/influxdb/telegraf/
+  grafana stack on the same host. The broker stack holds the record; the
+  watchdog is the alarm. Neither is restarted to deploy the other.
+  `deploy.sh` offers preflight, deploy, status, logs, restart, rebuild,
+  backup and rollback.
+- `docs/deployment-production.md` - the full deployment guide.
+- `tests/test_production_readiness.py` - 33 checks covering the WAL
+  checkpoint and its threshold, the retention windows and their audit,
+  the config-load error handling, and the absence of any raw datetime
+  bound to SQL.
+
+### Verified
+The production stack was built and run end to end on this host as a
+test - a separate stack with its own volumes - and came up healthy,
+receiving packets and producing alerts within a minute.

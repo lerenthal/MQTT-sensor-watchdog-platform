@@ -84,12 +84,20 @@ The doc set lives under [`docs/`](docs/). Read in this order:
 .
 ├── app.py                  # Single-file Flask + MQTT + watchdog + Telegram
 ├── dashboard.js            # Client-side JS for the dashboard (sort/search/expand)
+├── wallboard.js            # The wall display's own JS
+├── alarm.js                # Shared alarm engine: tone styles, mute, test
 ├── schema.sql              # SQLite schema (idempotent)
 ├── config.yaml             # Bundled config template (committed; sanitised)
 ├── requirements.txt        # Python deps for non-Docker development
 ├── Dockerfile              # python:3.12-slim, non-root, healthcheck
-├── docker-compose.yml      # Single service, bind mounts, env-var secrets
+├── docker-compose.yml      # The development instance
+├── docker-compose.production.yml   # The production stack (separate)
 ├── ops.sh                  # Operator entry-point: start/stop/restart/logs/...
+├── deploy.sh               # Production deploy: preflight/deploy/status/backup
+├── grafana/                # Version-controlled Grafana dashboards
+├── tests/                  # Test suites
+├── tools/                  # Verification tools
+├── deploy/                 # Production deploy inputs (.env.example, config)
 ├── .dockerignore           # Keep image small
 ├── .env.example            # Documented template; cp to .env for secrets
 ├── .gitignore
@@ -107,6 +115,10 @@ config/config.yaml         # live config (bind-mounted; gitignored)
 data/sensor_watchdog.db    # SQLite database (bind-mounted; gitignored)
 backups/                   # ./ops.sh backup target (gitignored)
 ```
+
+On the production host the same files live under `deploy/`, and the
+database and backups are **named Docker volumes** so a `docker compose
+down` cannot take the audit trail with it.
 
 ---
 
@@ -144,6 +156,7 @@ live broker. They are runnable, not just documentation:
 |---|---|
 | `tools/verify_features.py <url>` | The dashboard features: ignore list, snooze control, persistent highlighting, TEST ALARM button, honest restart reporting. Exits non-zero on failure. |
 | `tests/test_false_alarm_fixes.py` | Retired channels are removed and not resurrected by the broker's retained replay. |
+| `tests/test_production_readiness.py` | The WAL is checkpointed, the history is pruned and audited, a corrupt config says why, and no raw datetime is bound to SQL. |
 | `tests/test_admin_routes.py` | Every admin route points at the right view; no stacked decorators. |
 | `tests/test_snooze_semantics.py` | A snooze silences the wall board and an unsnooze restores it immediately. |
 | `tools/verify_restart.sh <service> <device>` | The restart path: command published, broker acknowledgement, heartbeat reset. |

@@ -58,3 +58,9 @@ pilot/data/
 pilot/backups/
 pilot/config/config.yaml
 pilot/.env
+
+# Production deployment
+deploy/.env
+deploy/data/
+deploy/backups/
+deploy/config/

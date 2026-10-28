@@ -38,6 +38,14 @@ watchdog:
   # dashboard and no longer alerted on. A channel that really is broken is
   # caught long before this and reported as SENSOR_SILENT.
   retired_sensor_after_seconds: 21600
+  # Retention windows for the history tables. alerts and
+  # device_status_history grow with every fault (roughly 75 rows an hour
+  # on a flapping fleet), so without a window they grow without bound
+  # and the audit trail becomes unreadable.
+  #   0 disables the pruning for that table.
+  alert_retention_days: 90            # resolved alerts
+  status_history_retention_days: 30   # the flap detector's record
+  audit_retention_days: 365           # the audit trail itself
   # Clear-side deadband for OUT_OF_RANGE, as a percentage of the configured
   # band (max-min). A value must come back inside the limits by this margin
   # before the breach resolves, so a reading parked on the limit cannot

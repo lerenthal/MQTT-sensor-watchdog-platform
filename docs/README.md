@@ -9,6 +9,8 @@ Per-topic documentation for the MQTT Sensor Watchdog Platform.
 
 | Doc | Audience | When to read |
 |---|---|---|
+| [`deployment-production.md`](deployment-production.md) | Production engineer | Deploying to `10.10.17.11` alongside the mosquitto/influxdb/telegraf/grafana stack. **Read this first for the production deploy.** |
+| [`REVIEW_2026-10-28.md`](REVIEW_2026-10-28.md) | Engineer | The production-readiness review: findings, evidence, what was fixed. |
 | [`install.md`](install.md) | Production engineer | First-time deployment on a fresh host. |
 | [`configuration.md`](configuration.md) | Anyone editing the config | Reference for every key in `config.yaml` and every `WATCHDOG_*` env var. |
 | [`operations.md`](operations.md) | Operator | The `./ops.sh` command surface, container lifecycle, log triage, backups. |
