@@ -726,3 +726,39 @@ valid database with every device in it
   excluded and counted, the alerts for them are excluded, every filter
   and sort is wired, the controls are hidden on paper, and the excluded
   counts cannot go negative.
+
+## 2026-10-28 - Add a user, or change a password, from the dashboard
+
+### Added
+- **Admin > Users**: add an account, change a password, change a role,
+  disable an account and delete one. The new account can sign in
+  immediately - no restart, no config edit. Every change is audited
+  (USER_ADDED, USER_PASSWORD_CHANGED, USER_ROLE_CHANGED, USER_DISABLED,
+  USER_ENABLED, USER_DELETED) with the operator's name, because who can
+  reach the facility's dashboard is itself a regulated fact.
+
+- **The accounts live in the DATABASE**, not the config file. The config
+  is mounted read-only in production, so a user added through the Admin
+  Config page could not be saved at all - the write failed and the
+  change was lost on the next restart. The config's auth.users is the
+  SEED, so an account defined in the YAML still works.
+
+### Protected
+- A password must be at least 8 characters; a username may only contain
+  letters, digits, dot, underscore and dash; the role must be known.
+- **The last enabled admin cannot be deleted or demoted** - the page
+  says so and refuses. Otherwise one action would lock everybody out.
+- The password is stored as a salted SHA-256 hash. The plaintext is
+  never written to the database or the config.
+
+### Fixed
+- The login check read the accounts from the config only, so a password
+  changed in the database would not have taken effect. It now reads the
+  live list, and a disabled account cannot sign in.
+
+### Tests
+- `tests/test_user_management.py` - 40 checks, including a behavioural
+  proof: a user is created, the plaintext is searched for in the
+  database file and the WAL (and must not be found), the hash verifies
+  the password, a wrong password is refused, and a disabled account
+  cannot log in.

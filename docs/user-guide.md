@@ -661,3 +661,58 @@ contains the report, not the controls.
 A note under the table says what was left out and why - so "there were no
 faults" is never confused with "the faults were filtered out".
 
+## Adding a user, or changing a password
+
+**Admin → Users**. Every admin can do this; an operator cannot.
+
+| Action | How |
+|---|---|
+| **Add an account** | Fill in the form at the bottom of the page |
+| **Change a password** | Type the new one in the account's row and press **Change password** |
+| **Change a role** | Pick a role in the account's row and press **Set** |
+| **Stop someone signing in** | **Disable** — the account keeps its history but cannot log in |
+| **Remove an account** | **Delete** — for someone who has left |
+
+The new account can sign in **immediately**. No restart, no config edit.
+
+### The two roles
+
+**Admin** can change the configuration, the ignore list, the target ranges
+and the user accounts. **Operator** can see the dashboard, silence alarms,
+snooze and restart devices, and print the report — but cannot change the
+configuration.
+
+Give an operator the operator role unless they need to change the
+system.
+
+### What is protected
+
+- A password must be **at least 8 characters**.
+- A username may only contain letters, digits, dot, underscore and dash.
+- **The last enabled admin cannot be deleted or demoted.** If you try,
+  it tells you to promote another account to admin first — otherwise
+  nobody could manage the users, and the only way back in would be to
+  edit the config file by hand.
+
+### The password is never stored in the clear
+
+It is stored as a salted SHA-256 hash. The plaintext is never written to
+the database or the config, and it is never shown again — so if you
+forget it, **set a new one** rather than looking for the old.
+
+### Every change is audited
+
+`USER_ADDED`, `USER_PASSWORD_CHANGED`, `USER_ROLE_CHANGED`,
+`USER_DISABLED`, `USER_ENABLED` and `USER_DELETED` all go into the audit
+log with the operator's name. Who can reach the facility's dashboard is
+itself a regulated fact.
+
+### Where the accounts live
+
+In the **database**, not the config file. The config is mounted read-only
+in production so that a compromised process cannot rewrite the MQTT
+password or the session key — which means a user added through the Admin
+Config page could not be saved at all. The config's `auth.users` is used
+as the **seed** on first start, so an account defined in the YAML still
+works.
+

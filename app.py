@@ -412,6 +412,32 @@ def _apply_migrations(conn):
         CREATE INDEX IF NOT EXISTS idx_status_history_device
             ON device_status_history(device_id, changed_at DESC);
     """)
+    # v11 -> v12: the users.
+    #
+    # The accounts live in the DATABASE rather than the config file,
+    # because the config is mounted read-only in production: a user
+    # added there could not be saved at all, and the change was lost on
+    # the next restart. The config's users are the seed.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            username      TEXT PRIMARY KEY,
+            role          TEXT NOT NULL DEFAULT 'operator',
+            password_hash TEXT,
+            salt          TEXT,
+            created_at    TIMESTAMP DEFAULT (datetime('now','localtime')),
+            changed_at    TIMESTAMP,
+            disabled      INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    # Seed from the config on the first run. The hash is carried over
+    # as-is, so a config-defined account keeps working unchanged.
+    for _name, _u in (config.get("auth", {}).get("users", {}) or {}).items():
+        _ph = _u.get("password_hash") or {}
+        conn.execute(
+            "INSERT OR IGNORE INTO users "
+            "(username, role, password_hash, salt) VALUES (?,?,?,?)",
+            (_name, _u.get("role", "operator"), _ph.get("hash"), _ph.get("salt")))
+
     # v10 -> v11: the ignore list.
     #
     # The list lives in the DATABASE rather than the config file, because
@@ -563,7 +589,7 @@ def _apply_migrations(conn):
         log.info("Migration: renamed sensor_readings.sensor_id -> sensor_name")
 
     conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','11')"
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version','12')"
     )
 
 def init_db():
@@ -710,16 +736,204 @@ PLACEHOLDER_PASSWORD_HASH = "!"
 
 
 def _is_placeholder_password(u):
-    """True when the account still carries the never-set placeholder."""
-    ph = u.get("password_hash") or {}
-    return (ph.get("salt") == PLACEHOLDER_PASSWORD_SALT
-            and ph.get("hash") == PLACEHOLDER_PASSWORD_HASH)
+    """True when the account still carries the never-set placeholder.
 
+    An account can come from the config (password_hash: {salt, hash}) or
+    from the database (flat salt and hash), so both shapes are accepted.
+    """
+    ph = u.get("password_hash") or {}
+    salt = ph.get("salt") if ph else u.get("salt")
+    hsh = ph.get("hash") if ph else u.get("hash")
+    return (salt == PLACEHOLDER_PASSWORD_SALT
+            and hsh == PLACEHOLDER_PASSWORD_HASH)
+
+
+# -----------------------------------------------------------------------------
+# Users
+#
+# The accounts live in the DATABASE, not the config file.
+#
+# In production the config is mounted READ-ONLY - a compromised process
+# must not be able to rewrite the MQTT password or the session key - so a
+# user added through the Admin Config page could not be saved at all: the
+# write failed and the change was lost on the next restart.
+#
+# Credentials are operational state. They change as staff come and go, and
+# they must be changeable without editing a YAML file by hand. The
+# database is the right home for them. The config's auth.users is the
+# SEED, so a template with users still works and a fresh install still
+# has its first account.
+#
+# The hash is the same salted SHA-256 the config format uses, so the two
+# are interchangeable: an account created in the config and one created
+# in the UI are indistinguishable to the login check.
+# -----------------------------------------------------------------------------
+USER_ROLES = ("admin", "operator")
+
+
+def _db_users():
+    """The accounts, from the database."""
+    conn = None
+    try:
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT username, role, password_hash, salt, created_at, "
+            "       changed_at, disabled FROM users"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _user_record(username):
+    """One account, or None."""
+    conn = None
+    try:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT username, role, password_hash, salt, created_at, "
+            "       changed_at, disabled FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _all_accounts():
+    """Every account: the database first, then the config.
+
+    The config is included so that a user added by editing the YAML by
+    hand still works even if the seed has not run yet. The DATABASE wins
+    on a name collision, because it is the live list.
+    """
+    accounts = {}
+    for u in _db_users():
+        accounts[u["username"]] = {
+            "username": u["username"],
+            "role": u.get("role") or "operator",
+            "salt": u.get("salt"),
+            "hash": u.get("password_hash"),
+            "created_at": u.get("created_at"),
+            "changed_at": u.get("changed_at"),
+            "disabled": bool(u.get("disabled")),
+            "source": "database",
+        }
+    for name, u in (config.get("auth", {}).get("users", {}) or {}).items():
+        if name in accounts:
+            continue
+        ph = u.get("password_hash") or {}
+        accounts[name] = {
+            "username": name,
+            "role": u.get("role", "operator"),
+            "salt": ph.get("salt"),
+            "hash": ph.get("hash"),
+            "created_at": None,
+            "changed_at": None,
+            "disabled": False,
+            "source": "config",
+        }
+    return accounts
+
+
+def _save_user(username, password=None, role=None, disabled=None):
+    """Create or update an account in the database.
+
+    The password is stored as a salted SHA-256 hash. The plaintext is
+    never written anywhere.
+    """
+    username = (username or "").strip()
+    if not username:
+        raise ValueError("The username is required.")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", username):
+        raise ValueError("A username may only contain letters, digits, "
+                         "dot, underscore and dash (max 64 characters).")
+    if role is not None and role not in USER_ROLES:
+        raise ValueError(f"Unknown role {role!r}. Valid roles: "
+                         f"{', '.join(USER_ROLES)}.")
+    if password is not None and password != "":
+        if len(password) < 8:
+            raise ValueError("A password must be at least 8 characters.")
+        if len(password) > 256:
+            raise ValueError("A password may be at most 256 characters.")
+
+    conn = get_db()
+    try:
+        existing = conn.execute(
+            "SELECT username FROM users WHERE username = ?", (username,)).fetchone()
+        now = datetime.now().isoformat(sep=" ")
+        if existing:
+            sets = []
+            args = []
+            if role is not None:
+                sets.append("role = ?")
+                args.append(role)
+            if disabled is not None:
+                sets.append("disabled = ?")
+                args.append(1 if disabled else 0)
+            if password:
+                salt = secrets.token_hex(8)
+                sets.append("password_hash = ?")
+                args.append(_hash_password(password, salt))
+                sets.append("salt = ?")
+                args.append(salt)
+                sets.append("changed_at = ?")
+                args.append(now)
+            if sets:
+                args.append(username)
+                conn.execute(f"UPDATE users SET {', '.join(sets)} "
+                             f"WHERE username = ?", args)
+                conn.commit()
+            return "updated"
+        salt = secrets.token_hex(8)
+        conn.execute(
+            "INSERT INTO users (username, role, password_hash, salt, "
+            "created_at, changed_at, disabled) VALUES (?,?,?,?,?,?,?)",
+            (username, role or "operator",
+             _hash_password(password, salt) if password else None,
+             salt, now, now, 0),
+        )
+        conn.commit()
+        return "created"
+    finally:
+        conn.close()
+
+
+def _delete_user(username):
+    """Remove an account from the database."""
+    conn = get_db()
+    try:
+        cur = conn.execute("DELETE FROM users WHERE username = ?", (username,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
 
 def _check_credentials(username, password):
-    users = config.get("auth", {}).get("users", {})
-    u = users.get(username)
-    if not u or "password_hash" not in u:
+    """Check a username and password against the live account list.
+
+    The accounts live in the DATABASE (see _all_accounts), so a user
+    added or re-passworded in the Admin Users page can sign in
+    immediately - without a restart, and without editing the config.
+    """
+    u = _all_accounts().get(username)
+    if not u or not u.get("hash"):
+        return False, None
+    # A disabled account cannot log in, even with the right password.
+    if u.get("disabled"):
+        log.warning("Login refused for %s: the account is disabled.", username)
         return False, None
     # An account whose password was never set cannot be logged into. This
     # is what makes the committed template safe to publish: it carries a
@@ -728,9 +942,8 @@ def _check_credentials(username, password):
         log.warning("Login refused for %s: no password has been set for this "
                     "account yet.", username)
         return False, None
-    expected = u["password_hash"]["hash"]
-    got = _hash_password(password, u["password_hash"]["salt"])
-    if secrets.compare_digest(expected, got):
+    got = _hash_password(password, u.get("salt") or "")
+    if secrets.compare_digest(u["hash"], got):
         return True, u.get("role", "operator")
     return False, None
 
@@ -2820,6 +3033,13 @@ tr.row-stalled  td:first-child { box-shadow: inset 3px 0 0 var(--warning); }
     display: flex; gap: .3rem; margin-bottom: 1rem;
     border-bottom: 1px solid var(--border); padding-bottom: .4rem;
 }
+.inline-form { display: inline-flex; gap: .3rem; align-items: center;
+  margin: 0; }
+.inline-form input[type=password], .inline-form input[type=text] {
+  padding: .25rem .4rem; border: 1px solid #ccc; border-radius: 5px;
+  font: inherit; font-size: .85rem; min-width: 9rem; }
+.inline-form select { padding: .25rem .3rem; border: 1px solid #ccc;
+  border-radius: 5px; font: inherit; font-size: .85rem; }
 .admin-subtab {
     padding: .4rem .8rem; border-radius: 6px; text-decoration: none;
     color: var(--muted-foreground); font-weight: 600; font-size: .9rem;
@@ -2925,6 +3145,7 @@ def _render_layout(title, body, current_tab=None, wide=False):
         ("history", "Audit Log", "audit_page"),
         ("admin", "Admin Config", "admin_config"),
         ("ignored", "Ignore List", "admin_ignored"),
+        ("users", "Users", "admin_users"),
     ]
     if session.get("username"):
         tabs.append(("print", "Print Report", "print_report"))
@@ -4047,6 +4268,241 @@ def _sensor_channels():
         })
     return out
 
+
+@app.route("/admin/users", methods=["GET", "POST"])
+@login_required
+def admin_users():
+    """Manage the user accounts: add, change a password, change a role.
+
+    An admin-only page. Every change is audited, because who can reach
+    the facility's dashboard is itself a regulated fact.
+
+    The accounts live in the database, so this page works on a
+    read-only config - which is the production arrangement.
+    """
+    if session.get("role") != "admin":
+        abort(403)
+
+    who = session.get("username", "?")
+    message = ""
+    error = ""
+
+    if request.method == "POST":
+        action = (request.form.get("action") or "").strip()
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        role = (request.form.get("role") or "").strip() or None
+
+        try:
+            if action == "add":
+                if not password:
+                    raise ValueError("A password is required for a new account.")
+                _save_user(username, password=password, role=role or "operator")
+                audit("USER_ADDED", details=f"username={username!r}; "
+                      f"role={role or 'operator'}", username=who)
+                message = f"Account {username!r} created."
+
+            elif action == "password":
+                if not password:
+                    raise ValueError("A new password is required.")
+                _save_user(username, password=password)
+                audit("USER_PASSWORD_CHANGED", details=f"username={username!r}",
+                      username=who)
+                message = f"The password for {username!r} was changed."
+
+            elif action == "role":
+                if not role:
+                    raise ValueError("A role is required.")
+                _save_user(username, role=role)
+                audit("USER_ROLE_CHANGED",
+                      details=f"username={username!r}; role={role}", username=who)
+                message = f"{username!r} is now {role}."
+
+            elif action == "disable":
+                _save_user(username, disabled=True)
+                audit("USER_DISABLED", details=f"username={username!r}",
+                      username=who)
+                message = f"{username!r} can no longer sign in."
+
+            elif action == "enable":
+                _save_user(username, disabled=False)
+                audit("USER_ENABLED", details=f"username={username!r}",
+                      username=who)
+                message = f"{username!r} can sign in again."
+
+            elif action == "delete":
+                # Never let the last admin lock everyone out.
+                _accounts = _all_accounts()
+                _admins = [u for u, a in _accounts.items()
+                           if a.get("role") == "admin" and not a.get("disabled")]
+                if username in _admins and len(_admins) <= 1:
+                    raise ValueError(
+                        "This is the last enabled admin account. Promote "
+                        "another account to admin first, or nobody could "
+                        "manage the users.")
+                _delete_user(username)
+                audit("USER_DELETED", details=f"username={username!r}",
+                      username=who)
+                message = f"Account {username!r} deleted."
+
+            else:
+                raise ValueError("Unknown action.")
+
+        except ValueError as e:
+            error = str(e)
+        except Exception as e:
+            log.exception("user management failed")
+            error = f"Could not save the change: {e}"
+
+        return redirect(url_for("admin_users", msg=message, err=error))
+
+    # ---- GET
+    msg = (request.args.get("msg") or "").strip()
+    err = (request.args.get("err") or "").strip()
+    accounts = _all_accounts()
+    me = session.get("username")
+
+    rows = ""
+    for name in sorted(accounts):
+        a = accounts[name]
+        is_self = (name == me)
+        state = "disabled" if a.get("disabled") else "active"
+        when = a.get("changed_at") or a.get("created_at")
+        when = (when or "")[:19] or "—"
+        src_label = ("database" if a.get("source") == "database"
+                     else "config file")
+        pw_state = ("set" if a.get("hash") else "not set")
+
+        # The row's own password form.
+        pw_form = f"""<form method="post" action="/admin/users" class="inline-form">
+          {_csrf_input()}
+          <input type="hidden" name="action" value="password">
+          <input type="hidden" name="username" value="{html_lib.escape(name)}">
+          <input type="password" name="password" placeholder="new password"
+                 autocomplete="new-password" required>
+          <button class="btn btn-sm" type="submit">Change password</button>
+        </form>"""
+
+        # The role form.
+        role_opts = "".join(
+            f'<option value="{r}"{" selected" if a.get("role") == r else ""}>'
+            f'{r}</option>' for r in USER_ROLES)
+        role_form = f"""<form method="post" action="/admin/users" class="inline-form">
+          {_csrf_input()}
+          <input type="hidden" name="action" value="role">
+          <input type="hidden" name="username" value="{html_lib.escape(name)}">
+          <select name="role">{role_opts}</select>
+          <button class="btn btn-sm" type="submit">Set</button>
+        </form>"""
+
+        # Enable / disable and delete.
+        if a.get("disabled"):
+            toggle = f"""<form method="post" action="/admin/users" style="display:inline">
+              {_csrf_input()}
+              <input type="hidden" name="action" value="enable">
+              <input type="hidden" name="username" value="{html_lib.escape(name)}">
+              <button class="btn btn-sm btn-success" type="submit">Enable</button>
+            </form>"""
+        else:
+            toggle = f"""<form method="post" action="/admin/users" style="display:inline">
+              {_csrf_input()}
+              <input type="hidden" name="action" value="disable">
+              <input type="hidden" name="username" value="{html_lib.escape(name)}">
+              <button class="btn btn-sm btn-danger" type="submit">Disable</button>
+            </form>"""
+
+        # The last admin cannot be deleted or demoted.
+        _admins = [u for u, x in accounts.items()
+                   if x.get("role") == "admin" and not x.get("disabled")]
+        is_last_admin = (a.get("role") == "admin" and not a.get("disabled")
+                         and len(_admins) <= 1)
+        if is_last_admin:
+            delete = ('<span class="muted" style="font-size:.8rem">'
+                      'the last admin</span>')
+        else:
+            delete = f"""<form method="post" action="/admin/users" style="display:inline"
+                          onsubmit="return confirm('Delete the account {html_lib.escape(name)}? This cannot be undone.');">
+              {_csrf_input()}
+              <input type="hidden" name="action" value="delete">
+              <input type="hidden" name="username" value="{html_lib.escape(name)}">
+              <button class="btn btn-sm btn-danger" type="submit">Delete</button>
+            </form>"""
+
+        rows += (
+            f'<tr>'
+            f'<td><strong>{html_lib.escape(name)}</strong>'
+            f'{(" &middot; <em>you</em>") if is_self else ""}'
+            f'<br><span class="muted" style="font-size:.8rem">'
+            f'password {html_lib.escape(pw_state)} &middot; '
+            f'from the {html_lib.escape(src_label)} &middot; '
+            f'changed {html_lib.escape(when)}</span></td>'
+            f'<td><span class="status-{"ONLINE" if state == "active" else "OFFLINE"}">'
+            f'{state}</span></td>'
+            f'<td>{role_form}</td>'
+            f'<td>{pw_form}</td>'
+            f'<td>{toggle}</td>'
+            f'<td>{delete}</td>'
+            f'</tr>')
+
+    if not rows:
+        rows = ('<tr><td colspan="6" class="muted">'
+                'No accounts. Add one below.</td></tr>')
+
+    role_opts_new = "".join(
+        f'<option value="{r}">{r}</option>' for r in USER_ROLES)
+
+    body = f"""<div class="admin-subtabs">
+  <a class="admin-subtab" href="/admin/ignored">Ignore list</a>
+  <a class="admin-subtab" href="/admin/ranges">Target ranges</a>
+  <a class="admin-subtab active" href="/admin/users">Users</a>
+</div>
+<div class="card">
+  <h3>User accounts</h3>
+  <p class="muted" style="margin-top:0">
+    Who can sign in to the dashboard. An <strong>admin</strong> can change
+    the configuration, the ignore list and these accounts; an
+    <strong>operator</strong> can see the dashboard, silence alerts and
+    restart devices, but cannot change the configuration.
+  </p>
+  {'<div class="flash error">' + html_lib.escape(err) + '</div>' if err else ''}
+  {'<div class="flash success">' + html_lib.escape(msg) + '</div>' if msg else ''}
+  <table style="width:100%;border-collapse:collapse;margin-top:1rem">
+    <thead><tr>
+      <th style="text-align:left">Account</th><th style="text-align:left">State</th>
+      <th style="text-align:left">Role</th><th style="text-align:left">Change password</th>
+      <th style="text-align:left">Sign in</th><th style="text-align:left">Remove</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>
+<div class="card">
+  <h3>Add an account</h3>
+  <p class="muted" style="margin-top:0">
+    The password is stored as a salted SHA-256 hash. The plaintext is
+    never written to disk, and it is never shown again.
+  </p>
+  <form method="post" action="/admin/users">
+    {_csrf_input()}
+    <input type="hidden" name="action" value="add">
+    <div class="field">
+      <label>Username</label>
+      <input type="text" name="username" required autocomplete="off"
+             placeholder="e.g. d.levi">
+    </div>
+    <div class="field">
+      <label>Role</label>
+      <select name="role">{role_opts_new}</select>
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" name="password" required minlength="8"
+             autocomplete="new-password">
+    </div>
+    <button class="btn btn-primary" type="submit">Add account</button>
+  </form>
+</div>"""
+
+    return _render_layout("Admin — Users", body, current_tab="admin")
 
 @app.route("/admin/ignored", methods=["GET", "POST"])
 @login_required

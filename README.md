@@ -158,6 +158,7 @@ live broker. They are runnable, not just documentation:
 | `tests/test_false_alarm_fixes.py` | Retired channels are removed and not resurrected by the broker's retained replay. |
 | `tests/test_production_readiness.py` | The WAL is checkpointed, the history is pruned and audited, a corrupt config says why, and no raw datetime is bound to SQL. |
 | `tests/test_print_report.py` | The report excludes the ignored devices and can be filtered and sorted. |
+| `tests/test_user_management.py` | The accounts live in the database, the plaintext is never stored, and the last admin cannot be locked out. |
 | `tests/test_admin_routes.py` | Every admin route points at the right view; no stacked decorators. |
 | `tests/test_snooze_semantics.py` | A snooze silences the wall board and an unsnooze restores it immediately. |
 | `tools/verify_restart.sh <service> <device>` | The restart path: command published, broker acknowledgement, heartbeat reset. |

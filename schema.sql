@@ -134,3 +134,17 @@ CREATE TABLE IF NOT EXISTS ignored_devices (
     added_at  TIMESTAMP DEFAULT (datetime('now','localtime')),
     added_by  TEXT
 );
+
+-- The user accounts. Stored here rather than in the config file, because
+-- the config is mounted READ-ONLY in production: a user added there
+-- could not be saved, and the change was lost on the next restart.
+-- Credentials are operational state, not configuration.
+CREATE TABLE IF NOT EXISTS users (
+    username      TEXT PRIMARY KEY,
+    role          TEXT NOT NULL DEFAULT 'operator',
+    password_hash TEXT,
+    salt          TEXT,
+    created_at    TIMESTAMP DEFAULT (datetime('now','localtime')),
+    changed_at    TIMESTAMP,
+    disabled      INTEGER NOT NULL DEFAULT 0
+);
